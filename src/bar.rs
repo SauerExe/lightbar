@@ -1396,6 +1396,20 @@ unsafe fn update_fullscreen(hwnd: HWND) {
 
 // ---------------------------------------------------------- Usage-Anzeige
 
+/// Unix-Sekunden → lokale Uhrzeit "HH:MM".
+fn clock_of(unix: i64) -> String {
+    unsafe {
+        use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+        let ticks = (unix as u64 + 11_644_473_600) * 10_000_000;
+        let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+        let (mut utc, mut local): (SYSTEMTIME, SYSTEMTIME) = (zeroed(), zeroed());
+        if FileTimeToSystemTime(&ft, &mut utc) == 0 || SystemTimeToTzSpecificLocalTime(null(), &utc, &mut local) == 0 {
+            return String::new();
+        }
+        format!("{:02}:{:02}", local.wHour, local.wMinute)
+    }
+}
+
 fn level_color(used: f32) -> COLORREF {
     if used >= 90.0 {
         rgb(255, 99, 71)
@@ -1460,7 +1474,7 @@ unsafe fn draw_usage(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
     let u = crate::usage::current().unwrap_or_default();
     let mid = (r.top + r.bottom) / 2;
     let line = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
-    for (i, (name, res)) in [("Claude", &u.claude), ("Codex", &u.codex)].into_iter().enumerate() {
+    for (i, (name, res, paused)) in [("Claude", &u.claude, u.claude_paused_until), ("Codex", &u.codex, u.codex_paused_until)].into_iter().enumerate() {
         let row = RECT {
             left: r.left + px(dpi, 8),
             right: r.right - px(dpi, 8),
@@ -1488,8 +1502,10 @@ unsafe fn draw_usage(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
                 };
                 text(dc, &label, &RECT { left: track.right + px(dpi, 8), ..rest }, font, TEXT, line);
             }
+            // Ohne Wert, aber in 429-Pause: sagen, bis wann – statt rätselhafter Punkte.
+            _ if paused > 0 => text(dc, &format!("pausiert bis {}", clock_of(paused)), &rest, font, DIM, line),
             Some(Err(_)) => text(dc, "nicht verfügbar", &rest, font, DIM, line),
-            None => text(dc, "…", &rest, font, DIM, line),
+            None => text(dc, "wird abgefragt …", &rest, font, DIM, line),
         }
     }
 }

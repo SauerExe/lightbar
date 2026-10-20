@@ -39,6 +39,9 @@ pub struct Usage {
     /// Zeitpunkt des angezeigten Werts (für "Stand vor …").
     pub claude_at: i64,
     pub codex_at: i64,
+    /// Nächster geplanter Versuch, falls gerade pausiert (429), sonst 0.
+    pub claude_paused_until: i64,
+    pub codex_paused_until: i64,
 }
 
 fn now() -> i64 {
@@ -374,6 +377,8 @@ pub fn current() -> Option<Usage> {
         codex: s[1].value.clone(),
         claude_at: s[0].fetched_at,
         codex_at: s[1].fetched_at,
+        claude_paused_until: if s[0].backoff > 0 { s[0].next_at } else { 0 },
+        codex_paused_until: if s[1].backoff > 0 { s[1].next_at } else { 0 },
     })
 }
 
@@ -396,11 +401,12 @@ fn window_from(v: &Value) -> Option<Window> {
 
 fn save_cache(slots: &[Slot; 2]) {
     let entry = |s: &Slot| {
-        let (five, week) = match &s.value {
-            Some(Ok(l)) => (window_json(&l.five_hour), window_json(&l.week)),
-            _ => (Value::Null, Value::Null),
+        let (five, week, error) = match &s.value {
+            Some(Ok(l)) => (window_json(&l.five_hour), window_json(&l.week), Value::Null),
+            Some(Err(e)) => (Value::Null, Value::Null, Value::from(e.as_str())),
+            None => (Value::Null, Value::Null, Value::Null),
         };
-        serde_json::json!({ "fetched_at": s.fetched_at, "next_at": s.next_at, "backoff": s.backoff, "five_hour": five, "week": week })
+        serde_json::json!({ "fetched_at": s.fetched_at, "next_at": s.next_at, "backoff": s.backoff, "five_hour": five, "week": week, "error": error })
     };
     let doc = serde_json::json!({ "claude": entry(&slots[0]), "codex": entry(&slots[1]) });
     if let Some(p) = cache_path() {
@@ -423,6 +429,8 @@ fn load_cache() {
         if limits.five_hour.is_some() || limits.week.is_some() {
             s[i].value = Some(Ok(limits));
             s[i].fetched_at = fetched_at;
+        } else if let Some(err) = e.get("error").and_then(Value::as_str) {
+            s[i].value = Some(Err(err.to_string()));
         }
         s[i].backoff = num("backoff");
         // Nach einem Neustart frühestens zum geplanten Zeitpunkt wieder fragen.
