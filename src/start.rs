@@ -667,9 +667,18 @@ unsafe fn show() {
     });
     let mut br: RECT = zeroed();
     GetWindowRect(bar, &mut br);
-    let (w, hh) = (px(dpi, W), px(dpi, H));
-    let x = br.left + (br.right - br.left - w) / 2;
-    let y = br.top - px(dpi, 12) - hh;
+    // Wie in Windows eingestellt: über dem Startknopf links oder mittig. Auf
+    // kleinen oder hochkant gestellten Bildschirmen kürzer bzw. eingerückt.
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    GetMonitorInfoW(MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST), &mut mi);
+    let m = mi.rcMonitor;
+    let gap = px(dpi, 12);
+    let w = px(dpi, W).min(m.right - m.left - 2 * gap);
+    let hh = px(dpi, H).min(br.top - m.top - 2 * gap);
+    let x = if crate::display::align_left() { br.left + gap } else { br.left + (br.right - br.left - w) / 2 };
+    let x = x.clamp(m.left + gap, (m.right - gap - w).max(m.left + gap));
+    let y = br.top - gap - hh;
     crate::anim::pop_in(h, x, y, w, hh, px(dpi, 18));
     force_foreground(h);
     InvalidateRect(h, null(), 0);

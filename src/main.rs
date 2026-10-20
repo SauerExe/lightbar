@@ -9,6 +9,7 @@ mod anim;
 mod apps;
 mod bar;
 mod calendar;
+mod display;
 mod glow;
 mod keyhook;
 mod menus;

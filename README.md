@@ -59,7 +59,9 @@ Honest answer, based on what was measured and built – including where it is *n
 - **Glow edge** above the taskbar (Aurora, accent colour or neon) and subtle animations – optional
 - **Claude / Codex usage** (5-hour and weekly limits) – optional, off by default, see notes
 - **Presentation mode** for streaming or screen sharing – hides your name, recent files, file search results and usage
-- **Multiple monitors** – a taskbar on every display (apps, Start, clock); flyouts open on the display you clicked; full-screen apps hide only the taskbar on their display
+- **Follows your Windows settings** – taskbar alignment (left or centred, also where the Start menu opens) and "Show my taskbar on all displays"
+- **Multiple monitors** – taskbars on other displays show Start, apps and the clock, like Windows; choose per display which ones get a taskbar and whether new displays get one (right-click → Bildschirme); flyouts open on the display you clicked; full-screen apps hide only the taskbar on their display
+- **Small and portrait screens** – when space runs out, tray icons move into the overflow, the usage display hides, buttons get narrower, and remaining apps go behind a "…" button instead of overlapping
 - Hides the Windows taskbar while running and restores it on exit; maximised windows and full-screen apps are handled
 
 ## Performance
@@ -115,7 +117,7 @@ Settings (right-click the taskbar) are stored in `%APPDATA%\Lightbar\settings.tx
 
 ## Known limitations
 
-- Multi-monitor support is new and not yet tested on real multi-display hardware; secondary taskbars use the primary display's scaling
+- Multi-monitor support is new and not yet tested on real multi-display hardware; secondary taskbars use the primary display's scaling. If Explorer does not reserve a taskbar's space (reported on multi-monitor setups), Lightbar sets that display's work area itself
 - Jump lists show recent/frequent items only (no app-defined tasks); notification centre and widgets are Windows' own
 - Touch and pen work through Windows' mouse emulation (tap = click, press-and-hold = right-click); untested on real touch hardware
 - German UI

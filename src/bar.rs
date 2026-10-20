@@ -70,6 +70,8 @@ enum Hit {
     Task(usize),
     Tray(usize),
     Chevron,
+    /// "…": Apps, für die in der Leiste kein Platz mehr ist.
+    More,
     Status,
     Clock,
     Desktop,
@@ -261,61 +263,152 @@ pub fn is_pinned(exe: &str) -> bool {
 
 // ---------------------------------------------------------------- Layout
 
+/// Nicht vorhandene Elemente haben ein leeres Rechteck (trifft nie, zeichnet nichts).
 struct Layout {
     usage: RECT,
+    show_usage: bool,
     taskmgr: RECT,
     start: RECT,
+    /// Kann kürzer sein als die Gruppenliste, wenn nicht alle Buttons passen.
     tasks: Vec<RECT>,
     tray: Vec<RECT>,
     chevron: Option<RECT>,
+    /// "…"-Knopf, wenn nicht alle App-Buttons Platz haben.
+    more: Option<RECT>,
     status: RECT,
     clock: RECT,
     desktop: RECT,
 }
 
-fn layout(width: i32, dpi: u32, n_tasks: usize, n_tray: usize, overflow: bool, battery: bool) -> Layout {
-    let (bw, gap) = (px(dpi, BTN_W), px(dpi, BTN_GAP));
+struct LayoutInput {
+    width: i32,
+    dpi: u32,
+    n_tasks: usize,
+    /// Angezeigte Tray-Icons (ohne die, die Windows ohnehin ausblendet).
+    n_tray: usize,
+    /// Gibt es ausgeblendete Tray-Icons (Überlauf-Pfeil nötig)?
+    hidden_tray: bool,
+    battery: bool,
+    /// Hauptleiste: mit Infobereich, Status, Usage und Task-Manager. Zweitleisten
+    /// zeigen wie bei Windows nur Start, Apps und Uhr.
+    primary: bool,
+    usage: bool,
+    align_left: bool,
+}
+
+/// Kleinste Buttonbreite, bevor Buttons wegfallen (Symbol 24 px + Rand).
+const BTN_MIN_W: i32 = 32;
+
+/// Aufteilung der Leiste. Wird es eng (Hochkant-Bildschirm, viele Apps),
+/// weicht die Leiste stufenweise aus: Tray-Icons wandern in den Überlauf,
+/// dann verschwindet die Usage-Anzeige, dann werden die Buttons schmaler und
+/// zuletzt fallen Buttons am Ende weg, statt sich mit dem Rest zu überlappen.
+fn layout(i: &LayoutInput) -> Layout {
+    let (w, dpi) = (i.width, i.dpi);
+    let gap = px(dpi, BTN_GAP);
     let h = px(dpi, BAR_H);
     let top = (h - px(dpi, BTN_H)) / 2;
     let bottom = top + px(dpi, BTN_H);
-    let count = n_tasks as i32 + 1;
-    let mut x = (width - (count * bw + (count - 1) * gap)) / 2;
+    let empty = RECT { left: 0, top, right: 0, bottom };
+
+    // Rechte Seite von außen nach innen.
+    let desktop = RECT { left: w - px(dpi, DESKTOP_W), top: 0, right: w, bottom: h };
+    let clock_r = desktop.left - px(dpi, 4);
+    let clock = RECT { left: clock_r - px(dpi, CLOCK_W), top, right: clock_r, bottom };
+    let status = if i.primary {
+        let glyphs = 2 + i.battery as i32;
+        let status_r = clock.left - px(dpi, 4);
+        RECT { left: status_r - glyphs * px(dpi, STATUS_GLYPH_W) - px(dpi, 16), top, right: status_r, bottom }
+    } else {
+        RECT { left: clock.left, right: clock.left, ..empty }
+    };
+    let tray_r = status.left - px(dpi, 4);
+    let tw = px(dpi, TRAY_W);
+    let n_tray = if i.primary { i.n_tray } else { 0 };
+    let chevron_needed = |shown: usize| i.primary && (i.hidden_tray || shown < n_tray);
+    let right_start = |shown: usize| tray_r - (shown as i32 + chevron_needed(shown) as i32) * tw;
+
+    // Linke Seite: Usage, dann Task-Manager.
+    let margin = px(dpi, 8);
+    let left_end = |usage: bool| match (i.primary, usage) {
+        (false, _) => 0,
+        (true, true) => margin + px(dpi, USAGE_W) + px(dpi, 4) + px(dpi, TASKMGR_W),
+        (true, false) => margin + px(dpi, TASKMGR_W),
+    };
+
+    let count = i.n_tasks as i32 + 1;
+    let need = |bw: i32| count * bw + (count - 1) * gap;
+    let room = |usage: bool, shown: usize| right_start(shown) - left_end(usage) - 2 * gap;
+    let (mut usage, mut shown, mut bw) = (i.primary && i.usage, n_tray, px(dpi, BTN_W));
+    while need(bw) > room(usage, shown) {
+        if shown > 0 {
+            shown -= 1;
+        } else if usage {
+            usage = false;
+        } else {
+            bw = ((room(usage, shown) + gap) / count - gap).max(px(dpi, BTN_MIN_W));
+            break;
+        }
+    }
+
+    // Apps: mittig (über die ganze Breite) oder links, wie in Windows eingestellt;
+    // nie über die Elemente links und rechts hinaus.
+    let lo = left_end(usage) + gap;
+    let hi = right_start(shown) - gap;
+    let fit = (((hi - lo + gap) / (bw + gap)).max(1) as usize).min(count as usize);
+    let total = need(bw).min(fit as i32 * (bw + gap) - gap);
+    let mut x = if i.align_left { lo } else { ((w - total) / 2).clamp(lo, (hi - total).max(lo)) };
     let mut next = || {
         let r = RECT { left: x, top, right: x + bw, bottom };
         x += bw + gap;
         r
     };
     let start = next();
-    let tasks = (0..n_tasks).map(|_| next()).collect();
+    // Passen nicht alle, wird der letzte Platz zum "…"-Knopf für den Rest.
+    let overflow = fit - 1 < i.n_tasks && fit >= 2;
+    let n_shown = if overflow { fit - 2 } else { (fit - 1).min(i.n_tasks) };
+    let tasks = (0..n_shown).map(|_| next()).collect();
+    let more = overflow.then(|| next());
 
-    // Rechte Seite von außen nach innen.
-    let desktop = RECT { left: width - px(dpi, DESKTOP_W), top: 0, right: width, bottom: h };
-    let clock_r = desktop.left - px(dpi, 4);
-    let clock = RECT { left: clock_r - px(dpi, CLOCK_W), top, right: clock_r, bottom };
-    let glyphs = 2 + battery as i32;
-    let status_r = clock.left - px(dpi, 4);
-    let status = RECT { left: status_r - glyphs * px(dpi, STATUS_GLYPH_W) - px(dpi, 16), top, right: status_r, bottom };
-    let tw = px(dpi, TRAY_W);
-    let tray_r = status.left - px(dpi, 4);
-    let tray_l = tray_r - n_tray as i32 * tw;
-    let tray = (0..n_tray as i32)
-        .map(|i| RECT { left: tray_l + i * tw, top, right: tray_l + (i + 1) * tw, bottom })
-        .collect();
-    let chevron = overflow.then(|| RECT { left: tray_l - tw, top, right: tray_l, bottom });
-    let usage = RECT { left: px(dpi, 8), top, right: px(dpi, 8 + USAGE_W), bottom };
-    // Task-Manager direkt rechts neben der Usage-Anzeige (oder ganz links, wenn die aus ist).
-    let tm_left = if { let s = crate::settings::get(); s.show_usage && !s.presentation } { usage.right + px(dpi, 4) } else { px(dpi, 8) };
-    let taskmgr = RECT { left: tm_left, top, right: tm_left + px(dpi, TASKMGR_W), bottom };
-    Layout { usage, taskmgr, start, tasks, tray, chevron, status, clock, desktop }
+    let tray_l = tray_r - shown as i32 * tw;
+    let tray = (0..shown as i32).map(|n| RECT { left: tray_l + n * tw, top, right: tray_l + (n + 1) * tw, bottom }).collect();
+    let chevron = chevron_needed(shown).then(|| RECT { left: tray_l - tw, top, right: tray_l, bottom });
+    let usage_r = if usage { RECT { left: margin, top, right: margin + px(dpi, USAGE_W), bottom } } else { empty };
+    let taskmgr = if i.primary {
+        // Direkt rechts neben der Usage-Anzeige (oder ganz links, wenn die aus ist).
+        let tm_left = if usage { usage_r.right + px(dpi, 4) } else { margin };
+        RECT { left: tm_left, top, right: tm_left + px(dpi, TASKMGR_W), bottom }
+    } else {
+        empty
+    };
+    Layout { usage: usage_r, show_usage: usage, taskmgr, start, tasks, tray, chevron, more, status, clock, desktop }
 }
 
+/// Layout einer Leiste und die Tray-Icons, die darin Platz haben. Tray-Icons,
+/// die nicht mehr passen, zeigt der Überlauf.
 unsafe fn current_layout(hwnd: HWND) -> Option<(Layout, Vec<(usize, HICON)>)> {
     let (dpi, n, battery) = with(|s| (s.dpi, s.groups.len(), s.status.as_ref().is_some_and(|x| x.battery.is_some())))?;
-    let tray = tray::visible();
-    let overflow = !tray::overflow().is_empty();
+    let primary = hwnd == self::hwnd();
+    let mut tray = if primary { tray::visible() } else { Vec::new() };
     let mut rc: RECT = zeroed();
     GetClientRect(hwnd, &mut rc);
-    Some((layout(rc.right, dpi, n, tray.len(), overflow, battery), tray))
+    let settings = crate::settings::get();
+    let l = layout(&LayoutInput {
+        width: rc.right,
+        dpi,
+        n_tasks: n,
+        n_tray: tray.len(),
+        hidden_tray: tray::has_hidden(),
+        battery,
+        primary,
+        usage: settings.show_usage && !settings.presentation,
+        align_left: crate::display::align_left(),
+    });
+    if primary {
+        tray::set_shown(l.tray.len());
+        tray.truncate(l.tray.len());
+    }
+    Some((l, tray))
 }
 
 unsafe fn hit_at(hwnd: HWND, x: i32, y: i32) -> Hit {
@@ -328,6 +421,9 @@ unsafe fn hit_at(hwnd: HWND, x: i32, y: i32) -> Hit {
     }
     if let Some(i) = l.tray.iter().position(|r| inside(r, x, y)) {
         return Hit::Tray(tray[i].0);
+    }
+    if l.more.is_some_and(|r| inside(&r, x, y)) {
+        return Hit::More;
     }
     if l.chevron.is_some_and(|r| inside(&r, x, y)) {
         return Hit::Chevron;
@@ -344,7 +440,7 @@ unsafe fn hit_at(hwnd: HWND, x: i32, y: i32) -> Hit {
     if inside(&l.taskmgr, x, y) {
         return Hit::TaskMgr;
     }
-    if inside(&l.usage, x, y) && crate::settings::get().show_usage && !crate::settings::get().presentation {
+    if l.show_usage && inside(&l.usage, x, y) {
         return Hit::Usage;
     }
     Hit::None
@@ -735,10 +831,37 @@ unsafe fn task_menu(hwnd: HWND, g: Group) {
     }
 }
 
+/// "…"-Knopf: die Apps, für die in der Leiste kein Platz ist, als Liste.
+unsafe fn more_menu(hwnd: HWND) {
+    let Some((l, _)) = current_layout(hwnd) else { return };
+    let hidden: Vec<Group> = with(|s| s.groups.iter().skip(l.tasks.len()).cloned().collect()).unwrap_or_default();
+    let names: Vec<String> = hidden.iter().map(|g| shorten(&group_name(g), 60)).collect();
+    let items: Vec<Item> = names.iter().enumerate().map(|(n, name)| Item::Cmd(n + 1, name)).collect();
+    let id = menus::popup(hwnd, &items);
+    if let Some(g) = id.checked_sub(1).and_then(|n| hidden.get(n)) {
+        click_group(g);
+    }
+}
+
+/// Menü-IDs der Bildschirm-Auswahl (eine pro Bildschirm).
+const MONITOR_IDS: usize = 50;
+
 unsafe fn bar_menu(hwnd: HWND) {
     use crate::settings::GlowStyle;
     let s = crate::settings::get();
     let glow = |id, label, style| Item::Check(id, label, s.glow == style);
+    // Bildschirme: Hauptbildschirm hat immer eine Leiste; die übrigen einzeln
+    // wählbar, dazu die Regel für weitere (anfangs wie in Windows eingestellt).
+    let monitors = crate::display::list();
+    let mut screens: Vec<Item> = monitors
+        .iter()
+        .enumerate()
+        .map(|(n, m)| if m.primary { Item::Label(&m.label) } else { Item::Check(MONITOR_IDS + n, &m.label, crate::display::wanted(m)) })
+        .collect();
+    screens.push(Item::Sep);
+    screens.push(Item::Check(19, "Auf weiteren Bildschirmen anzeigen", crate::display::new_monitors()));
+    let secondary = hwnd != self::hwnd();
+    let last = if secondary { Item::Cmd(20, "Auf diesem Bildschirm ausblenden") } else { Item::Cmd(3, "Lightbar beenden") };
     let id = menus::popup(
         hwnd,
         &[
@@ -760,8 +883,9 @@ unsafe fn bar_menu(hwnd: HWND) {
             Item::Check(15, "Claude/Codex-Usage anzeigen", s.show_usage),
             Item::Check(5, "Tray-Icons einfarbig", s.mono_tray),
             Item::Check(18, "Präsentationsmodus", s.presentation),
+            Item::Sub("Bildschirme", screens),
             Item::Sep,
-            Item::Cmd(3, "Taskleiste beenden"),
+            last,
         ],
     );
     match id {
@@ -785,6 +909,28 @@ unsafe fn bar_menu(hwnd: HWND) {
             DestroyWindow(hwnd);
             return;
         }
+        19 => {
+            crate::display::set_new_monitors(!crate::display::new_monitors());
+            sync_monitors();
+        }
+        20 => {
+            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if let Some(m) = monitors.iter().find(|m| m.handle == mon) {
+                crate::display::set_wanted(&m.id, false);
+            }
+            // Zerstört diese Leiste – danach nichts mehr mit `hwnd` anfangen.
+            sync_monitors();
+            return;
+        }
+        n if (MONITOR_IDS..MONITOR_IDS + monitors.len()).contains(&n) => {
+            let m = &monitors[n - MONITOR_IDS];
+            crate::display::set_wanted(&m.id, !crate::display::wanted(m));
+            let destroys_self = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) == m.handle && secondary;
+            sync_monitors();
+            if destroys_self {
+                return;
+            }
+        }
         _ => {}
     }
     InvalidateRect(hwnd, null(), 0);
@@ -799,6 +945,7 @@ unsafe fn tip_text(hit: Hit) -> String {
         },
         Hit::Tray(i) => tray::tip(i),
         Hit::Chevron => "Ausgeblendete Symbole anzeigen".into(),
+        Hit::More => "Weitere Apps".into(),
         Hit::Status => {
             let Some(s) = with(|s| s.status.clone()).flatten() else { return String::new() };
             let net = match &s.net {
@@ -840,6 +987,7 @@ unsafe fn rect_of(hwnd: HWND, hit: Hit) -> Option<RECT> {
         Hit::Task(i) => l.tasks.get(i).copied(),
         Hit::Tray(i) => tray.iter().position(|t| t.0 == i).map(|p| l.tray[p]),
         Hit::Chevron => l.chevron,
+        Hit::More => l.more,
         Hit::Status => Some(l.status),
         Hit::Clock => Some(l.clock),
         Hit::Desktop => Some(l.desktop),
@@ -1083,6 +1231,7 @@ unsafe fn set_pos(hwnd: HWND) {
     abd.rc.top = abd.rc.bottom - h;
     SHAppBarMessage(ABM_SETPOS, &mut abd);
     MoveWindow(hwnd, abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left, h, 1);
+    ensure_work_area(hwnd);
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
     let icon = exe_icon(&format!("{root}\\System32\\Taskmgr.exe"), px(dpi, 20));
     with(|s| {
@@ -1116,14 +1265,13 @@ pub fn ui_elements() -> Vec<UiElement> {
         let mut origin = POINT { x: 0, y: 0 };
         ClientToScreen(hwnd, &mut origin);
         let screen = |r: RECT| RECT { left: r.left + origin.x, top: r.top + origin.y, right: r.right + origin.x, bottom: r.bottom + origin.y };
-        let settings = crate::settings::get();
         let groups = with(|s| s.groups.clone()).unwrap_or_default();
         let fg = GetForegroundWindow();
         let mut out = Vec::new();
         let mut push = |hit: Hit, id: String, name: String, help: &str, rect: RECT| {
             out.push(UiElement { id, name, help: help.to_string(), rect: screen(rect), hit });
         };
-        if settings.show_usage && !settings.presentation {
+        if l.show_usage {
             push(Hit::Usage, "usage".into(), tip_text(Hit::Usage).replace('\n', ", "), "Claude- und Codex-Nutzung, klicken zum Aktualisieren", l.usage);
         }
         push(Hit::TaskMgr, "taskmgr".into(), tip_text(Hit::TaskMgr).replace('\n', ", "), "Task-Manager öffnen", l.taskmgr);
@@ -1137,6 +1285,9 @@ pub fn ui_elements() -> Vec<UiElement> {
                 n => format!("{n} Fenster"),
             };
             push(Hit::Task(i), format!("app:{}", g.slot), group_name(g), &state, r);
+        }
+        if let Some(r) = l.more {
+            push(Hit::More, "more".into(), "Weitere Apps".into(), "Apps, die in der Leiste keinen Platz haben", r);
         }
         if let Some(r) = l.chevron {
             push(Hit::Chevron, "overflow".into(), "Ausgeblendete Symbole anzeigen".into(), "Infobereich", r);
@@ -1251,6 +1402,7 @@ fn hit_id(hit: Hit, groups: &[Group]) -> Option<String> {
         Hit::Task(i) => format!("g:{}", groups.get(i)?.key),
         Hit::Tray(i) => format!("t:{i}"),
         Hit::Chevron => "chevron".into(),
+        Hit::More => "more".into(),
         Hit::Status => "status".into(),
         Hit::Clock => "clock".into(),
         Hit::Usage => "usage".into(),
@@ -1681,23 +1833,50 @@ unsafe fn set_pos_secondary(hwnd: HWND) {
     abd.rc.top = abd.rc.bottom - h;
     SHAppBarMessage(ABM_SETPOS, &mut abd);
     MoveWindow(hwnd, abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left, h, 1);
+    ensure_work_area(hwnd);
 }
 
-unsafe extern "system" fn collect_monitor(mon: HMONITOR, _: HDC, _: *mut RECT, lp: LPARAM) -> BOOL {
-    let mut mi: MONITORINFO = zeroed();
-    mi.cbSize = size_of::<MONITORINFO>() as u32;
-    if GetMonitorInfoW(mon, &mut mi) != 0 && mi.dwFlags & MONITORINFOF_PRIMARY == 0 {
-        (*(lp as *mut Vec<(HMONITOR, RECT)>)).push((mon, mi.rcMonitor));
+/// Die Leiste muss ihren Platz auch wirklich vom Arbeitsbereich abziehen,
+/// sonst legen sich maximierte Fenster darunter. Normalerweise erledigt das
+/// Explorer über die AppBar-Anmeldung; hat er es nicht getan (gemeldet auf
+/// Systemen mit mehreren Bildschirmen), setzen wir den Arbeitsbereich dieses
+/// Monitors selbst.
+unsafe fn ensure_work_area(bar: HWND) {
+    if IsWindowVisible(bar) == 0 {
+        return;
     }
-    1
+    let mut br: RECT = zeroed();
+    GetWindowRect(bar, &mut br);
+    let mut work = monitor_rect(bar, true);
+    if work.bottom > br.top {
+        work.bottom = br.top;
+        SystemParametersInfoW(SPI_SETWORKAREA, 0, &mut work as *mut RECT as *mut c_void, SPIF_SENDCHANGE);
+        fit_maximized(bar);
+    }
+}
+
+/// Gegenstück beim Entfernen einer Zweitleiste: Endet der Arbeitsbereich noch
+/// genau an ihrer Oberkante, geben wir den Platz selbst frei.
+unsafe fn release_work_area(bar: HWND) {
+    let mut br: RECT = zeroed();
+    GetWindowRect(bar, &mut br);
+    let mut work = monitor_rect(bar, true);
+    let m = monitor_rect(bar, false);
+    if work.bottom == br.top && br.bottom == m.bottom {
+        work.bottom = m.bottom;
+        SystemParametersInfoW(SPI_SETWORKAREA, 0, &mut work as *mut RECT as *mut c_void, SPIF_SENDCHANGE);
+    }
 }
 
 /// Zweitleisten an die aktuelle Monitor-Anordnung anpassen: neue Monitore
-/// bekommen eine Leiste, entfernte verlieren ihre, vorhandene werden neu
-/// ausgerichtet.
+/// bekommen eine Leiste (wenn gewünscht, siehe `display`), entfernte oder
+/// abgewählte verlieren ihre, vorhandene werden neu ausgerichtet.
 pub unsafe fn sync_monitors() {
-    let mut monitors: Vec<(HMONITOR, RECT)> = Vec::new();
-    EnumDisplayMonitors(null_mut(), null(), Some(collect_monitor), &mut monitors as *mut _ as LPARAM);
+    let mut monitors: Vec<(HMONITOR, RECT)> = crate::display::list()
+        .into_iter()
+        .filter(|m| !m.primary && crate::display::wanted(m))
+        .map(|m| (m.handle, m.rect))
+        .collect();
     let existing = secondaries();
     let mut keep = Vec::new();
     for h in existing {
@@ -1756,6 +1935,7 @@ unsafe fn create_secondary(inst: HINSTANCE, rect: RECT) -> Option<HWND> {
 unsafe fn tick_secondaries() {
     let mut changed = false;
     for h in secondaries() {
+        ensure_work_area(h);
         fit_maximized(h);
         let full = foreground_fullscreen(h);
         let visible = IsWindowVisible(h) != 0;
@@ -1875,8 +2055,10 @@ unsafe fn paint(hwnd: HWND) {
         return;
     };
     let hv = |id: &str| if hover_here { anim.hover.get(id).copied().unwrap_or(0.0) } else { 0.0 };
-    let tray = tray::visible();
-    let overflow = !tray::overflow().is_empty();
+    let Some((l, tray)) = current_layout(hwnd) else {
+        ValidateRect(hwnd, null());
+        return;
+    };
     let focus = if hwnd == self::hwnd() { focus_rect(hwnd) } else { None };
     let settings = crate::settings::get();
     let mono_on = settings.mono_tray;
@@ -1886,7 +2068,6 @@ unsafe fn paint(hwnd: HWND) {
         fill(dc, &RECT { left: 0, top: 0, right: w, bottom: px(dpi, 1).max(1) }, BORDER);
 
         let battery = status.as_ref().and_then(|s| s.battery);
-        let l = layout(w, dpi, groups.len(), tray.len(), overflow, battery.is_some());
         let radius = px(dpi, 6);
         let hover_bg = |dc: HDC, r: &RECT, k: f32| {
             if k > 0.01 {
@@ -1953,6 +2134,12 @@ unsafe fn paint(hwnd: HWND) {
             }
         }
 
+        // "…": Apps ohne Platz in der Leiste.
+        if let Some(r) = l.more {
+            hover_bg(dc, &r, hv("more"));
+            text(dc, "\u{E712}", &r, icons, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
         // Infobereich
         let ts = px(dpi, TRAY_ICON);
         for (n, &(index, icon)) in tray.iter().enumerate() {
@@ -1969,7 +2156,7 @@ unsafe fn paint(hwnd: HWND) {
 
         // Status: Netz, Lautstärke, Akku
         hover_bg(dc, &l.status, hv("status"));
-        if let Some(s) = &status {
+        if let Some(s) = status.as_ref().filter(|_| l.status.right > l.status.left) {
             let gw = px(dpi, STATUS_GLYPH_W);
             let mut gx = l.status.left + px(dpi, 8);
             let mut glyph = |g: &str| {
@@ -1987,10 +2174,12 @@ unsafe fn paint(hwnd: HWND) {
         let k = if crate::calendar::visible() { 1.0 } else { hv("clock") };
         draw_clock(dc, &l.clock, dpi, font, k);
 
-        if settings.show_usage && !settings.presentation {
+        if l.show_usage {
             draw_usage(dc, &l.usage, dpi, font, hv("usage"));
         }
-        draw_taskmgr(dc, &l.taskmgr, dpi, hv("taskmgr"), taskmgr_icon, cpu);
+        if l.taskmgr.right > l.taskmgr.left {
+            draw_taskmgr(dc, &l.taskmgr, dpi, hv("taskmgr"), taskmgr_icon, cpu);
+        }
 
         // Tastaturfokus (Win+T): deutlich sichtbarer Rahmen.
         if let Some(r) = focus {
@@ -2186,6 +2375,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             update_status(hwnd);
             tray::tick();
             crate::shell::ensure_hidden();
+            ensure_work_area(hwnd);
             fit_maximized(hwnd);
             tick_secondaries();
             // Vor Explorers Shell_TrayWnd bleiben, damit neue Tray-Icons zu uns kommen.
@@ -2220,6 +2410,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match wp as u32 {
                 EVENT_SYSTEM_FOREGROUND => {
                     update_fullscreen(hwnd);
+                    ensure_work_area(hwnd);
                     tick_secondaries();
                     kick(hwnd);
                 }
@@ -2351,6 +2542,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         click_group(&g);
                     }
                 }
+                Hit::More => more_menu(hwnd),
                 Hit::None => {}
             }
             InvalidateRect(hwnd, null(), 0);
@@ -2374,6 +2566,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Akzentfarbe geändert (Personalisierung) → neu einlesen.
         0x0320 | WM_SETTINGCHANGE => {
             reload_accent();
+            // Taskleisten-Einstellungen von Windows (Ausrichtung, alle Bildschirme)
+            // gelten sofort – nicht bei unserer eigenen Arbeitsbereich-Meldung.
+            if msg == WM_SETTINGCHANGE && hwnd == self::hwnd() && wp as u32 != SPI_SETWORKAREA {
+                crate::display::reload();
+                sync_monitors();
+                for b in all_bars() {
+                    InvalidateRect(b, null(), 0);
+                }
+            }
             InvalidateRect(hwnd, null(), 0);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
@@ -2405,6 +2606,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 Hit::Tray(i) => tray_click(hwnd, i, Click::Right),
                 Hit::Chevron => bar_menu(hwnd),
+                Hit::More => more_menu(hwnd),
                 Hit::Status => status_menu(hwnd),
                 Hit::Clock => clock_menu(hwnd),
                 Hit::Desktop | Hit::Usage | Hit::TaskMgr | Hit::None => bar_menu(hwnd),
@@ -2433,6 +2635,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // Zweitleiste: nur ihren Platz freigeben.
             let mut abd = appbar_data(hwnd);
             SHAppBarMessage(ABM_REMOVE, &mut abd);
+            release_work_area(hwnd);
             if let Ok(mut v) = SECONDARY.lock() {
                 v.retain(|&h| h != hwnd as isize);
             }
@@ -2533,4 +2736,74 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
         PostMessageW(notify_target as HWND, WM_BAR_USAGE, 0, 0);
     });
     hwnd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn non_empty(r: &RECT) -> bool {
+        r.right > r.left
+    }
+
+    fn overlap(a: &RECT, b: &RECT) -> bool {
+        non_empty(a) && non_empty(b) && a.left < b.right && b.left < a.right
+    }
+
+    /// Breiten in physischen Pixeln (auch hochkant), gängige Skalierungen,
+    /// wenige bis sehr viele Apps und Tray-Icons: nichts überlappt, nichts
+    /// ragt aus der Leiste, Buttons bleiben bedienbar breit.
+    #[test]
+    fn layout_fits_every_resolution() {
+        let mut dropped = Vec::new();
+        for width in [720, 768, 800, 1024, 1080, 1200, 1280, 1366, 1440, 1600, 1920, 2160, 2560, 3440, 3840] {
+            for dpi in [96, 120, 144, 168, 192] {
+                for n_tasks in [0, 3, 8, 15, 25, 40] {
+                    for n_tray in [0, 4, 12] {
+                        for (primary, usage, align_left, hidden_tray) in [(true, true, false, true), (true, false, true, false), (true, true, true, false), (false, false, false, false), (false, false, true, false)] {
+                            let i = LayoutInput { width, dpi, n_tasks, n_tray, hidden_tray, battery: true, primary, usage, align_left };
+                            let l = layout(&i);
+                            let ctx = format!("w={width} dpi={dpi} tasks={n_tasks} tray={n_tray} primary={primary} usage={usage} left={align_left}");
+                            let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr)];
+                            if l.show_usage {
+                                all.push(("usage", l.usage));
+                            }
+                            all.extend(l.tasks.iter().map(|r| ("task", *r)));
+                            all.extend(l.tray.iter().map(|r| ("tray", *r)));
+                            all.extend(l.chevron.iter().map(|r| ("chevron", *r)));
+                            all.extend(l.more.iter().map(|r| ("more", *r)));
+                            if l.tasks.len() < n_tasks {
+                                assert!(l.more.is_some(), "Apps ohne Platz und ohne …-Knopf: {ctx}");
+                            }
+                            for (name, r) in &all {
+                                if non_empty(r) {
+                                    assert!(r.left >= 0 && r.right <= width, "{name} außerhalb: {ctx}");
+                                }
+                            }
+                            for a in 0..all.len() {
+                                for b in a + 1..all.len() {
+                                    assert!(!overlap(&all[a].1, &all[b].1), "{} überlappt {}: {ctx}", all[a].0, all[b].0);
+                                }
+                            }
+                            for r in &l.tasks {
+                                assert!(r.right - r.left >= px(dpi, BTN_MIN_W), "Button zu schmal: {ctx}");
+                            }
+                            if !primary {
+                                assert!(l.tray.is_empty() && !l.show_usage && !non_empty(&l.taskmgr), "Zweitleiste mit Hauptleisten-Elementen: {ctx}");
+                            }
+                            if l.tasks.len() < n_tasks {
+                                dropped.push(ctx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Zur Einordnung: wo nicht alle Buttons Platz haben.
+        let tight: Vec<&String> = dropped.iter().filter(|c| !c.contains("tasks=40") && !c.contains("tasks=25")).collect();
+        println!("{} Fälle mit weggelassenen Buttons, davon {} mit höchstens 15 Apps:", dropped.len(), tight.len());
+        for c in tight.iter().filter(|c| c.starts_with("w=1080 ") || c.starts_with("w=1366 ")) {
+            println!("  {c}");
+        }
+    }
 }

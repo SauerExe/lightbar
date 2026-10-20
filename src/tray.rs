@@ -320,9 +320,25 @@ pub fn visible() -> Vec<(usize, HICON)> {
     listed(true)
 }
 
-/// Icons hinter dem Überlauf-Pfeil.
+/// Wie viele der sichtbaren Icons in die Leiste passen (setzt das Layout).
+static SHOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+pub fn set_shown(n: usize) {
+    SHOWN.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Icons, die Windows ausblendet (unabhängig vom Platz in der Leiste).
+pub fn has_hidden() -> bool {
+    !listed(false).is_empty()
+}
+
+/// Icons hinter dem Überlauf-Pfeil: die, die nicht mehr in die Leiste
+/// passen, und die, die Windows ausblendet.
 pub fn overflow() -> Vec<(usize, HICON)> {
-    listed(false)
+    let shown = SHOWN.load(std::sync::atomic::Ordering::Relaxed);
+    let mut v: Vec<(usize, HICON)> = listed(true).into_iter().skip(shown).collect();
+    v.extend(listed(false));
+    v
 }
 
 pub fn tip(index: usize) -> String {
