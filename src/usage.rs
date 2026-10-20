@@ -36,12 +36,9 @@ pub struct Limits {
 pub struct Usage {
     pub claude: Option<Result<Limits, String>>,
     pub codex: Option<Result<Limits, String>>,
-}
-
-static CURRENT: Mutex<Option<Usage>> = Mutex::new(None);
-
-pub fn current() -> Option<Usage> {
-    CURRENT.lock().ok()?.clone()
+    /// Zeitpunkt des angezeigten Werts (für "Stand vor …").
+    pub claude_at: i64,
+    pub codex_at: i64,
 }
 
 fn now() -> i64 {
@@ -64,8 +61,9 @@ impl Drop for Handle {
     }
 }
 
-/// HTTPS-GET über WinHTTP (Systemproxy, Systemzertifikate). Rückgabe: (Status, Body).
-fn https_get(host: &str, path: &str, headers: &[(&str, String)]) -> Result<(u32, String), String> {
+/// HTTPS-GET über WinHTTP (Systemproxy, Systemzertifikate).
+/// Rückgabe: (Status, Body, Retry-After in Sekunden, falls der Server eins nennt).
+fn https_get(host: &str, path: &str, headers: &[(&str, String)]) -> Result<(u32, String, Option<i64>), String> {
     unsafe {
         let session = Handle(WinHttpOpen(w16("lightbar/0.1").as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null(), null(), 0));
         if session.0.is_null() {
@@ -97,6 +95,16 @@ fn https_get(host: &str, path: &str, headers: &[(&str, String)]) -> Result<(u32,
             &mut size,
             null_mut(),
         );
+        let mut retry: u32 = 0;
+        let mut rsize = std::mem::size_of::<u32>() as u32;
+        let has_retry = WinHttpQueryHeaders(
+            req.0,
+            WINHTTP_QUERY_RETRY_AFTER | WINHTTP_QUERY_FLAG_NUMBER,
+            null(),
+            &mut retry as *mut _ as _,
+            &mut rsize,
+            null_mut(),
+        ) != 0;
         let mut body = Vec::new();
         loop {
             let mut avail = 0u32;
@@ -113,7 +121,7 @@ fn https_get(host: &str, path: &str, headers: &[(&str, String)]) -> Result<(u32,
                 break; // Antworten sind wenige KB; mehr ist kaputt.
             }
         }
-        Ok((status, String::from_utf8_lossy(&body).into_owned()))
+        Ok((status, String::from_utf8_lossy(&body).into_owned(), has_retry.then_some(retry as i64)))
     }
 }
 
@@ -164,6 +172,36 @@ fn codex_window(v: &Value, fetched: i64) -> Option<Window> {
     Some(Window { used, resets_at })
 }
 
+/// Warum eine Abfrage scheiterte – bestimmt, wann es erneut versucht wird.
+#[derive(Clone, Debug)]
+pub struct Failure {
+    pub message: String,
+    /// HTTP 429: Pause einlegen (ggf. so lange, wie der Server verlangt).
+    rate_limited: Option<Option<i64>>,
+    /// Login fehlt/abgelaufen: alte Werte nicht weiter anzeigen.
+    auth: bool,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Failure { message, rate_limited: None, auth: false }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+fn http_failure(service: &str, status: u32, retry_after: Option<i64>) -> Failure {
+    Failure {
+        message: http_error(service, status),
+        rate_limited: (status == 429).then_some(retry_after),
+        auth: status == 401 || status == 403,
+    }
+}
+
 fn http_error(service: &str, status: u32) -> String {
     match status {
         401 => format!("{service}: Login abgelaufen – {service} einmal starten (HTTP 401)"),
@@ -175,23 +213,23 @@ fn http_error(service: &str, status: u32) -> String {
 
 // ------------------------------------------------------------- Abfragen
 
-fn fetch_claude() -> Result<Limits, String> {
+fn fetch_claude() -> Result<Limits, Failure> {
     let path = home().ok_or("kein Benutzerordner")?.join(".claude").join(".credentials.json");
-    let text = std::fs::read_to_string(path).map_err(|_| "Claude: nicht angemeldet".to_string())?;
-    let creds: Value = serde_json::from_str(&text).map_err(|_| "Claude: Login-Datei unlesbar".to_string())?;
+    let text = std::fs::read_to_string(path).map_err(|_| Failure { auth: true, ..Failure::from("Claude: nicht angemeldet") })?;
+    let creds: Value = serde_json::from_str(&text).map_err(|_| Failure::from("Claude: Login-Datei unlesbar"))?;
     let token = creds
         .pointer("/claudeAiOauth/accessToken")
         .and_then(Value::as_str)
         .ok_or("Claude: kein Abo-Login (API-Key-Nutzung hat keine Limits)")?;
-    let (status, body) = https_get(
+    let (status, body, retry) = https_get(
         "api.anthropic.com",
         "/api/oauth/usage",
         &[("Authorization", format!("Bearer {token}")), ("anthropic-beta", "oauth-2025-04-20".into()), ("Accept", "application/json".into())],
     )?;
     if status != 200 {
-        return Err(http_error("Claude", status));
+        return Err(http_failure("Claude", status, retry));
     }
-    let v: Value = serde_json::from_str(&body).map_err(|_| "Claude: Antwort unlesbar".to_string())?;
+    let v: Value = serde_json::from_str(&body).map_err(|_| Failure::from("Claude: Antwort unlesbar"))?;
     let limits = Limits {
         five_hour: v.get("five_hour").and_then(claude_window),
         week: v.get("seven_day").and_then(claude_window),
@@ -202,10 +240,10 @@ fn fetch_claude() -> Result<Limits, String> {
     Ok(limits)
 }
 
-fn fetch_codex() -> Result<Limits, String> {
+fn fetch_codex() -> Result<Limits, Failure> {
     let path = home().ok_or("kein Benutzerordner")?.join(".codex").join("auth.json");
-    let text = std::fs::read_to_string(path).map_err(|_| "Codex: nicht angemeldet".to_string())?;
-    let auth: Value = serde_json::from_str(&text).map_err(|_| "Codex: Login-Datei unlesbar".to_string())?;
+    let text = std::fs::read_to_string(path).map_err(|_| Failure { auth: true, ..Failure::from("Codex: nicht angemeldet") })?;
+    let auth: Value = serde_json::from_str(&text).map_err(|_| Failure::from("Codex: Login-Datei unlesbar"))?;
     let token = auth
         .pointer("/tokens/access_token")
         .and_then(Value::as_str)
@@ -215,11 +253,11 @@ fn fetch_codex() -> Result<Limits, String> {
         headers.push(("ChatGPT-Account-Id", account.to_string()));
     }
     let fetched = now();
-    let (status, body) = https_get("chatgpt.com", "/backend-api/wham/usage", &headers)?;
+    let (status, body, retry) = https_get("chatgpt.com", "/backend-api/wham/usage", &headers)?;
     if status != 200 {
-        return Err(http_error("Codex", status));
+        return Err(http_failure("Codex", status, retry));
     }
-    let v: Value = serde_json::from_str(&body).map_err(|_| "Codex: Antwort unlesbar".to_string())?;
+    let v: Value = serde_json::from_str(&body).map_err(|_| Failure::from("Codex: Antwort unlesbar"))?;
     let rl = v.get("rate_limit").ok_or("Codex: Antwortformat unbekannt")?;
     let limits = Limits {
         five_hour: rl.get("primary_window").and_then(|w| codex_window(w, fetched)),
@@ -231,38 +269,188 @@ fn fetch_codex() -> Result<Limits, String> {
     Ok(limits)
 }
 
-/// Beide Dienste abfragen (blockiert, nur vom Hintergrund-Thread aufrufen).
-pub fn fetch() -> Usage {
-    Usage { claude: Some(fetch_claude()), codex: Some(fetch_codex()) }
+// --------------------------------------------------------- Zeitplanung
+//
+// Rücksichtsvoll abfragen: je Dienst höchstens alle 10 Minuten, bei HTTP 429
+// Pause (Retry-After des Servers, sonst 10 → 20 → 40 → 60 Minuten). Werte und
+// Zeitplan liegen in `usage-cache.json`, damit ein Neustart nicht sofort neu
+// fragt, sondern die letzten Werte zeigt.
+
+const INTERVAL: i64 = 600;
+const MAX_BACKOFF: i64 = 3600;
+const MIN_MANUAL: i64 = 60;
+
+#[derive(Clone, Default)]
+struct Slot {
+    value: Option<Result<Limits, String>>,
+    /// Zeitpunkt des letzten erfolgreichen Werts.
+    fetched_at: i64,
+    next_at: i64,
+    backoff: i64,
 }
 
-/// Neues Ergebnis übernehmen. Schlägt eine Abfrage nur vorübergehend fehl
-/// (Netz weg, 429), bleibt der letzte gute Wert stehen.
-fn store(new: Usage) {
-    let Ok(mut cur) = CURRENT.lock() else { return };
-    let old = cur.take().unwrap_or_default();
-    let keep = |n: Option<Result<Limits, String>>, o: Option<Result<Limits, String>>| match (n, o) {
-        (Some(Err(e)), Some(Ok(prev))) if !e.contains("401") && !e.contains("403") => Some(Ok(prev)),
-        (n, _) => n,
+/// Index 0 = Claude, 1 = Codex.
+static SLOTS: Mutex<[Slot; 2]> = Mutex::new([
+    Slot { value: None, fetched_at: 0, next_at: 0, backoff: 0 },
+    Slot { value: None, fetched_at: 0, next_at: 0, backoff: 0 },
+]);
+
+fn fetch_slot(i: usize) -> Result<Limits, Failure> {
+    if i == 0 {
+        fetch_claude()
+    } else {
+        fetch_codex()
+    }
+}
+
+/// Ergebnis einer Abfrage in den Zeitplan einarbeiten.
+fn apply(slot: &mut Slot, result: Result<Limits, Failure>, t: i64) {
+    match result {
+        Ok(l) => {
+            slot.value = Some(Ok(l));
+            slot.fetched_at = t;
+            slot.backoff = 0;
+            slot.next_at = t + INTERVAL;
+        }
+        Err(f) => {
+            let wait = match f.rate_limited {
+                Some(retry) => {
+                    slot.backoff = retry.unwrap_or(if slot.backoff == 0 { INTERVAL } else { slot.backoff * 2 }).clamp(INTERVAL, MAX_BACKOFF);
+                    slot.backoff
+                }
+                None => INTERVAL / 2,
+            };
+            slot.next_at = t + wait;
+            // Letzten guten Wert behalten – außer der Login ist weg.
+            let keep = matches!(slot.value, Some(Ok(_))) && !f.auth;
+            if !keep {
+                let msg = if f.rate_limited.is_some() {
+                    format!("{} – nächster Versuch {}", f.message, until(slot.next_at))
+                } else {
+                    f.message
+                };
+                slot.value = Some(Err(msg));
+            }
+        }
+    }
+}
+
+/// Fällige Dienste abfragen. `manual`: auf Klick, aber nicht öfter als
+/// einmal pro Minute und nie während einer 429-Pause.
+fn run_due(manual: bool) -> bool {
+    let t = now();
+    let due: Vec<usize> = match SLOTS.lock() {
+        Ok(s) => (0..2)
+            .filter(|&i| {
+                let sl = &s[i];
+                if manual {
+                    sl.backoff == 0 && t - sl.fetched_at >= MIN_MANUAL
+                } else {
+                    t >= sl.next_at
+                }
+            })
+            .collect(),
+        Err(_) => return false,
     };
-    *cur = Some(Usage { claude: keep(new.claude, old.claude), codex: keep(new.codex, old.codex) });
+    if due.is_empty() {
+        return false;
+    }
+    // Netzwerk außerhalb der Sperre.
+    let results: Vec<(usize, Result<Limits, Failure>)> = due.into_iter().map(|i| (i, fetch_slot(i))).collect();
+    if let Ok(mut s) = SLOTS.lock() {
+        let t = now();
+        for (i, r) in results {
+            apply(&mut s[i], r, t);
+        }
+        save_cache(&s);
+    }
+    true
 }
 
-/// Hintergrund-Thread: sofort, dann alle 5 Minuten; meldet sich per
-/// `notify` (PostMessage an die Leiste) nach jeder Abfrage.
+pub fn current() -> Option<Usage> {
+    let s = SLOTS.lock().ok()?;
+    Some(Usage {
+        claude: s[0].value.clone(),
+        codex: s[1].value.clone(),
+        claude_at: s[0].fetched_at,
+        codex_at: s[1].fetched_at,
+    })
+}
+
+// ------------------------------------------------------------- Cache
+
+fn cache_path() -> Option<PathBuf> {
+    Some(crate::util::data_dir()?.join("usage-cache.json"))
+}
+
+fn window_json(w: &Option<Window>) -> Value {
+    match w {
+        Some(w) => serde_json::json!({ "used": w.used, "resets_at": w.resets_at }),
+        None => Value::Null,
+    }
+}
+
+fn window_from(v: &Value) -> Option<Window> {
+    Some(Window { used: v.get("used")?.as_f64()? as f32, resets_at: v.get("resets_at").and_then(Value::as_i64) })
+}
+
+fn save_cache(slots: &[Slot; 2]) {
+    let entry = |s: &Slot| {
+        let (five, week) = match &s.value {
+            Some(Ok(l)) => (window_json(&l.five_hour), window_json(&l.week)),
+            _ => (Value::Null, Value::Null),
+        };
+        serde_json::json!({ "fetched_at": s.fetched_at, "next_at": s.next_at, "backoff": s.backoff, "five_hour": five, "week": week })
+    };
+    let doc = serde_json::json!({ "claude": entry(&slots[0]), "codex": entry(&slots[1]) });
+    if let Some(p) = cache_path() {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, doc.to_string());
+    }
+}
+
+fn load_cache() {
+    let Some(text) = cache_path().and_then(|p| std::fs::read_to_string(p).ok()) else { return };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else { return };
+    let Ok(mut s) = SLOTS.lock() else { return };
+    for (i, key) in ["claude", "codex"].into_iter().enumerate() {
+        let Some(e) = doc.get(key) else { continue };
+        let num = |k: &str| e.get(k).and_then(Value::as_i64).unwrap_or(0);
+        let limits = Limits { five_hour: e.get("five_hour").and_then(window_from), week: e.get("week").and_then(window_from) };
+        let fetched_at = num("fetched_at");
+        if limits.five_hour.is_some() || limits.week.is_some() {
+            s[i].value = Some(Ok(limits));
+            s[i].fetched_at = fetched_at;
+        }
+        s[i].backoff = num("backoff");
+        // Nach einem Neustart frühestens zum geplanten Zeitpunkt wieder fragen.
+        s[i].next_at = num("next_at").max(fetched_at + INTERVAL);
+    }
+}
+
+// ----------------------------------------------------------- Threads
+
+/// Hintergrund-Thread: prüft jede Minute, ob ein Dienst fällig ist, und
+/// meldet sich per `notify` (PostMessage an die Leiste) nach jeder Abfrage.
 pub fn spawn(notify: impl Fn() + Send + 'static) {
+    load_cache();
+    notify();
     std::thread::spawn(move || loop {
-        store(fetch());
-        notify();
-        std::thread::park_timeout(Duration::from_secs(300));
+        if run_due(false) {
+            notify();
+        }
+        std::thread::park_timeout(Duration::from_secs(60));
     });
 }
 
-/// Sofort neu abfragen (Klick auf die Anzeige).
+/// Klick auf die Anzeige: neu abfragen, soweit erlaubt.
 pub fn refresh_now(notify: impl Fn() + Send + 'static) {
     std::thread::spawn(move || {
-        store(fetch());
-        notify();
+        if run_due(true) {
+            notify();
+        }
     });
 }
 
@@ -279,7 +467,7 @@ pub fn until(t: i64) -> String {
     }
 }
 
-pub fn describe(name: &str, r: &Option<Result<Limits, String>>) -> String {
+pub fn describe(name: &str, r: &Option<Result<Limits, String>>, fetched_at: i64) -> String {
     match r {
         None => format!("{name}: wird abgefragt …"),
         Some(Err(e)) => e.clone(),
@@ -292,7 +480,9 @@ pub fn describe(name: &str, r: &Option<Result<Limits, String>>) -> String {
                 })
                 .unwrap_or_default()
             };
-            format!("{name}{}{}", line("5 Stunden", &l.five_hour), line("Woche", &l.week))
+            let age = now() - fetched_at;
+            let stand = if fetched_at > 0 && age >= 120 { format!(" (Stand vor {} Min.)", age / 60) } else { String::new() };
+            format!("{name}{stand}{}{}", line("5 Stunden", &l.five_hour), line("Woche", &l.week))
         }
     }
 }
@@ -300,8 +490,8 @@ pub fn describe(name: &str, r: &Option<Result<Limits, String>>) -> String {
 /// `--usage-test`: einmal abfragen und nur Prozentwerte/Fehler in eine Datei
 /// schreiben – zum Prüfen ohne Tokens anzuzeigen.
 pub fn self_test() {
-    let u = fetch();
-    let text = format!("{}\n\n{}\n", describe("Claude", &u.claude), describe("Codex", &u.codex));
+    let d = |r: Result<Limits, Failure>| Some(r.map_err(|f| f.message));
+    let text = format!("{}\n\n{}\n", describe("Claude", &d(fetch_claude()), now()), describe("Codex", &d(fetch_codex()), now()));
     if let Ok(appdata) = std::env::var("APPDATA") {
         let dir = PathBuf::from(appdata).join("Lightbar");
         let _ = std::fs::create_dir_all(&dir);

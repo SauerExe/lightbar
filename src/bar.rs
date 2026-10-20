@@ -773,7 +773,7 @@ unsafe fn tip_text(hit: Hit) -> String {
         }
         Hit::Usage => {
             let u = crate::usage::current().unwrap_or_default();
-            format!("{}\n\n{}\n\nKlicken zum Aktualisieren", crate::usage::describe("Claude", &u.claude), crate::usage::describe("Codex", &u.codex))
+            format!("{}\n\n{}\n\nKlicken zum Aktualisieren", crate::usage::describe("Claude", &u.claude, u.claude_at), crate::usage::describe("Codex", &u.codex, u.codex_at))
         }
         Hit::None => String::new(),
     }
