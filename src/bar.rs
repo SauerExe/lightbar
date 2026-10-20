@@ -2003,8 +2003,8 @@ unsafe fn draw_logo(dc: HDC, r: &RECT, dpi: u32) {
     round(dc, &RECT { left: sx, top: sy, right: sx + shine, bottom: sy + shine }, mix(accent(), rgb(255, 255, 255), 0.6), shine);
 }
 
-/// Tux aus Ellipsen, entworfen auf 18 × 22 px bei 100 %. Der schwarze Körper
-/// bekommt einen grauen Rand, sonst verschwindet er auf der dunklen Leiste.
+/// Tux aus Ellipsen, entworfen auf 18 × 22 px bei 100 %. Einfarbig in der
+/// Akzentfarbe wie Orb und Windows-Logo; Bauch und Augen sind ausgespart.
 unsafe fn draw_tux(dc: HDC, r: &RECT, dpi: u32) {
     let s = dpi as f32 / 96.0;
     let (w, h) = ((18.0 * s).round() as i32, (22.0 * s).round() as i32);
@@ -2013,19 +2013,17 @@ unsafe fn draw_tux(dc: HDC, r: &RECT, dpi: u32) {
         let e = RECT { left: x + (x0 * s).round() as i32, top: y + (y0 * s).round() as i32, right: x + (x1 * s).round() as i32, bottom: y + (y1 * s).round() as i32 };
         round(dc, &e, c, (e.right - e.left).max(e.bottom - e.top) + 1);
     };
-    let (black, white) = (rgb(16, 16, 16), rgb(242, 242, 242));
-    let (beak, feet) = (rgb(250, 196, 40), rgb(240, 150, 20));
-    ellipse(0.5, 0.0, 17.5, 20.5, rgb(120, 120, 120));
-    ellipse(1.5, 1.0, 16.5, 19.5, black);
-    ellipse(4.0, 7.5, 14.0, 19.0, white);
+    let a = accent();
+    ellipse(1.0, 0.0, 17.0, 20.0, a);
+    ellipse(4.0, 7.5, 14.0, 19.0, BG);
     // Augen mit Pupillen, darunter der Schnabel.
-    ellipse(5.0, 3.0, 8.5, 7.5, white);
-    ellipse(9.5, 3.0, 13.0, 7.5, white);
-    ellipse(6.5, 4.5, 8.0, 6.5, black);
-    ellipse(10.0, 4.5, 11.5, 6.5, black);
-    ellipse(5.5, 6.5, 12.5, 9.5, beak);
-    ellipse(1.0, 18.0, 8.0, 22.0, feet);
-    ellipse(10.0, 18.0, 17.0, 22.0, feet);
+    ellipse(5.0, 3.0, 8.5, 7.5, BG);
+    ellipse(9.5, 3.0, 13.0, 7.5, BG);
+    ellipse(6.5, 4.5, 8.0, 6.5, a);
+    ellipse(10.0, 4.5, 11.5, 6.5, a);
+    ellipse(5.5, 6.5, 12.5, 9.5, a);
+    ellipse(1.0, 18.0, 8.0, 22.0, a);
+    ellipse(10.0, 18.0, 17.0, 22.0, a);
 }
 
 /// Uhr samt Hover-Fläche zeichnen (volles Zeichnen und Schnellweg).
