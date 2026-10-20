@@ -2003,27 +2003,107 @@ unsafe fn draw_logo(dc: HDC, r: &RECT, dpi: u32) {
     round(dc, &RECT { left: sx, top: sy, right: sx + shine, bottom: sy + shine }, mix(accent(), rgb(255, 255, 255), 0.6), shine);
 }
 
-/// Tux aus Ellipsen, entworfen auf 18 × 22 px bei 100 %. Einfarbig in der
-/// Akzentfarbe wie Orb und Windows-Logo; Bauch und Augen sind ausgespart.
+/// Der sitzende Tux (Larry Ewing) als Strichzeichnung wie die bekannte
+/// einfarbige Fassung, entworfen auf 20 × 22 px bei 100 %: Umriss,
+/// Gesichtsmaske mit Schnabel, Bauch und Füße in der Akzentfarbe, der Körper
+/// selbst bleibt Hintergrund.
+///
+/// Bei 22 px würden Augen und Schnabel auf ganze Pixel gerundet und den Kopf
+/// zerfressen. Deshalb die Form vierfach groß als Maske zeichnen, je 4 × 4
+/// Pixel zu einer Deckung mitteln und damit die Akzentfarbe über den
+/// vorhandenen Hintergrund mischen (HALFTONE schwingt über: helle und fast
+/// schwarze Säume).
 unsafe fn draw_tux(dc: HDC, r: &RECT, dpi: u32) {
-    let s = dpi as f32 / 96.0;
-    let (w, h) = ((18.0 * s).round() as i32, (22.0 * s).round() as i32);
+    const SS: i32 = 4;
+    // Entwurf 20 × 22, gezeichnet 26 px hoch: kleiner verschwimmt das Gesicht.
+    let s = dpi as f32 / 96.0 * 26.0 / 22.0;
+    let (w, h) = ((20.0 * s).round() as i32, (22.0 * s).round() as i32);
     let (x, y) = (r.left + (r.right - r.left - w) / 2, r.top + (r.bottom - r.top - h) / 2);
-    let ellipse = |x0: f32, y0: f32, x1: f32, y1: f32, c: COLORREF| {
-        let e = RECT { left: x + (x0 * s).round() as i32, top: y + (y0 * s).round() as i32, right: x + (x1 * s).round() as i32, bottom: y + (y1 * s).round() as i32 };
-        round(dc, &e, c, (e.right - e.left).max(e.bottom - e.top) + 1);
+    let (bw, bh) = (w * SS, h * SS);
+    let mut bi: BITMAPINFO = zeroed();
+    bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = bw;
+    bi.bmiHeader.biHeight = -bh; // von oben nach unten
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    let mut bits: *mut c_void = null_mut();
+    let bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    if bmp.is_null() {
+        return;
+    }
+    let mem = CreateCompatibleDC(dc);
+    let old = SelectObject(mem, bmp);
+    // Maske: weiß = Akzentfarbe, schwarz = Hintergrund.
+    let (a, bg) = (rgb(255, 255, 255), rgb(0, 0, 0));
+    fill(mem, &RECT { left: 0, top: 0, right: bw, bottom: bh }, bg);
+    let s = s * SS as f32;
+    let at = |vx: f32, vy: f32| POINT { x: (vx * s).round() as i32, y: (vy * s).round() as i32 };
+    // Füllen ohne Rand. Ellipse statt `round`: RoundRect mit quadratischem
+    // Radius verzerrt nicht quadratische Flächen zu Spitzen.
+    let fill_with = |c: COLORREF, draw: &dyn Fn()| {
+        let brush = CreateSolidBrush(c);
+        let ob = SelectObject(mem, brush);
+        let op = SelectObject(mem, GetStockObject(NULL_PEN));
+        draw();
+        SelectObject(mem, op);
+        SelectObject(mem, ob);
+        DeleteObject(brush);
     };
-    let a = accent();
-    ellipse(1.0, 0.0, 17.0, 20.0, a);
-    ellipse(4.0, 7.5, 14.0, 19.0, BG);
-    // Augen mit Pupillen, darunter der Schnabel.
-    ellipse(5.0, 3.0, 8.5, 7.5, BG);
-    ellipse(9.5, 3.0, 13.0, 7.5, BG);
-    ellipse(6.5, 4.5, 8.0, 6.5, a);
-    ellipse(10.0, 4.5, 11.5, 6.5, a);
-    ellipse(5.5, 6.5, 12.5, 9.5, a);
-    ellipse(1.0, 18.0, 8.0, 22.0, a);
-    ellipse(10.0, 18.0, 17.0, 22.0, a);
+    let ellipse = |x0: f32, y0: f32, x1: f32, y1: f32, c: COLORREF| {
+        let (a, b) = (at(x0, y0), at(x1, y1));
+        // Mit NULL_PEN lässt Ellipse rechts/unten ein Pixel weg.
+        fill_with(c, &|| {
+            Ellipse(mem, a.x, a.y, b.x + 1, b.y + 1);
+        });
+    };
+    let polygon = |pts: [(f32, f32); 4], c: COLORREF| {
+        let pts = pts.map(|(vx, vy)| at(vx, vy));
+        fill_with(c, &|| {
+            Polygon(mem, pts.as_ptr(), pts.len() as i32);
+        });
+    };
+    // Umriss: Silhouette aus Rumpf, Kopf und Flossen, innen wieder ausgespart.
+    const T: f32 = 1.0;
+    ellipse(2.5, 6.5, 17.5, 21.5, a);
+    ellipse(5.5, 0.0, 14.5, 11.5, a);
+    polygon([(4.2, 9.0), (1.0, 16.5), (2.6, 18.2), (5.6, 12.5)], a);
+    polygon([(15.8, 9.0), (19.0, 16.5), (17.4, 18.2), (14.4, 12.5)], a);
+    ellipse(2.5 + T, 6.5 + T, 17.5 - T, 21.5 - T, bg);
+    ellipse(5.5 + T, T, 14.5 - T, 11.5 - T, bg);
+    polygon([(4.6, 10.5), (2.0, 16.3), (2.9, 17.2), (5.8, 13.2)], bg);
+    polygon([(15.4, 10.5), (18.0, 16.3), (17.1, 17.2), (14.2, 13.2)], bg);
+    ellipse(5.5, 9.5, 15.0, 20.5, a); // Bauch
+    // Augen mit Pupillen, darunter der breite Schnabel.
+    ellipse(7.4, 3.4, 9.9, 6.8, a);
+    ellipse(10.1, 3.4, 12.6, 6.8, a);
+    ellipse(8.5, 4.4, 9.5, 6.1, bg);
+    ellipse(10.5, 4.4, 11.5, 6.1, bg);
+    ellipse(7.0, 5.8, 13.0, 8.4, a);
+    ellipse(0.2, 17.0, 8.8, 22.0, a); // Füße
+    ellipse(11.2, 17.0, 19.8, 22.0, a);
+    GdiFlush();
+    let mask = std::slice::from_raw_parts(bits as *const u8, (bw * bh * 4) as usize);
+    let accent = accent();
+    for py in 0..h {
+        for px_ in 0..w {
+            let mut sum = 0u32;
+            for sy in 0..SS {
+                let row = ((py * SS + sy) * bw + px_ * SS) as usize * 4;
+                for sx in 0..SS as usize {
+                    sum += mask[row + sx * 4 + 1] as u32;
+                }
+            }
+            if sum == 0 {
+                continue;
+            }
+            let k = sum as f32 / (255 * SS * SS) as f32;
+            let under = GetPixel(dc, x + px_, y + py);
+            SetPixelV(dc, x + px_, y + py, mix(under, accent, k));
+        }
+    }
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
 }
 
 /// Uhr samt Hover-Fläche zeichnen (volles Zeichnen und Schnellweg).
