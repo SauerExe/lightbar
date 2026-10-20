@@ -27,15 +27,35 @@ impl GlowStyle {
     }
 }
 
+/// Startsymbol. Standard ist der eigene Orb: Das Windows-Logo ist eine Marke
+/// von Microsoft und soll nicht ungefragt erscheinen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StartLogo {
+    Orb,
+    Windows,
+    Tux,
+}
+
+impl StartLogo {
+    fn key(self) -> &'static str {
+        match self {
+            StartLogo::Orb => "orb",
+            StartLogo::Windows => "windows",
+            StartLogo::Tux => "tux",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        [StartLogo::Orb, StartLogo::Windows, StartLogo::Tux].into_iter().find(|l| l.key() == s)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Settings {
     pub glow: GlowStyle,
     pub mono_tray: bool,
     pub clock_seconds: bool,
     pub show_usage: bool,
-    /// Windows-Logo statt des eigenen Orbs als Startsymbol. Standard aus: Das
-    /// Logo ist eine Marke von Microsoft und soll nicht ungefragt erscheinen.
-    pub windows_logo: bool,
+    pub start_logo: StartLogo,
     /// Präsentationsmodus (Streamen, Bildschirm teilen): keine persönlichen
     /// Daten – Name, zuletzt verwendete Dateien, Dateitreffer, Usage.
     pub presentation: bool,
@@ -43,7 +63,7 @@ pub struct Settings {
 
 // Usage-Anzeige standardmäßig aus: Sie liest lokale Logins und nutzt nicht
 // offiziell dokumentierte Schnittstellen – das soll man bewusst einschalten.
-const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: false, windows_logo: false, presentation: false };
+const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: false, start_logo: StartLogo::Orb, presentation: false };
 
 static CURRENT: Mutex<Option<Settings>> = Mutex::new(None);
 
@@ -66,7 +86,9 @@ fn load() -> Settings {
                     "mono_tray" => s.mono_tray = on,
                     "clock_seconds" => s.clock_seconds = on,
                     "show_usage" => s.show_usage = on,
-                    "windows_logo" => s.windows_logo = on,
+                    "start_logo" => s.start_logo = StartLogo::parse(v).unwrap_or(s.start_logo),
+                    // Frühere Ja/Nein-Einstellung (bis 0.2.2).
+                    "windows_logo" if on => s.start_logo = StartLogo::Windows,
                     "presentation" => s.presentation = on,
                     _ => {}
                 }
@@ -92,12 +114,12 @@ fn save(s: &Settings) {
     let _ = std::fs::create_dir_all(&dir);
     let b = |v: bool| if v { "1" } else { "0" };
     let text = format!(
-        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\nwindows_logo={}\npresentation={}\n",
+        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\nstart_logo={}\npresentation={}\n",
         s.glow.key(),
         b(s.mono_tray),
         b(s.clock_seconds),
         b(s.show_usage),
-        b(s.windows_logo),
+        s.start_logo.key(),
         b(s.presentation)
     );
     let _ = std::fs::write(dir.join("settings.txt"), text);

@@ -847,7 +847,7 @@ unsafe fn more_menu(hwnd: HWND) {
 const MONITOR_IDS: usize = 50;
 
 unsafe fn bar_menu(hwnd: HWND) {
-    use crate::settings::GlowStyle;
+    use crate::settings::{GlowStyle, StartLogo};
     let s = crate::settings::get();
     let glow = |id, label, style| Item::Check(id, label, s.glow == style);
     // Bildschirme: Hauptbildschirm hat immer eine Leiste; die übrigen einzeln
@@ -878,7 +878,14 @@ unsafe fn bar_menu(hwnd: HWND) {
                     glow(13, "Aus", GlowStyle::Off),
                 ],
             ),
-            Item::Sub("Startsymbol", vec![Item::Check(16, "Orb", !s.windows_logo), Item::Check(17, "Windows-Logo", s.windows_logo)]),
+            Item::Sub(
+                "Startsymbol",
+                vec![
+                    Item::Check(16, "Orb", s.start_logo == StartLogo::Orb),
+                    Item::Check(17, "Windows-Logo", s.start_logo == StartLogo::Windows),
+                    Item::Check(21, "Tux", s.start_logo == StartLogo::Tux),
+                ],
+            ),
             Item::Check(14, "Uhr mit Sekunden", s.clock_seconds),
             Item::Check(15, "Claude/Codex-Usage anzeigen", s.show_usage),
             Item::Check(5, "Tray-Icons einfarbig", s.mono_tray),
@@ -900,8 +907,9 @@ unsafe fn bar_menu(hwnd: HWND) {
             crate::settings::update(|s| s.clock_seconds = !s.clock_seconds);
             schedule_clock(hwnd);
         }
-        16 => crate::settings::update(|s| s.windows_logo = false),
-        17 => crate::settings::update(|s| s.windows_logo = true),
+        16 => crate::settings::update(|s| s.start_logo = StartLogo::Orb),
+        17 => crate::settings::update(|s| s.start_logo = StartLogo::Windows),
+        21 => crate::settings::update(|s| s.start_logo = StartLogo::Tux),
         15 => crate::settings::update(|s| s.show_usage = !s.show_usage),
         5 => crate::settings::update(|s| s.mono_tray = !s.mono_tray),
         18 => crate::settings::update(|s| s.presentation = !s.presentation),
@@ -1966,7 +1974,13 @@ unsafe fn tick_secondaries() {
 /// Kern, Glanzpunkt); auf Wunsch das Windows-Logo (Marke von Microsoft,
 /// deshalb nicht voreingestellt).
 unsafe fn draw_logo(dc: HDC, r: &RECT, dpi: u32) {
-    if crate::settings::get().windows_logo {
+    use crate::settings::StartLogo;
+    let logo = crate::settings::get().start_logo;
+    if logo == StartLogo::Tux {
+        draw_tux(dc, r, dpi);
+        return;
+    }
+    if logo == StartLogo::Windows {
         let (q, gap) = (px(dpi, 8), px(dpi, 1).max(1));
         let size = 2 * q + gap;
         let x = r.left + (r.right - r.left - size) / 2;
@@ -1987,6 +2001,31 @@ unsafe fn draw_logo(dc: HDC, r: &RECT, dpi: u32) {
     let shine = px(dpi, 4).max(2);
     let (sx, sy) = (x + px(dpi, 5), y + px(dpi, 5));
     round(dc, &RECT { left: sx, top: sy, right: sx + shine, bottom: sy + shine }, mix(accent(), rgb(255, 255, 255), 0.6), shine);
+}
+
+/// Tux aus Ellipsen, entworfen auf 18 × 22 px bei 100 %. Der schwarze Körper
+/// bekommt einen grauen Rand, sonst verschwindet er auf der dunklen Leiste.
+unsafe fn draw_tux(dc: HDC, r: &RECT, dpi: u32) {
+    let s = dpi as f32 / 96.0;
+    let (w, h) = ((18.0 * s).round() as i32, (22.0 * s).round() as i32);
+    let (x, y) = (r.left + (r.right - r.left - w) / 2, r.top + (r.bottom - r.top - h) / 2);
+    let ellipse = |x0: f32, y0: f32, x1: f32, y1: f32, c: COLORREF| {
+        let e = RECT { left: x + (x0 * s).round() as i32, top: y + (y0 * s).round() as i32, right: x + (x1 * s).round() as i32, bottom: y + (y1 * s).round() as i32 };
+        round(dc, &e, c, (e.right - e.left).max(e.bottom - e.top) + 1);
+    };
+    let (black, white) = (rgb(16, 16, 16), rgb(242, 242, 242));
+    let (beak, feet) = (rgb(250, 196, 40), rgb(240, 150, 20));
+    ellipse(0.5, 0.0, 17.5, 20.5, rgb(120, 120, 120));
+    ellipse(1.5, 1.0, 16.5, 19.5, black);
+    ellipse(4.0, 7.5, 14.0, 19.0, white);
+    // Augen mit Pupillen, darunter der Schnabel.
+    ellipse(5.0, 3.0, 8.5, 7.5, white);
+    ellipse(9.5, 3.0, 13.0, 7.5, white);
+    ellipse(6.5, 4.5, 8.0, 6.5, black);
+    ellipse(10.0, 4.5, 11.5, 6.5, black);
+    ellipse(5.5, 6.5, 12.5, 9.5, beak);
+    ellipse(1.0, 18.0, 8.0, 22.0, feet);
+    ellipse(10.0, 18.0, 17.0, 22.0, feet);
 }
 
 /// Uhr samt Hover-Fläche zeichnen (volles Zeichnen und Schnellweg).
