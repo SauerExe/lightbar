@@ -69,9 +69,22 @@ enum Hit {
     TaskMgr,
 }
 
+#[derive(Clone)]
+struct Drag {
+    slot: String,
+    start_x: i32,
+    x: i32,
+    /// Erst ab ein paar Pixeln Bewegung wird aus dem Klick ein Ziehen.
+    active: bool,
+}
+
 /// Ein Button: alle Fenster einer App (wie bei Windows 11 gruppiert).
 #[derive(Clone)]
 struct Group {
+    /// Fester Platz in der Reihenfolge: Anheft-Eintrag bei angehefteten Apps,
+    /// sonst der Gruppenschlüssel. Bleibt gleich, wenn eine angeheftete App
+    /// ein Fenster öffnet (und ihr Schlüssel z. B. zur AppUserModelID wird).
+    slot: String,
     /// "aumid:<AppUserModelID>" oder "exe:<pfad>" – Gruppier- und Anheft-Schlüssel.
     key: String,
     /// Kleingeschriebener exe-Pfad, soweit ermittelbar.
@@ -93,6 +106,10 @@ struct State {
     /// Je Fenster: (exe, Gruppenschlüssel) – einmal ermittelt, dann gecacht.
     info: HashMap<usize, (Option<String>, String)>,
     pins: Vec<String>,
+    /// Vom Nutzer per Ziehen festgelegte Reihenfolge (Platz-Schlüssel).
+    order: Vec<String>,
+    /// Laufendes Ziehen eines Buttons.
+    drag: Option<Drag>,
     status: Option<Status>,
     hover: Hit,
     tracking: bool,
@@ -442,13 +459,13 @@ unsafe fn refresh(hwnd: HWND, refetch: Option<HWND>) {
     let mut found: Vec<HWND> = Vec::new();
     EnumWindows(Some(enum_cb), &mut found as *mut _ as LPARAM);
     found.reverse();
-    let Some((mut old, size, cached_size, pins, mut info)) = with(|s| {
+    let Some((mut old, size, cached_size, pins, mut info, user_order)) = with(|s| {
         let size = px(s.dpi, ICON);
         let cached = s.icon_px;
         s.icon_px = size;
         // Kopie statt take: Icon-Abfragen können Nachrichten pumpen, ein Paint
         // dazwischen soll weiter die alte Liste zeichnen statt einer leeren.
-        (s.groups.clone(), size, cached, s.pins.clone(), s.info.clone())
+        (s.groups.clone(), size, cached, s.pins.clone(), s.info.clone(), s.order.clone())
     }) else {
         return;
     };
@@ -482,17 +499,25 @@ unsafe fn refresh(hwnd: HWND, refetch: Option<HWND>) {
     }
     grouped.sort_by_key(|g| old.iter().position(|o| o.key == g.0).unwrap_or(usize::MAX));
 
+    // (Platz, Schlüssel, exe, Fenster): angeheftete zuerst, dann der Rest.
     let mut ordered = Vec::with_capacity(grouped.len() + pins.len());
     for pin in &pins {
         match grouped.iter().position(|g| &g.0 == pin || g.1.as_deref().map(exe_key).as_ref() == Some(pin)) {
-            Some(i) => ordered.push(grouped.remove(i)),
-            None => ordered.push((pin.clone(), pin.strip_prefix("exe:").map(String::from), Vec::new())),
+            Some(i) => {
+                let (key, exe, windows) = grouped.remove(i);
+                ordered.push((pin.clone(), key, exe, windows));
+            }
+            None => ordered.push((pin.clone(), pin.clone(), pin.strip_prefix("exe:").map(String::from), Vec::new())),
         }
     }
-    ordered.extend(grouped);
+    ordered.extend(grouped.into_iter().map(|(key, exe, windows)| (key.clone(), key, exe, windows)));
+    // Selbst sortierte Reihenfolge hat Vorrang; Neues kommt ans Ende.
+    if !user_order.is_empty() {
+        ordered.sort_by_key(|g| user_order.iter().position(|s| *s == g.0).unwrap_or(usize::MAX));
+    }
 
     let mut groups = Vec::with_capacity(ordered.len());
-    for (key, exe, windows) in ordered {
+    for (slot, key, exe, windows) in ordered {
         let reuse = cached_size == size && !refetch.is_some_and(|r| windows.contains(&r));
         let cached = if reuse { old.iter().position(|g| g.key == key) } else { None };
         let (icon, owned) = match cached {
@@ -502,7 +527,7 @@ unsafe fn refresh(hwnd: HWND, refetch: Option<HWND>) {
             }
             None => group_icon(&key, exe.as_deref(), windows.first().copied(), size),
         };
-        groups.push(Group { key, exe, windows, icon, owned });
+        groups.push(Group { slot, key, exe, windows, icon, owned });
     }
     // Alles, was nicht übernommen wurde, ist weg oder ersetzt.
     for g in old {
@@ -972,6 +997,66 @@ unsafe fn kick(hwnd: HWND) {
     SetTimer(hwnd, TIMER_ANIM, 16, None);
 }
 
+/// Während des Ziehens: Button folgt der Maus, die anderen weichen aus.
+/// 	rue, wenn gerade gezogen wird (dann kein normales Hover).
+unsafe fn drag_move(hwnd: HWND, x: i32) -> bool {
+    let Some((l, _)) = current_layout(hwnd) else { return false };
+    let moving = with(|s| {
+        let d = s.dpi;
+        let drag = s.drag.as_mut()?;
+        drag.x = x;
+        if !drag.active {
+            if (x - drag.start_x).abs() < px(d, 6) {
+                return Some(false);
+            }
+            drag.active = true;
+            s.anim.press = None;
+        }
+        let slot = drag.slot.clone();
+        let cur = s.groups.iter().position(|g| g.slot == slot)?;
+        // Ziel = Anzahl der anderen Buttons, deren Mitte links vom Zeiger liegt.
+        let target = l.tasks.iter().enumerate().filter(|(i, r)| *i != cur && (r.left + r.right) / 2 < x).count();
+        if target != cur && target < s.groups.len() {
+            let g = s.groups.remove(cur);
+            s.groups.insert(target, g);
+            s.order = s.groups.iter().map(|g| g.slot.clone()).collect();
+        }
+        Some(true)
+    })
+    .flatten();
+    if moving != Some(true) {
+        return false;
+    }
+    crate::tooltip::hide();
+    crate::preview::hide();
+    kick(hwnd);
+    InvalidateRect(hwnd, null(), 0);
+    true
+}
+
+/// Ziehen beenden. Angeheftete Apps behalten die neue Reihenfolge dauerhaft.
+/// 	rue, wenn wirklich gezogen wurde (dann ist es kein Klick).
+unsafe fn drag_end(hwnd: HWND) -> bool {
+    let Some(drag) = with(|s| s.drag.take()).flatten() else { return false };
+    ReleaseCapture();
+    if !drag.active {
+        return false;
+    }
+    with(|s| {
+        let mut pins: Vec<String> = s.groups.iter().filter(|g| s.pins.contains(&g.slot)).map(|g| g.slot.clone()).collect();
+        for p in &s.pins {
+            if !pins.contains(p) {
+                pins.push(p.clone());
+            }
+        }
+        s.pins = pins;
+        save_pins(&s.pins);
+    });
+    kick(hwnd);
+    InvalidateRect(hwnd, null(), 0);
+    true
+}
+
 /// Ein Animationsschritt; `true`, solange sich noch etwas bewegt.
 unsafe fn step_anim(hwnd: HWND) -> bool {
     let Some((l, _)) = current_layout(hwnd) else { return false };
@@ -1250,9 +1335,10 @@ unsafe fn paint(hwnd: HWND) {
             .iter()
             .map(|g| (format!("g:{}", g.key), g.windows.clone(), g.icon, g.windows.iter().any(|w| s.attention.contains(w))))
             .collect();
-        (s.dpi, s.font, s.icons, s.status.clone(), groups, s.anim.clone(), s.start.elapsed().as_secs_f32(), s.taskmgr_icon, s.cpu)
+        let dragged = s.drag.as_ref().filter(|d| d.active).and_then(|d| s.groups.iter().find(|g| g.slot == d.slot).map(|g| (format!("g:{}", g.key), d.x)));
+        (s.dpi, s.font, s.icons, s.status.clone(), groups, s.anim.clone(), s.start.elapsed().as_secs_f32(), s.taskmgr_icon, s.cpu, dragged)
     });
-    let Some((dpi, font, icons, status, groups, anim, t, taskmgr_icon, cpu)) = snapshot else {
+    let Some((dpi, font, icons, status, groups, anim, t, taskmgr_icon, cpu, dragged)) = snapshot else {
         let mut ps: PAINTSTRUCT = zeroed();
         BeginPaint(hwnd, &mut ps);
         EndPaint(hwnd, &ps);
@@ -1285,7 +1371,14 @@ unsafe fn paint(hwnd: HWND) {
             let Some(base) = l.tasks.get(i) else { continue };
             // Weich nachrutschende Position.
             let dx = anim.x.get(id).map(|x| x.round() as i32 - base.left).unwrap_or(0);
-            let r = RECT { left: base.left + dx, right: base.right + dx, ..*base };
+            let mut r = RECT { left: base.left + dx, right: base.right + dx, ..*base };
+            // Gezogener Button klebt am Mauszeiger.
+            let is_dragged = dragged.as_ref().is_some_and(|(did, _)| did == id);
+            if let Some((_, mx)) = dragged.as_ref().filter(|_| is_dragged) {
+                let w = base.right - base.left;
+                r = RECT { left: mx - w / 2, right: mx - w / 2 + w, ..*base };
+                round(dc, &r, mix(ACTIVE, rgb(72, 72, 72), 0.6), radius);
+            }
             let active = windows.iter().any(|w| *w == fg);
             if *attention {
                 let pulse = 0.5 + 0.5 * (t * 6.0).sin();
@@ -1527,6 +1620,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSEMOVE => {
             let (x, y) = xy(lp);
+            if drag_move(hwnd, x) {
+                return 0;
+            }
             let h = hit_at(hwnd, x, y);
             let (changed, start_tracking) = with(|s| {
                 let changed = s.hover != h;
@@ -1591,13 +1687,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if hit != Hit::Chevron {
                 tray::hide_overflow();
             }
+            if let (WM_LBUTTONDOWN, Hit::Task(i)) = (msg, hit) {
+                // Möglicher Beginn eines Ziehens; zum Ziehen wird es erst ab ein paar Pixeln.
+                with(|s| s.drag = s.groups.get(i).map(|g| Drag { slot: g.slot.clone(), start_x: x, x, active: false }));
+                SetCapture(hwnd);
+            }
             if msg == WM_LBUTTONDOWN && matches!(hit, Hit::Task(_)) {
                 with(|s| s.anim.press = hit_id(hit, &s.groups).map(|id| (id, Instant::now())));
                 kick(hwnd);
             }
             0
         }
+        WM_CAPTURECHANGED => {
+            with(|s| s.drag = None);
+            0
+        }
         WM_LBUTTONUP => {
+            if drag_end(hwnd) {
+                return 0; // Gezogen, nicht geklickt.
+            }
             let (x, y) = xy(lp);
             match hit_at(hwnd, x, y) {
                 Hit::Chevron => {
@@ -1749,6 +1857,8 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
             groups: Vec::new(),
             info: HashMap::new(),
             pins: load_pins(),
+            order: Vec::new(),
+            drag: None,
             status: Some(status::poll()),
             hover: Hit::None,
             tracking: false,
