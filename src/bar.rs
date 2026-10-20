@@ -47,12 +47,18 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER_TICK: usize = 1;
 const TIMER_TIP: usize = 2;
 const TIMER_ANIM: usize = 3;
+const TIMER_CPU: usize = 5;
+const TIMER_SLOW: usize = 6;
+const TIMER_REFRESH: usize = 7;
 pub const WM_BAR_WINX: u32 = WM_APP + 30;
 pub const WM_BAR_NUM: u32 = WM_APP + 31;
 pub const WM_BAR_QUICK: u32 = WM_APP + 32;
 const WM_BAR_USAGE: u32 = WM_APP + 33;
 const WM_BAR_INVOKE: u32 = WM_APP + 34;
 pub const WM_BAR_FOCUS: u32 = WM_APP + 35;
+/// Lautstärke/Netz/Akku geändert (gepostet aus status).
+pub const WM_BAR_STATUS: u32 = WM_APP + 36;
+const WM_BAR_EVENT: u32 = WM_APP + 37;
 const USAGE_W: i32 = 236;
 const TASKMGR_W: i32 = 40;
 const VK_KEY_D: VIRTUAL_KEY = 0x44;
@@ -123,8 +129,6 @@ struct State {
     /// Eine Vollbild-App ist vorne: Leiste ausgeblendet.
     fullscreen: bool,
     anim: Anim,
-    /// Sekundenzähler für seltenere Aufgaben.
-    tick: u32,
     /// Systemlast fürs Task-Manager-Symbol (0..100) und letzte Messwerte.
     cpu: f32,
     ram: f32,
@@ -463,6 +467,7 @@ unsafe fn group_icon(key: &str, exe: Option<&str>, sample: Option<HWND>, size: i
 /// Icons werden nur für neue Gruppen, nach DPI-Wechsel oder für `refetch`
 /// (Fenster hat sein Icon geändert) neu erzeugt.
 unsafe fn refresh(hwnd: HWND, refetch: Option<HWND>) {
+    prof(2);
     let mut found: Vec<HWND> = Vec::new();
     EnumWindows(Some(enum_cb), &mut found as *mut _ as LPARAM);
     found.reverse();
@@ -548,6 +553,7 @@ unsafe fn refresh(hwnd: HWND, refetch: Option<HWND>) {
         s.info = info;
     });
     if changed {
+        prof(3);
         kick(hwnd);
         InvalidateRect(hwnd, null(), 0);
     }
@@ -766,7 +772,10 @@ unsafe fn bar_menu(hwnd: HWND) {
         11 => crate::glow::set_style(GlowStyle::Accent),
         12 => crate::glow::set_style(GlowStyle::Neon),
         13 => crate::glow::set_style(GlowStyle::Off),
-        14 => crate::settings::update(|s| s.clock_seconds = !s.clock_seconds),
+        14 => {
+            crate::settings::update(|s| s.clock_seconds = !s.clock_seconds);
+            schedule_clock(hwnd);
+        }
         16 => crate::settings::update(|s| s.windows_logo = false),
         17 => crate::settings::update(|s| s.windows_logo = true),
         15 => crate::settings::update(|s| s.show_usage = !s.show_usage),
@@ -892,6 +901,94 @@ unsafe fn cycle_group(g: &Group, forward: bool) {
     if let Some(&h) = next {
         activate(h);
     }
+}
+
+// ------------------------------------------------------------- Profil
+//
+// Mit LIGHTBAR_PROFILE=1 zählt die Leiste, was sie aufweckt, und schreibt die
+// Zahlen alle 30 s nach %APPDATA%\Lightbar\profile.txt.
+
+pub static PROF: [std::sync::atomic::AtomicU32; 8] = [const { std::sync::atomic::AtomicU32::new(0) }; 8];
+const PROF_NAMES: [&str; 8] = ["shell-hook", "winevent", "refresh", "refresh-geändert", "paint", "timer", "status", "copydata"];
+
+pub fn prof(i: usize) {
+    PROF[i].fetch_add(1, Ordering::Relaxed);
+}
+
+thread_local! {
+    static PROF_DETAIL: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+}
+
+fn dump_profile() {
+    if std::env::var("LIGHTBAR_PROFILE").is_err() {
+        return;
+    }
+    let mut detail: Vec<(String, u32)> = PROF_DETAIL.with(|d| d.borrow_mut().drain().collect());
+    detail.sort_by(|a, b| b.1.cmp(&a.1));
+    let top: Vec<String> = detail.iter().take(6).map(|(k, v)| format!("{k}={v}")).collect();
+    let line: Vec<String> = PROF.iter().zip(PROF_NAMES).map(|(c, n)| format!("{n}={}", c.swap(0, Ordering::Relaxed))).collect();
+    if let Some(dir) = crate::util::data_dir() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("profile.txt")) {
+            let _ = writeln!(f, "{}", line.join(" "));
+            let _ = writeln!(f, "  Code:Klasse:exe → {}", top.join(", "));
+        }
+    }
+}
+
+/// Uhr-Zeitgeber auf den nächsten Sekunden- bzw. Minutenwechsel stellen.
+unsafe fn schedule_clock(hwnd: HWND) {
+    let mut st: SYSTEMTIME = zeroed();
+    GetLocalTime(&mut st);
+    let ms = st.wMilliseconds as u32;
+    let due = if crate::settings::get().clock_seconds { 1000 - ms } else { (60 - st.wSecond as u32) * 1000 - ms };
+    SetTimer(hwnd, TIMER_TICK, due.max(20), None);
+}
+
+/// Status neu lesen; nur bei Änderung die Status-Symbole neu zeichnen.
+unsafe fn update_status(hwnd: HWND) {
+    let s = status::poll();
+    let changed = with(|st| {
+        let changed = st.status.as_ref() != Some(&s);
+        st.status = Some(s);
+        changed
+    })
+    .unwrap_or(false);
+    if changed {
+        if let Some((l, _)) = current_layout(hwnd) {
+            InvalidateRect(hwnd, &l.status, 0);
+        }
+    }
+}
+
+/// WinEvents (außerhalb unseres Prozesses, nur Fenster-Objekte) an die Leiste weiterreichen.
+unsafe extern "system" fn win_event(_: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK, event: u32, h: HWND, object: i32, child: i32, _: u32, _: u32) {
+    if h.is_null() || object != OBJID_WINDOW || child != 0 {
+        return;
+    }
+    // Ein-/Ausblenden passiert ständig (Menüs, Tooltips, Konsolen): nur
+    // weiterreichen, wenn es ein Leisten-Fenster ist oder wird.
+    if event == EVENT_OBJECT_SHOW && !is_task_window(h) {
+        return;
+    }
+    if event == EVENT_OBJECT_HIDE && !is_known(h) {
+        return;
+    }
+    PostMessageW(self::hwnd(), WM_BAR_EVENT, event as usize, 0);
+}
+
+/// Steht das Fenster gerade als Button auf der Leiste?
+fn is_known(h: HWND) -> bool {
+    with(|s| s.groups.iter().any(|g| g.windows.contains(&h))).unwrap_or(false)
+}
+
+/// Vordergrundwechsel, Cloaking (virtuelle Desktops) und Ein-/Ausblenden abonnieren.
+unsafe fn install_win_events() {
+    use windows_sys::Win32::UI::Accessibility::SetWinEventHook;
+    let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+    SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, null_mut(), Some(win_event), 0, 0, flags);
+    SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, null_mut(), Some(win_event), 0, 0, flags);
+    SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, null_mut(), Some(win_event), 0, 0, flags);
 }
 
 /// Win+1…9: n-ten Button aktivieren oder starten.
@@ -1688,7 +1785,66 @@ unsafe fn draw_logo(dc: HDC, r: &RECT, dpi: u32) {
     round(dc, &RECT { left: sx, top: sy, right: sx + shine, bottom: sy + shine }, mix(accent(), rgb(255, 255, 255), 0.6), shine);
 }
 
+/// Uhr samt Hover-Fläche zeichnen (volles Zeichnen und Schnellweg).
+unsafe fn draw_clock(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
+    if hover > 0.01 {
+        round(dc, r, mix(BG, HOVER, hover), px(dpi, 6));
+    }
+    let mut st: SYSTEMTIME = zeroed();
+    GetLocalTime(&mut st);
+    let mid = (r.top + r.bottom) / 2;
+    let flags = DT_RIGHT | DT_SINGLELINE;
+    let cr = RECT { right: r.right - px(dpi, 10), ..*r };
+    let time = if crate::settings::get().clock_seconds {
+        format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
+    } else {
+        format!("{:02}:{:02}", st.wHour, st.wMinute)
+    };
+    text(dc, &time, &RECT { bottom: mid, ..cr }, font, TEXT, flags | DT_BOTTOM);
+    text(dc, &format!("{:02}.{:02}.{}", st.wDay, st.wMonth, st.wYear), &RECT { top: mid, ..cr }, font, TEXT, flags | DT_TOP);
+}
+
+/// Ist nur die Uhr ungültig (Sekunden-/Minutentakt)?
+unsafe fn clock_only_update(hwnd: HWND) -> Option<RECT> {
+    let mut ur: RECT = zeroed();
+    if GetUpdateRect(hwnd, &mut ur, 0) == 0 {
+        return None;
+    }
+    let (l, _) = current_layout(hwnd)?;
+    let c = l.clock;
+    (ur.left >= c.left && ur.right <= c.right && ur.top >= c.top && ur.bottom <= c.bottom).then_some(c)
+}
+
+/// Schnellweg: nur die Uhr in einen kleinen Puffer zeichnen statt der ganzen Leiste.
+unsafe fn paint_clock_only(hwnd: HWND, c: RECT) {
+    let Some((dpi, font, k)) = with(|s| {
+        let hover = if s.hover_hwnd == hwnd { s.anim.hover.get("clock").copied().unwrap_or(0.0) } else { 0.0 };
+        (s.dpi, s.font, if crate::calendar::visible() { 1.0 } else { hover })
+    }) else {
+        return;
+    };
+    let mut ps: PAINTSTRUCT = zeroed();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let (w, h) = (c.right - c.left, c.bottom - c.top);
+    let mem = CreateCompatibleDC(hdc);
+    let bmp = CreateCompatibleBitmap(hdc, w, h);
+    let old = SelectObject(mem, bmp);
+    // Leisten-Koordinaten beibehalten: Ursprung des Puffers liegt bei der Uhr.
+    SetViewportOrgEx(mem, -c.left, -c.top, null_mut());
+    fill(mem, &c, BG);
+    draw_clock(mem, &c, dpi, font, k);
+    BitBlt(hdc, c.left, c.top, w, h, mem, c.left, c.top, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    EndPaint(hwnd, &ps);
+}
+
 unsafe fn paint(hwnd: HWND) {
+    if let Some(c) = clock_only_update(hwnd) {
+        paint_clock_only(hwnd, c);
+        return;
+    }
     let snapshot = with(|s| {
         let groups: Vec<(String, Vec<HWND>, HICON, bool)> = s
             .groups
@@ -1815,19 +1971,7 @@ unsafe fn paint(hwnd: HWND) {
 
         // Uhr
         let k = if crate::calendar::visible() { 1.0 } else { hv("clock") };
-        hover_bg(dc, &l.clock, k);
-        let mut st: SYSTEMTIME = zeroed();
-        GetLocalTime(&mut st);
-        let mid = (l.clock.top + l.clock.bottom) / 2;
-        let flags = DT_RIGHT | DT_SINGLELINE;
-        let cr = RECT { right: l.clock.right - px(dpi, 10), ..l.clock };
-        let time = if settings.clock_seconds {
-            format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
-        } else {
-            format!("{:02}:{:02}", st.wHour, st.wMinute)
-        };
-        text(dc, &time, &RECT { bottom: mid, ..cr }, font, TEXT, flags | DT_BOTTOM);
-        text(dc, &format!("{:02}.{:02}.{}", st.wDay, st.wMonth, st.wYear), &RECT { top: mid, ..cr }, font, TEXT, flags | DT_TOP);
+        draw_clock(dc, &l.clock, dpi, font, k);
 
         if settings.show_usage && !settings.presentation {
             draw_usage(dc, &l.usage, dpi, font, hv("usage"));
@@ -1865,6 +2009,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         return 0;
     }
     if shell_msg != 0 && msg == shell_msg {
+        prof(0);
         // HSHELL_FLASH (0x8006): Fenster will Aufmerksamkeit; Aktivierung beendet das.
         let target = lp as HWND;
         match wp as u32 {
@@ -1877,17 +2022,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             _ => {}
         }
-        let code = (wp & 0x7fff) as u32;
-        let refetch = (code == HSHELL_REDRAW || code == HSHELL_WINDOWREPLACED).then_some(lp as HWND);
-        refresh(hwnd, refetch);
-        // Aktivierungswechsel: Vollbild sofort erkennen, nicht erst im Sekundentakt.
-        update_fullscreen(hwnd);
-        sync_glow(hwnd);
-        kick(hwnd);
+        // Nur so viel tun wie nötig: REDRAW kommt bei jeder Titeländerung (Browser,
+        // Chats, Fortschrittsanzeigen) mehrmals pro Sekunde und ändert die Leiste nicht.
+        if std::env::var("LIGHTBAR_PROFILE").is_ok() {
+            let mut cls = [0u16; 64];
+            let n = GetClassNameW(target, cls.as_mut_ptr(), 64).max(0) as usize;
+            let exe = exe_of(target).unwrap_or_default();
+            let exe = exe.rsplit('\\').next().unwrap_or("").to_string();
+            PROF_DETAIL.with(|d| *d.borrow_mut().entry(format!("{}:{}:{}", wp & 0x7fff, String::from_utf16_lossy(&cls[..n]), exe)).or_insert(0) += 1);
+        }
+        match (wp & 0x7fff) as u32 {
+            // Nur Fenster, die auf die Leiste gehören – Hintergrundprozesse erzeugen
+            // ständig unsichtbare Fenster (z. B. Konsolen), die uns nichts angehen.
+            HSHELL_WINDOWCREATED if is_task_window(target) => refresh(hwnd, None),
+            HSHELL_WINDOWDESTROYED if is_known(target) => refresh(hwnd, None),
+            HSHELL_WINDOWREPLACED => refresh(hwnd, Some(target)),
+            HSHELL_WINDOWACTIVATED => {
+                // Aktiv-Strich wandert, Vollbild sofort erkennen.
+                update_fullscreen(hwnd);
+                sync_glow(hwnd);
+                kick(hwnd);
+            }
+            HSHELL_REDRAW if wp & 0x8000 != 0 => kick(hwnd), // Blinken (Aufmerksamkeit)
+            _ => {}
+        }
         return 0;
     }
     match msg {
         WM_COPYDATA => {
+            prof(7);
             if let Some(r) = tray::handle_copydata(lp) {
                 InvalidateRect(hwnd, null(), 0);
                 return r;
@@ -1902,11 +2065,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             result as LRESULT
         }
         WM_PAINT => {
+            prof(4);
+            let clock_only = clock_only_update(hwnd).is_some();
             paint(hwnd);
-            // Zweitleisten zeigen denselben Zustand: mitzeichnen.
+            // Zweitleisten zeigen denselben Zustand: mitzeichnen – beim Uhr-Takt nur die Uhr.
             if hwnd == self::hwnd() {
                 for h in secondaries() {
-                    InvalidateRect(h, null(), 0);
+                    match current_layout(h).filter(|_| clock_only) {
+                        Some((l, _)) => InvalidateRect(h, &l.clock, 0),
+                        None => InvalidateRect(h, null(), 0),
+                    };
                 }
             }
             0
@@ -1966,53 +2134,84 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             activate_nth(wp);
             0
         }
-        WM_TIMER => {
-            let tick = with(|s| {
-                s.tick = s.tick.wrapping_add(1);
-                s.tick
-            })
-            .unwrap_or(0);
-            // Jede Sekunde nur das Billige: Last messen, Vollbild prüfen, Status
-            // (Audio/WLAN sind in `status` gecacht) – und nur Uhr, Last-Balken
-            // und Status-Symbole neu zeichnen statt der ganzen Leiste.
-            update_fullscreen(hwnd);
-            measure_load();
-            let s = status::poll();
-            let status_changed = with(|st| {
-                let changed = st.status.as_ref() != Some(&s);
-                st.status = Some(s);
-                changed
-            })
-            .unwrap_or(false);
+        // Im Leerlauf soll Lightbar fast nichts tun: Änderungen kommen als
+        // Ereignisse (Shell-Hook, WinEvents, Audio-/Netz-/Akku-Meldungen).
+        // Zeitgeber gibt es nur für das, was sich wirklich mit der Zeit ändert.
+        WM_TIMER if wp == TIMER_TICK => {
+            prof(5);
+            // Uhr: genau zum nächsten Minuten- bzw. Sekundenwechsel.
             if let Some((l, _)) = current_layout(hwnd) {
-                for r in [l.clock, l.taskmgr] {
-                    InvalidateRect(hwnd, &r, 0);
-                }
-                if status_changed {
-                    InvalidateRect(hwnd, &l.status, 0);
+                InvalidateRect(hwnd, &l.clock, 0);
+            }
+            schedule_clock(hwnd);
+            0
+        }
+        WM_TIMER if wp == TIMER_CPU => {
+            // CPU-Balken: messen ist billig, neu zeichnen nur bei sichtbarer Änderung.
+            let before = with(|s| s.cpu).unwrap_or(0.0);
+            measure_load();
+            let after = with(|s| s.cpu).unwrap_or(0.0);
+            if (before / 5.0).round() != (after / 5.0).round() {
+                if let Some((l, _)) = current_layout(hwnd) {
+                    InvalidateRect(hwnd, &l.taskmgr, 0);
                 }
             }
-            // Alle 3 s der Rest. Neue/geschlossene Fenster meldet der Shell-Hook
-            // sofort; das hier fängt nur ab, was er nicht meldet (Desktop-Wechsel).
-            if tick % 3 == 0 {
-                refresh(hwnd, None);
-                tray::tick();
-                crate::shell::ensure_hidden();
-                fit_maximized(hwnd);
-                tick_secondaries();
-                // Vor Explorers Shell_TrayWnd bleiben, damit neue Tray-Icons zu uns kommen.
-                // Nur wenn nötig (Explorer liegt vorne), nie bei offenem Menü und nie
-                // über einer Vollbild-App – sonst verdeckt die Leiste Menüs, Popups, Spiele.
-                let first = FindWindowW(w16("Shell_TrayWnd").as_ptr(), null());
-                let fullscreen = with(|s| s.fullscreen).unwrap_or(false);
-                if first != hwnd && !menus::menu_open() && !fullscreen {
-                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                    crate::glow::raise();
-                }
-                sync_glow(hwnd);
+            0
+        }
+        WM_TIMER if wp == TIMER_REFRESH => {
+            // Gebündelte Fensterlisten-Aktualisierung nach WinEvents.
+            KillTimer(hwnd, TIMER_REFRESH);
+            refresh(hwnd, None);
+            0
+        }
+        WM_TIMER if wp == TIMER_SLOW => {
+            // Sicherheitsnetz alle 30 s für das, was niemand meldet: WLAN-
+            // Signalstärke, verwaiste Tray-Icons, Explorer-Leiste wieder sichtbar,
+            // Z-Order gegenüber Explorer.
+            refresh(hwnd, None);
+            update_status(hwnd);
+            tray::tick();
+            crate::shell::ensure_hidden();
+            fit_maximized(hwnd);
+            tick_secondaries();
+            // Vor Explorers Shell_TrayWnd bleiben, damit neue Tray-Icons zu uns kommen.
+            // Nur wenn nötig (Explorer liegt vorne), nie bei offenem Menü und nie
+            // über einer Vollbild-App – sonst verdeckt die Leiste Menüs, Popups, Spiele.
+            let first = FindWindowW(w16("Shell_TrayWnd").as_ptr(), null());
+            let fullscreen = with(|s| s.fullscreen).unwrap_or(false);
+            if first != hwnd && !menus::menu_open() && !fullscreen {
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                crate::glow::raise();
             }
-            if with(|s| !s.attention.is_empty()).unwrap_or(false) {
-                kick(hwnd);
+            sync_glow(hwnd);
+            dump_profile();
+            0
+        }
+        // Lautstärke, Netzwerk oder Akku haben sich geändert (Meldung aus `status`).
+        WM_BAR_STATUS | WM_POWERBROADCAST => {
+            prof(6);
+            if msg == WM_BAR_STATUS {
+                status::invalidate_network();
+            }
+            update_status(hwnd);
+            if msg == WM_POWERBROADCAST {
+                return 1;
+            }
+            0
+        }
+        // WinEvents: Vordergrundwechsel (Vollbild, aktive App) und
+        // Ein-/Ausblenden von Fenstern beim Wechsel virtueller Desktops.
+        WM_BAR_EVENT => {
+            prof(1);
+            match wp as u32 {
+                EVENT_SYSTEM_FOREGROUND => {
+                    update_fullscreen(hwnd);
+                    tick_secondaries();
+                    kick(hwnd);
+                }
+                _ => {
+                    SetTimer(hwnd, TIMER_REFRESH, 150, None);
+                }
             }
             0
         }
@@ -2292,7 +2491,6 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
             tracking: null_mut(),
             fullscreen: false,
             anim: Anim::default(),
-            tick: 0,
             cpu: 0.0,
             ram: 0.0,
             cpu_times: (0, 0),
@@ -2307,7 +2505,11 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
     SHAppBarMessage(ABM_NEW, &mut abd);
     set_pos(hwnd);
     RegisterShellHookWindow(hwnd);
-    SetTimer(hwnd, TIMER_TICK, 1000, None);
+    schedule_clock(hwnd);
+    SetTimer(hwnd, TIMER_CPU, 2000, None);
+    SetTimer(hwnd, TIMER_SLOW, 30_000, None);
+    status::watch(hwnd);
+    install_win_events();
     refresh(hwnd, None);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     tray::announce();

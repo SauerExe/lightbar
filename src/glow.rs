@@ -221,6 +221,9 @@ unsafe fn frame() {
         let comet = (ct < 1.0).then(|| ct * (w as f32 + 400.0 * scale) - 200.0 * scale);
 
         let pixels = std::slice::from_raw_parts_mut(s.bits, (w * h * 4) as usize);
+        // Ausblend-Verlauf nach oben hängt nur von der Zeile ab: einmal pro Bild
+        // statt für jedes der ~40 000 Pixel (powf ist teuer).
+        let fade: Vec<f32> = (0..glow).map(|y| 0.5 * ((y + 1) as f32 / glow as f32).powf(2.4)).collect();
         for x in 0..w {
             let xf = x as f32;
             let mut i = 0.42 + 0.18 * (xf * 0.006 / scale + t * 1.1).sin() + 0.12 * (xf * 0.013 / scale - t * 1.7).sin();
@@ -245,14 +248,10 @@ unsafe fn frame() {
             g += (140.0 - g) * o;
             b += (0.0 - b) * o;
             let i = i.max(o * 1.2);
+            let line_alpha = (0.55 + 0.45 * i).min(1.0);
             for y in 0..h {
-                let a = if y >= glow {
-                    (0.55 + 0.45 * i).min(1.0)
-                } else {
-                    // Weiches Ausstrahlen nach oben (y = 0 ist der obere Rand).
-                    let k = (y + 1) as f32 / glow as f32;
-                    (i * 0.5 * k.powf(2.4)).min(1.0)
-                };
+                // Unten die Linie, darüber weiches Ausstrahlen (y = 0 ist der obere Rand).
+                let a = if y >= glow { line_alpha } else { (i * fade[y as usize]).min(1.0) };
                 let idx = ((y * w + x) * 4) as usize;
                 // Vormultipliziertes BGRA für UpdateLayeredWindow.
                 pixels[idx] = (b * a) as u8;

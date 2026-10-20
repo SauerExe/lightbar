@@ -1,12 +1,21 @@
 //! Systemstatus für die rechte Seite: Netzwerk, Lautstärke, Akku.
-//! Wird im Sekundentakt der Leiste abgefragt; alles davon ist billig.
+//!
+//! Ereignisgesteuert: Windows meldet Lautstärke- und Geräteänderungen (Audio-
+//! Callbacks) und Netzwerkwechsel (IP-Helper); die Leiste fragt dann neu ab.
+//! Akku kommt per WM_POWERBROADCAST direkt an die Leiste. Ein seltener
+//! Sicherheits-Abruf fängt den Rest ab (z. B. WLAN-Signalstärke).
 
 use std::cell::RefCell;
 use std::mem::zeroed;
 use std::ptr::null_mut;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+
+use windows::core::{implement, PCWSTR};
+use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl};
+use windows::Win32::Media::Audio::{EDataFlow, ERole, IMMNotificationClient, IMMNotificationClient_Impl, AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE};
+use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows_sys::Win32::Foundation::HANDLE;
@@ -38,10 +47,13 @@ struct Handles {
     endpoint: Option<(IAudioEndpointVolume, Instant)>,
     /// Letztes WLAN-Ergebnis; WLAN ändert sich selten, Abfrage alle 5 s.
     wifi: Option<(Option<(u32, String)>, Instant)>,
+    /// Rückmeldungen von Windows (nur gesetzt, wenn watch lief).
+    volume_watch: Option<IAudioEndpointVolumeCallback>,
+    device_watch: Option<IMMNotificationClient>,
 }
 
 thread_local! {
-    static HANDLES: RefCell<Handles> = const { RefCell::new(Handles { wlan: null_mut(), audio: None, endpoint: None, wifi: None }) };
+    static HANDLES: RefCell<Handles> = const { RefCell::new(Handles { wlan: null_mut(), audio: None, endpoint: None, wifi: None, volume_watch: None, device_watch: None }) };
 }
 
 unsafe fn wifi(h: &mut Handles) -> Option<(u32, String)> {
@@ -88,14 +100,105 @@ unsafe fn wifi(h: &mut Handles) -> Option<(u32, String)> {
 }
 
 unsafe fn endpoint(h: &mut Handles) -> Option<IAudioEndpointVolume> {
+    // Mit Rückmeldungen bleibt das Gerät offen, bis Windows einen Wechsel meldet;
+    // ohne sie wird es spätestens nach 10 s neu ermittelt.
+    let changed = DEVICE_CHANGED.swap(false, Ordering::Relaxed);
     if let Some((ep, at)) = &h.endpoint {
-        if at.elapsed() < Duration::from_secs(10) {
+        if !changed && (h.volume_watch.is_some() || at.elapsed() < Duration::from_secs(10)) {
             return Some(ep.clone());
         }
     }
     let ep = open_endpoint(h)?;
+    if let Some(cb) = &h.volume_watch {
+        if let Some((old, _)) = h.endpoint.take() {
+            let _ = old.UnregisterControlChangeNotify(cb);
+        }
+        let _ = ep.RegisterControlChangeNotify(cb);
+    }
     h.endpoint = Some((ep.clone(), Instant::now()));
     Some(ep)
+}
+
+// ------------------------------------------------------- Rückmeldungen
+
+/// Fenster, das bei Änderungen benachrichtigt wird (die Hauptleiste).
+static NOTIFY: AtomicIsize = AtomicIsize::new(0);
+/// Standard-Audiogerät gewechselt: beim nächsten Abruf neu öffnen.
+static DEVICE_CHANGED: AtomicBool = AtomicBool::new(false);
+
+fn notify() {
+    let h = NOTIFY.load(Ordering::Relaxed);
+    if h != 0 {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(h as _, crate::bar::WM_BAR_STATUS, 0, 0);
+        }
+    }
+}
+
+#[implement(IAudioEndpointVolumeCallback)]
+struct VolumeWatch;
+
+impl IAudioEndpointVolumeCallback_Impl for VolumeWatch_Impl {
+    fn OnNotify(&self, _: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows::core::Result<()> {
+        notify();
+        Ok(())
+    }
+}
+
+#[implement(IMMNotificationClient)]
+struct DeviceWatch;
+
+impl IMMNotificationClient_Impl for DeviceWatch_Impl {
+    fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnDeviceAdded(&self, _: &PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnDeviceRemoved(&self, _: &PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, _: &PCWSTR) -> windows::core::Result<()> {
+        if flow == eRender && role == eConsole {
+            DEVICE_CHANGED.store(true, Ordering::Relaxed);
+            notify();
+        }
+        Ok(())
+    }
+    fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+unsafe extern "system" fn on_network(_: *const core::ffi::c_void, _: *const windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPINTERFACE_ROW, _: windows_sys::Win32::NetworkManagement::IpHelper::MIB_NOTIFICATION_TYPE) {
+    notify();
+}
+
+/// Rückmeldungen einrichten; Änderungen kommen als WM_BAR_STATUS an hwnd.
+pub fn watch(hwnd: windows_sys::Win32::Foundation::HWND) {
+    NOTIFY.store(hwnd as isize, Ordering::Relaxed);
+    HANDLES.with(|cell| unsafe {
+        let h = &mut *cell.borrow_mut();
+        if h.audio.is_none() {
+            h.audio = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok();
+        }
+        let device: IMMNotificationClient = DeviceWatch.into();
+        if let Some(en) = &h.audio {
+            let _ = en.RegisterEndpointNotificationCallback(&device);
+        }
+        h.device_watch = Some(device);
+        h.volume_watch = Some(VolumeWatch.into());
+        // Aktuelles Gerät neu öffnen, damit die Lautstärke-Rückmeldung daran hängt.
+        DEVICE_CHANGED.store(true, Ordering::Relaxed);
+        let _ = endpoint(h);
+        let mut handle: windows_sys::Win32::Foundation::HANDLE = null_mut();
+        windows_sys::Win32::NetworkManagement::IpHelper::NotifyIpInterfaceChange(0, Some(on_network), std::ptr::null(), 0, &mut handle);
+    });
+}
+
+/// Netzwerk hat sich geändert: WLAN beim nächsten Abruf frisch lesen.
+pub fn invalidate_network() {
+    HANDLES.with(|cell| cell.borrow_mut().wifi = None);
 }
 
 unsafe fn open_endpoint(h: &mut Handles) -> Option<IAudioEndpointVolume> {
