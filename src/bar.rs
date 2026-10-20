@@ -1625,7 +1625,7 @@ unsafe fn draw_usage(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
 // Bildschirmen anzeigen" bei Windows 11). Sie teilt Zustand, Zeichnen und
 // Klicklogik mit der Hauptleiste – dieselbe WndProc, nur eine andere
 // Fensterklasse (Tray-Nachrichten gehen weiter nur an `Shell_TrayWnd`) und
-// eine eigene Platzreservierung auf ihrem Monitor. Leuchtrand, Tray-Übernahme,
+// eine eigene Platzreservierung auf ihrem Monitor. Tray-Übernahme,
 // Screenreader und Sekundentakt bleiben bei der Hauptleiste.
 
 static SECONDARY: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
@@ -1634,6 +1634,13 @@ static ANCHOR: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
 fn secondaries() -> Vec<HWND> {
     SECONDARY.lock().map(|v| v.iter().map(|&h| h as HWND).collect()).unwrap_or_default()
+}
+
+/// Hauptleiste und alle Zweitleisten.
+pub fn all_bars() -> Vec<HWND> {
+    let mut v = vec![hwnd()];
+    v.extend(secondaries());
+    v
 }
 
 /// Gehört das Fenster zu unseren Leisten (Haupt- oder Zweitleiste)?
@@ -1712,6 +1719,7 @@ pub unsafe fn sync_monitors() {
     if let Ok(mut v) = SECONDARY.lock() {
         *v = keep;
     }
+    crate::glow::sync();
 }
 
 unsafe fn create_secondary(inst: HINSTANCE, rect: RECT) -> Option<HWND> {
@@ -1746,15 +1754,21 @@ unsafe fn create_secondary(inst: HINSTANCE, rect: RECT) -> Option<HWND> {
 /// Sekundentakt der Hauptleiste für die Zweitleisten: maximierte Fenster
 /// kürzen und bei Vollbild auf ihrem Monitor aus-/einblenden.
 unsafe fn tick_secondaries() {
+    let mut changed = false;
     for h in secondaries() {
         fit_maximized(h);
         let full = foreground_fullscreen(h);
         let visible = IsWindowVisible(h) != 0;
         if full && visible {
             ShowWindow(h, SW_HIDE);
+            changed = true;
         } else if !full && !visible {
             SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            changed = true;
         }
+    }
+    if changed {
+        crate::glow::sync();
     }
 }
 

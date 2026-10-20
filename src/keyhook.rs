@@ -36,6 +36,10 @@ unsafe fn win_physically_down() -> bool {
     (GetAsyncKeyState(VK_LWIN as i32) as u16 & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN as i32) as u16 & 0x8000) != 0
 }
 
+unsafe fn modifier_down() -> bool {
+    [VK_SHIFT, VK_CONTROL, VK_MENU].iter().any(|&k| GetAsyncKeyState(k as i32) as u16 & 0x8000 != 0)
+}
+
 unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let k = &*(lp as *const KBDLLHOOKSTRUCT);
@@ -60,6 +64,11 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 WIN_DOWN.store(false, Ordering::Relaxed);
             } else if WIN_DOWN.load(Ordering::Relaxed) {
                 COMBO.store(true, Ordering::Relaxed);
+                // Mit Shift/Strg/Alt gehört das Kürzel Windows (z. B. Win+Shift+S
+                // = Bildschirmausschnitt, Strg+Win+Pfeil = Desktops).
+                if modifier_down() {
+                    return CallNextHookEx(null_mut(), code, wp, lp);
+                }
                 // Kürzel, die wir selbst bedienen; die Taste wird geschluckt.
                 let (target, msg, wp) = match vk {
                     VK_KEY_S => (start::hwnd(), start::WM_TOGGLE, 1),
