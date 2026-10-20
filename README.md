@@ -1,7 +1,7 @@
 # Lightbar
 
 A lightweight replacement for the Windows 11 taskbar and Start menu, written in Rust.
-Plain Win32 + GDI, no UI framework, a single ~600 KB executable using about 11 MB of RAM.
+Plain Win32 + GDI, no UI framework, a single ~650 KB executable using about 7 MB of RAM.
 
 ![Lightbar demo](docs/demo.gif)
 
@@ -31,15 +31,15 @@ Plain Win32 + GDI, no UI framework, a single ~600 KB executable using about 11 M
 
 ## Performance
 
-Measured idle on the author's machine (30 s each; small values, so treat as indicative):
+Lightbar is event-driven: when nothing happens it does almost nothing (no polling of volume, network, battery or the window list). Measured idle on the author's machine, 90 s per scenario, all other apps closed, clock with seconds enabled. CPU is reported in milliseconds of CPU time per second; Windows counts CPU time in 15.6 ms steps, so treat small differences as noise.
 
-| | CPU (whole shell) | Lightbar itself |
+| | CPU (Explorer + Start/Search hosts + Lightbar) | Lightbar itself |
 |---|---|---|
-| Lightbar, glow off | 6.3 ms/s | 3.1 ms/s · 11 MB |
-| Lightbar, neon glow | 17.2 ms/s | 15.6 ms/s · 11 MB |
-| Windows 11 taskbar | 14.1 ms/s | – |
+| Windows 11 taskbar | 1.4 ms/s | – |
+| Lightbar, glow off | 1.7 ms/s | 1.0 ms/s · 7 MB |
+| Lightbar, neon glow | 22.6 ms/s | 20.5 ms/s · 8 MB |
 
-Windows' own shell processes (Start menu host, search host, …) keep running in the background, so total memory does not go down.
+Without the glow, Lightbar is on par with the Windows taskbar. The animated glow costs about 20 ms of CPU per second. Windows' own shell processes (Explorer, Start menu host, search host) keep running in the background, so total memory goes up by Lightbar's ~7 MB rather than down.
 
 ## Install
 
