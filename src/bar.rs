@@ -99,6 +99,8 @@ struct State {
     /// Eine Vollbild-App ist vorne: Leiste ausgeblendet.
     fullscreen: bool,
     anim: Anim,
+    /// Sekundenzähler für seltenere Aufgaben.
+    tick: u32,
     /// Systemlast fürs Task-Manager-Symbol (0..100) und letzte Messwerte.
     cpu: f32,
     ram: f32,
@@ -450,6 +452,8 @@ unsafe fn refresh(hwnd: HWND, refetch: Option<HWND>) {
     }) else {
         return;
     };
+    // Fingerabdruck vorher: Nur bei echter Änderung neu zeichnen/animieren.
+    let before: Vec<(String, Vec<HWND>, usize)> = old.iter().map(|g| (g.key.clone(), g.windows.clone(), g.icon as usize)).collect();
 
     // Fenster in stabiler Reihenfolge: bekannte wie bisher, neue hinten.
     let mut order: Vec<HWND> = old.iter().flat_map(|g| g.windows.iter().copied()).filter(|h| found.contains(h)).collect();
@@ -506,12 +510,15 @@ unsafe fn refresh(hwnd: HWND, refetch: Option<HWND>) {
             DestroyIcon(g.icon);
         }
     }
+    let changed = groups.iter().map(|g| (g.key.clone(), g.windows.clone(), g.icon as usize)).ne(before);
     with(|s| {
         s.groups = groups;
         s.info = info;
     });
-    kick(hwnd);
-    InvalidateRect(hwnd, null(), 0);
+    if changed {
+        kick(hwnd);
+        InvalidateRect(hwnd, null(), 0);
+    }
 }
 
 // ---------------------------------------------------------------- Aktionen
@@ -1470,25 +1477,49 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_TIMER => {
-            // Fängt ab, was der Shell-Hook nicht meldet (z. B. Desktop-Wechsel), und tickt die Uhr.
-            refresh(hwnd, None);
-            tray::tick();
-            crate::shell::ensure_hidden();
-            let s = status::poll();
-            with(|st| st.status = Some(s));
-            fit_maximized(hwnd);
+            let tick = with(|s| {
+                s.tick = s.tick.wrapping_add(1);
+                s.tick
+            })
+            .unwrap_or(0);
+            // Jede Sekunde nur das Billige: Last messen, Vollbild prüfen, Status
+            // (Audio/WLAN sind in `status` gecacht) – und nur Uhr, Last-Balken
+            // und Status-Symbole neu zeichnen statt der ganzen Leiste.
             update_fullscreen(hwnd);
             measure_load();
-            // Vor Explorers Shell_TrayWnd bleiben, damit neue Tray-Icons zu uns kommen.
-            // Nur wenn nötig (Explorer liegt vorne), nie bei offenem Menü und nie
-            // über einer Vollbild-App – sonst verdeckt die Leiste Menüs, Popups, Spiele.
-            let first = FindWindowW(w16("Shell_TrayWnd").as_ptr(), null());
-            let fullscreen = with(|s| s.fullscreen).unwrap_or(false);
-            if first != hwnd && !menus::menu_open() && !fullscreen {
-                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                crate::glow::raise();
+            let s = status::poll();
+            let status_changed = with(|st| {
+                let changed = st.status.as_ref() != Some(&s);
+                st.status = Some(s);
+                changed
+            })
+            .unwrap_or(false);
+            if let Some((l, _)) = current_layout(hwnd) {
+                for r in [l.clock, l.taskmgr] {
+                    InvalidateRect(hwnd, &r, 0);
+                }
+                if status_changed {
+                    InvalidateRect(hwnd, &l.status, 0);
+                }
             }
-            sync_glow(hwnd);
+            // Alle 3 s der Rest. Neue/geschlossene Fenster meldet der Shell-Hook
+            // sofort; das hier fängt nur ab, was er nicht meldet (Desktop-Wechsel).
+            if tick % 3 == 0 {
+                refresh(hwnd, None);
+                tray::tick();
+                crate::shell::ensure_hidden();
+                fit_maximized(hwnd);
+                // Vor Explorers Shell_TrayWnd bleiben, damit neue Tray-Icons zu uns kommen.
+                // Nur wenn nötig (Explorer liegt vorne), nie bei offenem Menü und nie
+                // über einer Vollbild-App – sonst verdeckt die Leiste Menüs, Popups, Spiele.
+                let first = FindWindowW(w16("Shell_TrayWnd").as_ptr(), null());
+                let fullscreen = with(|s| s.fullscreen).unwrap_or(false);
+                if first != hwnd && !menus::menu_open() && !fullscreen {
+                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    crate::glow::raise();
+                }
+                sync_glow(hwnd);
+            }
             if with(|s| !s.attention.is_empty()).unwrap_or(false) {
                 kick(hwnd);
             }
@@ -1723,6 +1754,7 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
             tracking: false,
             fullscreen: false,
             anim: Anim::default(),
+            tick: 0,
             cpu: 0.0,
             ram: 0.0,
             cpu_times: (0, 0),

@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::mem::zeroed;
 use std::ptr::null_mut;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
@@ -33,10 +34,14 @@ pub struct Status {
 struct Handles {
     wlan: HANDLE,
     audio: Option<IMMDeviceEnumerator>,
+    /// Offenes Standard-Audiogerät; alle 10 s neu ermittelt (Kopfhörer-Wechsel).
+    endpoint: Option<(IAudioEndpointVolume, Instant)>,
+    /// Letztes WLAN-Ergebnis; WLAN ändert sich selten, Abfrage alle 5 s.
+    wifi: Option<(Option<(u32, String)>, Instant)>,
 }
 
 thread_local! {
-    static HANDLES: RefCell<Handles> = const { RefCell::new(Handles { wlan: null_mut(), audio: None }) };
+    static HANDLES: RefCell<Handles> = const { RefCell::new(Handles { wlan: null_mut(), audio: None, endpoint: None, wifi: None }) };
 }
 
 unsafe fn wifi(h: &mut Handles) -> Option<(u32, String)> {
@@ -83,6 +88,17 @@ unsafe fn wifi(h: &mut Handles) -> Option<(u32, String)> {
 }
 
 unsafe fn endpoint(h: &mut Handles) -> Option<IAudioEndpointVolume> {
+    if let Some((ep, at)) = &h.endpoint {
+        if at.elapsed() < Duration::from_secs(10) {
+            return Some(ep.clone());
+        }
+    }
+    let ep = open_endpoint(h)?;
+    h.endpoint = Some((ep.clone(), Instant::now()));
+    Some(ep)
+}
+
+unsafe fn open_endpoint(h: &mut Handles) -> Option<IAudioEndpointVolume> {
     if h.audio.is_none() {
         h.audio = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok();
     }
@@ -94,7 +110,16 @@ unsafe fn endpoint(h: &mut Handles) -> Option<IAudioEndpointVolume> {
 pub fn poll() -> Status {
     HANDLES.with(|cell| unsafe {
         let h = &mut *cell.borrow_mut();
-        let net = match wifi(h) {
+        let cached = h.wifi.as_ref().filter(|(_, at)| at.elapsed() < Duration::from_secs(5)).map(|(w, _)| w.clone());
+        let wifi_now = match cached {
+            Some(w) => w,
+            None => {
+                let w = wifi(h);
+                h.wifi = Some((w.clone(), Instant::now()));
+                w
+            }
+        };
+        let net = match wifi_now {
             Some((q, ssid)) => Net::Wifi(q, ssid),
             None => {
                 let mut flags = 0u32;

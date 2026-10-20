@@ -225,8 +225,12 @@ pub unsafe fn paint_buffered(hwnd: HWND, f: impl FnOnce(HDC, i32, i32)) {
     let mem = CreateCompatibleDC(hdc);
     let bmp = CreateCompatibleBitmap(hdc, w, h);
     let old = SelectObject(mem, bmp);
+    // Nur der ungültige Bereich wird wirklich gerastert; Zeichenaufrufe
+    // außerhalb kosten fast nichts (Teil-Neuzeichnen z. B. nur der Uhr).
+    let r = ps.rcPaint;
+    IntersectClipRect(mem, r.left, r.top, r.right, r.bottom);
     f(mem, w, h);
-    BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+    BitBlt(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, mem, r.left, r.top, SRCCOPY);
     SelectObject(mem, old);
     DeleteObject(bmp);
     DeleteDC(mem);
