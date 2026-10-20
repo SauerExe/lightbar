@@ -53,6 +53,20 @@ unsafe fn dark_menus() {
 
 fn main() {
     unsafe {
+        // Diagnose: Index-Suche ohne Oberfläche, Ergebnis nach %APPDATA%\rtaskbar\search-test.txt.
+        if std::env::args().nth(1).as_deref() == Some("--search-test") {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let q = std::env::args().nth(2).unwrap_or_default();
+            let t0 = std::time::Instant::now();
+            let text = match apps::search_index_checked(&q, 12) {
+                Ok(hits) => format!("{} Treffer in {} ms\n{}", hits.len(), t0.elapsed().as_millis(), hits.iter().map(|(n, p)| format!("{n} | {p}")).collect::<Vec<_>>().join("\n")),
+                Err(e) => format!("Fehler nach {} ms: {e}", t0.elapsed().as_millis()),
+            };
+            if let Ok(a) = std::env::var("APPDATA") {
+                let _ = std::fs::write(std::path::Path::new(&a).join("rtaskbar").join("search-test.txt"), text);
+            }
+            return;
+        }
         if std::env::args().nth(1).as_deref() == Some("--usage-test") {
             usage::self_test();
             return;

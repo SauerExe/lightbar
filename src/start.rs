@@ -26,6 +26,11 @@ use crate::util::*;
 
 pub const WM_TOGGLE: u32 = WM_APP + 10;
 const WM_RELOAD: u32 = WM_APP + 11;
+const WM_FILES: u32 = WM_APP + 12;
+const TIMER_FILES: usize = 4;
+
+/// Ergebnis der letzten Index-Suche: (Generation, Anfrage, Treffer).
+static FILE_RESULTS: std::sync::Mutex<Option<(u64, String, Vec<(String, String)>)>> = std::sync::Mutex::new(None);
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 // Logische Maße (96 DPI).
@@ -130,6 +135,11 @@ struct State {
     icons: HashMap<String, HBITMAP>,
     query: String,
     results: Vec<Row>,
+    /// Treffer aus dem Windows-Suchindex für iles_for.
+    files: Vec<Entry>,
+    files_for: String,
+    /// Laufende Nummer der Index-Suche; ältere Antworten werden verworfen.
+    files_gen: u64,
     view: View,
     sel: usize,
     scroll: i32,
@@ -325,6 +335,15 @@ fn search(st: &State) -> Vec<Row> {
     }
     hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.title.len().cmp(&b.1.title.len())));
     let mut rows: Vec<Row> = hits.into_iter().take(40).map(|(_, e)| Row::Item(e)).collect();
+
+    // Dateien aus dem Suchindex (sobald da und noch zur Anfrage passend),
+    // ohne Dopplungen mit "Zuletzt verwendet".
+    if st.files_for == st.query {
+        let recent_titles: Vec<String> = st.recent.iter().map(|e| e.title.to_lowercase()).collect();
+        for e in st.files.iter().filter(|e| !recent_titles.contains(&e.title.to_lowercase())).take(10) {
+            rows.push(Row::Item(e.clone()));
+        }
+    }
 
     let raw = st.query.trim();
     let home = std::env::var("USERPROFILE").unwrap_or_default();
@@ -715,9 +734,58 @@ fn hit(st: &State, x: i32, y: i32) -> Option<Act> {
     st.hits.iter().rev().find(|(r, _)| inside(r, x, y)).map(|(_, a)| a.clone())
 }
 
+/// Index-Suche für die aktuelle Anfrage im Hintergrund starten.
+unsafe fn start_file_search(hwnd: HWND) {
+    let Some((query, gen)) = with(|st| {
+        st.files_gen += 1;
+        (st.query.trim().to_string(), st.files_gen)
+    }) else {
+        return;
+    };
+    if query.chars().count() < 2 {
+        return; // Ein Zeichen findet zu viel, um nützlich zu sein.
+    }
+    let target = hwnd as isize;
+    std::thread::spawn(move || unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        let found = apps::search_index(&query, 12);
+        if let Ok(mut r) = FILE_RESULTS.lock() {
+            *r = Some((gen, query, found));
+        }
+        PostMessageW(target as HWND, WM_FILES, gen as usize, 0);
+    });
+}
+
+/// Index-Treffer übernehmen, wenn sie noch zur aktuellen Eingabe gehören.
+unsafe fn apply_file_results(hwnd: HWND, gen: u64) {
+    let Some((rgen, query, found)) = FILE_RESULTS.lock().ok().and_then(|mut r| r.take()) else { return };
+    let applied = with(|st| {
+        if rgen != gen || gen != st.files_gen || query != st.query.trim() {
+            return false;
+        }
+        st.files = found
+            .into_iter()
+            .map(|(name, path)| {
+                let folder = Path::new(&path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                Entry { title: name, kind: "Datei", sub: folder, target: Target::Path(path), glyph: Glyph::File }
+            })
+            .collect();
+        st.files_for = st.query.clone();
+        let sel = st.sel;
+        st.results = search(st);
+        st.sel = sel.min(st.results.len().saturating_sub(1));
+        true
+    })
+    .unwrap_or(false);
+    if applied {
+        InvalidateRect(hwnd, null(), 0);
+    }
+}
+
 unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
     let mut open_target = None;
     let mut close = false;
+    let mut schedule_files = false;
     let handled = with(|st| {
         let count = st.results.len();
         match vk {
@@ -733,6 +801,7 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
             VK_BACK => {
                 st.query.pop();
                 st.results = if st.query.is_empty() { Vec::new() } else { search(st) };
+                schedule_files = true;
                 st.sel = 0;
                 st.scroll = 0;
             }
@@ -757,6 +826,9 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
         true
     })
     .unwrap_or(false);
+    if schedule_files {
+        SetTimer(hwnd, TIMER_FILES, 160, None);
+    }
     if close {
         hide();
     } else if let Some(t) = open_target {
@@ -786,6 +858,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TOGGLE => {
             toggle(wp == 1);
+            0
+        }
+        WM_TIMER if wp == TIMER_FILES => {
+            KillTimer(hwnd, TIMER_FILES);
+            start_file_search(hwnd);
+            0
+        }
+        WM_FILES => {
+            apply_file_results(hwnd, wp as u64);
             0
         }
         WM_RELOAD => {
@@ -881,6 +962,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     st.sel = 0;
                     st.scroll = 0;
                 });
+                // Index-Suche erst nach kurzer Tipp-Pause.
+                SetTimer(hwnd, TIMER_FILES, 160, None);
                 InvalidateRect(hwnd, null(), 0);
             }
             0
@@ -931,6 +1014,9 @@ pub unsafe fn create(inst: HINSTANCE) {
         icons: HashMap::new(),
         query: String::new(),
         results: Vec::new(),
+        files: Vec::new(),
+        files_for: String::new(),
+        files_gen: 0,
         view: View::Home,
         sel: 0,
         scroll: 0,

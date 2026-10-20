@@ -79,6 +79,78 @@ pub unsafe fn target_path(app: &App) -> Option<String> {
     s.filter(is_exe)
 }
 
+/// Dateien und Ordner aus dem Windows-Suchindex – derselbe Weg wie die
+/// Explorer-Suche: Abfrage parsen (mit automatischem Platzhalter, "rus" findet
+/// "rust"), als Bedingung an einen Suchordner über dem Benutzerordner hängen
+/// und aufzählen. Das Aufzählen wartet auf die Index-Abfrage, blockiert also –
+/// nur aus einem Hintergrund-Thread mit eigenem COM-Apartment aufrufen.
+/// Rückgabe: (Anzeigename, Pfad).
+pub fn search_index(query: &str, max: usize) -> Vec<(String, String)> {
+    search_index_checked(query, max).unwrap_or_default()
+}
+
+/// Wie search_index, aber mit Fehlertext (für --search-test).
+pub fn search_index_checked(query: &str, max: usize) -> Result<Vec<(String, String)>, String> {
+    unsafe { search_index_inner(query, max).map_err(|e| format!("{e}")) }
+}
+
+unsafe fn search_index_inner(query: &str, max: usize) -> windows::core::Result<Vec<(String, String)>> {
+    let step = |n: &'static str| move |e: windows::core::Error| windows::core::Error::new(e.code(), format!("{n}: {}", e.message()));
+    use windows::Win32::System::Com::{CoCreateInstance, IEnumUnknown, CLSCTX_INPROC_SERVER};
+    use windows::Win32::System::Search::*;
+
+    let manager: IQueryParserManager = CoCreateInstance(&QueryParserManager, None, CLSCTX_INPROC_SERVER).map_err(step("QueryParserManager"))?;
+    // 0x0400 = Sprache des Benutzers für Schlüsselwörter wie "art:".
+    let parser: IQueryParser = manager.CreateLoadedParser(w!("SystemIndex"), 0x0400).map_err(step("CreateLoadedParser"))?;
+    manager.InitializeOptions(false, true, &parser).map_err(step("InitializeOptions"))?;
+    // Nur im Dateinamen suchen (nicht im Inhalt), mit automatischem Platzhalter.
+    let cleaned = query.replace(['"', '(', ')'], " ");
+    let aqs = format!("System.FileName:({cleaned})");
+    let solution = parser.Parse(&HSTRING::from(aqs), None::<&IEnumUnknown>).map_err(step("Parse"))?;
+    let mut condition: Option<ICondition> = None;
+    solution.GetQuery(Some(&mut condition), None).map_err(step("GetQuery"))?;
+    let Some(condition) = condition else { return Ok(Vec::new()) };
+    // Bezugszeit ist Pflicht (für relative Angaben wie "gestern").
+    let now = windows::Win32::System::SystemInformation::GetLocalTime();
+    let resolved = solution.Resolve(&condition, SQRO_DONT_SPLIT_WORDS, Some(&now)).map_err(step("Resolve"))?;
+
+    let factory: ISearchFolderItemFactory = CoCreateInstance(&SearchFolderItemFactory, None, CLSCTX_INPROC_SERVER).map_err(step("SearchFolderItemFactory"))?;
+    factory.SetDisplayName(w!("rtaskbar"))?;
+    let home = HSTRING::from(std::env::var("USERPROFILE").unwrap_or_default());
+    let scope_item: IShellItem = SHCreateItemFromParsingName(&home, None::<&IBindCtx>)?;
+    let scope: IShellItemArray = SHCreateShellItemArrayFromShellItem(&scope_item)?;
+    factory.SetScope(&scope).map_err(step("SetScope"))?;
+    factory.SetCondition(&resolved).map_err(step("SetCondition"))?;
+    let folder: IShellItem = factory.GetShellItem().map_err(step("GetShellItem"))?;
+    let items: IEnumShellItems = folder.BindToHandler(None::<&IBindCtx>, &BHID_EnumItems).map_err(step("BindToHandler"))?;
+
+    let mut out = Vec::new();
+    let mut scanned = 0usize;
+    while out.len() < max {
+        let mut batch: [Option<IShellItem>; 1] = [None];
+        let mut fetched = 0u32;
+        let _ = items.Next(&mut batch, Some(&mut fetched));
+        let Some(item) = (fetched > 0).then(|| batch[0].take()).flatten() else { break };
+        if let (Some(name), Some(path)) = (display(&item, SIGDN_NORMALDISPLAY), display(&item, SIGDN_FILESYSPATH)) {
+            if !is_noise(&path) {
+                out.push((name, path));
+            }
+        }
+        scanned += 1;
+        if scanned > max * 20 {
+            break; // Nicht ewig durch Rauschen blättern.
+        }
+    }
+    Ok(out)
+}
+/// Ordner, deren Inhalt fast nie gemeint ist (Abhängigkeiten, Caches,
+/// Versionsverwaltung, App-Daten).
+fn is_noise(path: &str) -> bool {
+    const NOISE: [&str; 9] = ["\\node_modules", "\\.git\\", "\\appdata\\", "\\go\\pkg\\", "\\.cargo\\", "\\target\\", "\\.venv\\", "\\__pycache__", "\\.nuget\\"];
+    let p = path.to_lowercase();
+    NOISE.iter().any(|n| p.contains(n))
+}
+
 /// AppUserModelID eines Fensters – danach gruppiert Windows die Taskleiste.
 /// Viele klassische Programme setzen keine; dann gilt deren exe.
 pub fn window_app_id(hwnd: *mut core::ffi::c_void) -> Option<String> {
