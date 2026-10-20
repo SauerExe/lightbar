@@ -1,0 +1,57 @@
+[package]
+name = "rtaskbar"
+version = "0.1.0"
+edition = "2021"
+description = "Schlanker Windows-11-Taskleisten-Nachbau in Rust (Win32 + GDI)"
+
+[dependencies]
+serde_json = "1"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_Networking_WinHttp",
+    "Win32_Networking_WinInet",
+    "Win32_Security",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_Shutdown",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Devices_Radios",
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
