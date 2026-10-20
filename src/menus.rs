@@ -61,10 +61,10 @@ pub unsafe fn popup(owner: HWND, items: &[Item]) -> usize {
     let menu = build(items);
     let mut pt: POINT = zeroed();
     GetCursorPos(&mut pt);
-    let bar = crate::bar::hwnd();
-    if owner == bar {
+    // Menüs unserer Leisten (Haupt- oder Zweitleiste) öffnen über der Leiste.
+    if crate::bar::is_bar(owner) {
         let mut r: RECT = zeroed();
-        GetWindowRect(bar, &mut r);
+        GetWindowRect(owner, &mut r);
         pt.y = r.top;
     }
     // Ohne Vordergrund schließt das Menü bei Klick daneben nicht.

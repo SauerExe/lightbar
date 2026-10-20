@@ -239,7 +239,7 @@ pub unsafe fn toggle() {
         ShowWindow(h, SW_HIDE);
         return;
     }
-    let bar = crate::bar::hwnd();
+    let bar = crate::bar::anchor();
     let dpi = GetDpiForWindow(bar);
     let (y, m, _) = today();
     with(|st| {

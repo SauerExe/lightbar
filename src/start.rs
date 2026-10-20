@@ -647,7 +647,7 @@ pub unsafe fn toggle(_search: bool) {
 
 unsafe fn show() {
     let h = hwnd();
-    let bar = crate::bar::hwnd();
+    let bar = crate::bar::anchor();
     let dpi = GetDpiForWindow(bar);
     let recent = load_recent();
     with(|st| {

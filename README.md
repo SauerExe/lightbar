@@ -26,6 +26,7 @@ Plain Win32 + GDI, no UI framework, a single ~600 KB executable using about 11 M
 - **Glow edge** above the taskbar (Aurora, accent colour or neon) and subtle animations – optional
 - **Claude / Codex usage** (5-hour and weekly limits) – optional, off by default, see notes
 - **Presentation mode** for streaming or screen sharing – hides your name, recent files, file search results and usage
+- **Multiple monitors** – a taskbar on every display (apps, Start, clock); flyouts open on the display you clicked; full-screen apps hide only the taskbar on their display
 - Hides the Windows taskbar while running and restores it on exit; maximised windows and full-screen apps are handled
 
 ## Performance
@@ -68,7 +69,7 @@ Settings (right-click the taskbar) are stored in `%APPDATA%\Lightbar\settings.tx
 
 ## Known limitations
 
-- Single monitor only (the taskbar appears on the primary display)
+- Multi-monitor support is new and not yet tested on real multi-display hardware; secondary taskbars use the primary display's scaling
 - Jump lists show recent/frequent items only (no app-defined tasks); notification centre and widgets are Windows' own
 - Touch and pen work through Windows' mouse emulation (tap = click, press-and-hold = right-click); untested on real touch hardware
 - German UI

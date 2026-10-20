@@ -116,7 +116,10 @@ struct State {
     kb_focus: Option<usize>,
     status: Option<Status>,
     hover: Hit,
-    tracking: bool,
+    /// Leiste, über der hover gilt (Haupt- oder Zweitleiste).
+    hover_hwnd: HWND,
+    /// Leiste, deren Mausverlassen gerade verfolgt wird.
+    tracking: HWND,
     /// Eine Vollbild-App ist vorne: Leiste ausgeblendet.
     fullscreen: bool,
     anim: Anim,
@@ -959,6 +962,10 @@ unsafe fn appbar_data(hwnd: HWND) -> APPBARDATA {
 
 /// Platz am unteren Rand reservieren und Fenster dorthin legen.
 unsafe fn set_pos(hwnd: HWND) {
+    if hwnd != self::hwnd() {
+        set_pos_secondary(hwnd);
+        return;
+    }
     let dpi = GetDpiForWindow(hwnd);
     let (font, icons) = (make_font(dpi, 12, FW_NORMAL), icon_font(dpi, 16));
     with(|s| {
@@ -1270,7 +1277,9 @@ unsafe fn step_anim(hwnd: HWND) -> bool {
             if !s.anim.x.contains_key(&id) && had_buttons {
                 new_buttons.push(bar_origin.x + (r.left + r.right) / 2);
             }
-            approach(s.anim.x.entry(id.clone()).or_insert(r.left as f32), r.left as f32, 0.22, 0.5, &mut moving);
+            // Relativ zum Startknopf: Haupt- und Zweitleiste haben verschiedene Breiten.
+            let rel = (r.left - l.start.left) as f32;
+            approach(s.anim.x.entry(id.clone()).or_insert(rel), rel, 0.22, 0.5, &mut moving);
             live.push(id);
         }
         s.anim.ind.retain(|k, _| live.contains(k));
@@ -1299,10 +1308,14 @@ unsafe fn step_anim(hwnd: HWND) -> bool {
 
 /// Leuchtrand mit Hover-Position und Aufmerksamkeits-Buttons versorgen.
 unsafe fn sync_glow(hwnd: HWND) {
+    if hwnd != self::hwnd() {
+        crate::glow::set_hover(None);
+        return;
+    }
     let Some((l, _)) = current_layout(hwnd) else { return };
     let mut origin = POINT { x: 0, y: 0 };
     ClientToScreen(hwnd, &mut origin);
-    let hover_hit = with(|s| s.hover).unwrap_or(Hit::None);
+    let hover_hit = with(|s| if s.hover_hwnd == hwnd { s.hover } else { Hit::None }).unwrap_or(Hit::None);
     let hover = rect_of(hwnd, hover_hit).map(|r| origin.x + (r.left + r.right) / 2);
     let Some(attention) = with(|s| {
         s.attention.retain(|&w| IsWindow(w) != 0);
@@ -1331,8 +1344,7 @@ unsafe fn same_monitor(a: HWND, b: HWND) -> bool {
 /// sind (z. B. maximiert, bevor unsere Leiste Platz reserviert hat), ragen
 /// unter die Leiste. Windows passt sie nicht von selbst an – also kürzen.
 pub unsafe fn fit_maximized(bar: HWND) {
-    let mut work: RECT = zeroed();
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as _, 0);
+    let work = monitor_rect(bar, true);
     let mut windows: Vec<HWND> = Vec::new();
     EnumWindows(Some(enum_cb), &mut windows as *mut _ as LPARAM);
     for h in windows {
@@ -1510,6 +1522,145 @@ unsafe fn draw_usage(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
     }
 }
 
+// ------------------------------------------------------- Mehrere Monitore
+//
+// Auf jedem weiteren Bildschirm eine eigene Leiste (wie "Taskleiste auf allen
+// Bildschirmen anzeigen" bei Windows 11). Sie teilt Zustand, Zeichnen und
+// Klicklogik mit der Hauptleiste – dieselbe WndProc, nur eine andere
+// Fensterklasse (Tray-Nachrichten gehen weiter nur an `Shell_TrayWnd`) und
+// eine eigene Platzreservierung auf ihrem Monitor. Leuchtrand, Tray-Übernahme,
+// Screenreader und Sekundentakt bleiben bei der Hauptleiste.
+
+static SECONDARY: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+/// Leiste, auf der zuletzt geklickt wurde – dort öffnen sich die Popups.
+static ANCHOR: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+
+fn secondaries() -> Vec<HWND> {
+    SECONDARY.lock().map(|v| v.iter().map(|&h| h as HWND).collect()).unwrap_or_default()
+}
+
+/// Gehört das Fenster zu unseren Leisten (Haupt- oder Zweitleiste)?
+pub fn is_bar(h: HWND) -> bool {
+    h == hwnd() || secondaries().contains(&h)
+}
+
+/// Leiste, über der Popups (Start, Kalender, Schnelleinstellungen) erscheinen:
+/// die zuletzt angeklickte, sonst die Hauptleiste.
+pub fn anchor() -> HWND {
+    let a = ANCHOR.load(Ordering::Relaxed);
+    if !a.is_null() && is_bar(a) && unsafe { IsWindow(a) } != 0 {
+        a
+    } else {
+        hwnd()
+    }
+}
+
+unsafe fn monitor_rect(h: HWND, work: bool) -> RECT {
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi);
+    if work {
+        mi.rcWork
+    } else {
+        mi.rcMonitor
+    }
+}
+
+/// Zweitleiste an den unteren Rand ihres Monitors legen und Platz reservieren.
+unsafe fn set_pos_secondary(hwnd: HWND) {
+    let dpi = with(|s| s.dpi).unwrap_or(96);
+    let h = px(dpi, BAR_H);
+    let m = monitor_rect(hwnd, false);
+    let mut abd = appbar_data(hwnd);
+    abd.rc = RECT { left: m.left, top: m.bottom - h, right: m.right, bottom: m.bottom };
+    SHAppBarMessage(ABM_QUERYPOS, &mut abd);
+    abd.rc.top = abd.rc.bottom - h;
+    SHAppBarMessage(ABM_SETPOS, &mut abd);
+    MoveWindow(hwnd, abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left, h, 1);
+}
+
+unsafe extern "system" fn collect_monitor(mon: HMONITOR, _: HDC, _: *mut RECT, lp: LPARAM) -> BOOL {
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(mon, &mut mi) != 0 && mi.dwFlags & MONITORINFOF_PRIMARY == 0 {
+        (*(lp as *mut Vec<(HMONITOR, RECT)>)).push((mon, mi.rcMonitor));
+    }
+    1
+}
+
+/// Zweitleisten an die aktuelle Monitor-Anordnung anpassen: neue Monitore
+/// bekommen eine Leiste, entfernte verlieren ihre, vorhandene werden neu
+/// ausgerichtet.
+pub unsafe fn sync_monitors() {
+    let mut monitors: Vec<(HMONITOR, RECT)> = Vec::new();
+    EnumDisplayMonitors(null_mut(), null(), Some(collect_monitor), &mut monitors as *mut _ as LPARAM);
+    let existing = secondaries();
+    let mut keep = Vec::new();
+    for h in existing {
+        let mon = MonitorFromWindow(h, MONITOR_DEFAULTTONULL);
+        if let Some(i) = monitors.iter().position(|(m, _)| *m == mon) {
+            monitors.remove(i);
+            set_pos_secondary(h);
+            keep.push(h as isize);
+        } else {
+            DestroyWindow(h);
+        }
+    }
+    let inst = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(null());
+    for (_, rect) in monitors {
+        if let Some(h) = create_secondary(inst, rect) {
+            keep.push(h as isize);
+        }
+    }
+    if let Ok(mut v) = SECONDARY.lock() {
+        *v = keep;
+    }
+}
+
+unsafe fn create_secondary(inst: HINSTANCE, rect: RECT) -> Option<HWND> {
+    let class = w16("LightbarSecondary");
+    // Mehrfaches Registrieren schlägt nur fehl, schadet aber nicht.
+    register_class(inst, &class, Some(wndproc), CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS);
+    // Gleich auf dem Zielmonitor anlegen, damit MonitorFromWindow stimmt.
+    let hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        class.as_ptr(),
+        w16("Lightbar").as_ptr(),
+        WS_POPUP,
+        rect.left,
+        rect.bottom - 1,
+        1,
+        1,
+        null_mut(),
+        null_mut(),
+        inst,
+        null(),
+    );
+    if hwnd.is_null() {
+        return None;
+    }
+    let mut abd = appbar_data(hwnd);
+    SHAppBarMessage(ABM_NEW, &mut abd);
+    set_pos_secondary(hwnd);
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    Some(hwnd)
+}
+
+/// Sekundentakt der Hauptleiste für die Zweitleisten: maximierte Fenster
+/// kürzen und bei Vollbild auf ihrem Monitor aus-/einblenden.
+unsafe fn tick_secondaries() {
+    for h in secondaries() {
+        fit_maximized(h);
+        let full = foreground_fullscreen(h);
+        let visible = IsWindowVisible(h) != 0;
+        if full && visible {
+            ShowWindow(h, SW_HIDE);
+        } else if !full && !visible {
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    }
+}
+
 /// Startsymbol: standardmäßig ein eigener Orb (Akzentfarbe, versetzter dunkler
 /// Kern, Glanzpunkt); auf Wunsch das Windows-Logo (Marke von Microsoft,
 /// deshalb nicht voreingestellt).
@@ -1545,18 +1696,18 @@ unsafe fn paint(hwnd: HWND) {
             .map(|g| (format!("g:{}", g.key), g.windows.clone(), g.icon, g.windows.iter().any(|w| s.attention.contains(w))))
             .collect();
         let dragged = s.drag.as_ref().filter(|d| d.active).and_then(|d| s.groups.iter().find(|g| g.slot == d.slot).map(|g| (format!("g:{}", g.key), d.x)));
-        (s.dpi, s.font, s.icons, s.status.clone(), groups, s.anim.clone(), s.start.elapsed().as_secs_f32(), s.taskmgr_icon, s.cpu, dragged)
+        (s.dpi, s.font, s.icons, s.status.clone(), groups, s.anim.clone(), s.start.elapsed().as_secs_f32(), s.taskmgr_icon, s.cpu, dragged, s.hover_hwnd == hwnd)
     });
-    let Some((dpi, font, icons, status, groups, anim, t, taskmgr_icon, cpu, dragged)) = snapshot else {
+    let Some((dpi, font, icons, status, groups, anim, t, taskmgr_icon, cpu, dragged, hover_here)) = snapshot else {
         let mut ps: PAINTSTRUCT = zeroed();
         BeginPaint(hwnd, &mut ps);
         EndPaint(hwnd, &ps);
         return;
     };
-    let hv = |id: &str| anim.hover.get(id).copied().unwrap_or(0.0);
+    let hv = |id: &str| if hover_here { anim.hover.get(id).copied().unwrap_or(0.0) } else { 0.0 };
     let tray = tray::visible();
     let overflow = !tray::overflow().is_empty();
-    let focus = focus_rect(hwnd);
+    let focus = if hwnd == self::hwnd() { focus_rect(hwnd) } else { None };
     let settings = crate::settings::get();
     let mono_on = settings.mono_tray;
     paint_buffered(hwnd, |dc, w, h| {
@@ -1580,7 +1731,7 @@ unsafe fn paint(hwnd: HWND) {
         for (i, (id, windows, icon, attention)) in groups.iter().enumerate() {
             let Some(base) = l.tasks.get(i) else { continue };
             // Weich nachrutschende Position.
-            let dx = anim.x.get(id).map(|x| x.round() as i32 - base.left).unwrap_or(0);
+            let dx = anim.x.get(id).map(|x| x.round() as i32 - (base.left - l.start.left)).unwrap_or(0);
             let mut r = RECT { left: base.left + dx, right: base.right + dx, ..*base };
             // Gezogener Button klebt am Mauszeiger.
             let is_dragged = dragged.as_ref().is_some_and(|(did, _)| did == id);
@@ -1752,6 +1903,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_PAINT => {
             paint(hwnd);
+            // Zweitleisten zeigen denselben Zustand: mitzeichnen.
+            if hwnd == self::hwnd() {
+                for h in secondaries() {
+                    InvalidateRect(h, null(), 0);
+                }
+            }
             0
         }
         WM_ERASEBKGND => 1,
@@ -1782,7 +1939,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         // Screenreader fragen nach unserem UI-Automation-Provider.
-        WM_GETOBJECT if lp as i32 == windows::Win32::UI::Accessibility::UiaRootObjectId => {
+        WM_GETOBJECT if hwnd == self::hwnd() && lp as i32 == windows::Win32::UI::Accessibility::UiaRootObjectId => {
             use windows::Win32::Foundation as wf;
             let root = crate::uia::root(hwnd as isize);
             windows::Win32::UI::Accessibility::UiaReturnRawElementProvider(wf::HWND(hwnd as _), wf::WPARAM(wp), wf::LPARAM(lp), &root).0
@@ -1842,6 +1999,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 tray::tick();
                 crate::shell::ensure_hidden();
                 fit_maximized(hwnd);
+                tick_secondaries();
                 // Vor Explorers Shell_TrayWnd bleiben, damit neue Tray-Icons zu uns kommen.
                 // Nur wenn nötig (Explorer liegt vorne), nie bei offenem Menü und nie
                 // über einer Vollbild-App – sonst verdeckt die Leiste Menüs, Popups, Spiele.
@@ -1865,9 +2023,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             let h = hit_at(hwnd, x, y);
             let (changed, start_tracking) = with(|s| {
-                let changed = s.hover != h;
+                let changed = s.hover != h || s.hover_hwnd != hwnd;
                 s.hover = h;
-                (changed, !std::mem::replace(&mut s.tracking, true))
+                s.hover_hwnd = hwnd;
+                (changed, std::mem::replace(&mut s.tracking, hwnd) != hwnd)
             })
             .unwrap_or((false, false));
             if start_tracking {
@@ -1909,8 +2068,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             crate::tooltip::hide();
             crate::preview::schedule_hide();
             with(|s| {
-                s.hover = Hit::None;
-                s.tracking = false;
+                // Nur die eigene Leiste zurücksetzen – die Maus kann schon auf der anderen sein.
+                if s.hover_hwnd == hwnd {
+                    s.hover = Hit::None;
+                }
+                if s.tracking == hwnd {
+                    s.tracking = null_mut();
+                }
             });
             kick(hwnd);
             crate::glow::set_hover(None);
@@ -1918,6 +2082,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+            ANCHOR.store(hwnd, Ordering::Relaxed);
             KillTimer(hwnd, TIMER_TIP);
             crate::tooltip::hide();
             crate::preview::hide();
@@ -2044,10 +2209,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
             set_pos(hwnd);
-            refresh(hwnd, None);
+            if hwnd == self::hwnd() {
+                refresh(hwnd, None);
+                // Monitor an- oder abgesteckt: Zweitleisten anpassen.
+                sync_monitors();
+            }
+            0
+        }
+        WM_DESTROY if hwnd != self::hwnd() => {
+            // Zweitleiste: nur ihren Platz freigeben.
+            let mut abd = appbar_data(hwnd);
+            SHAppBarMessage(ABM_REMOVE, &mut abd);
+            if let Ok(mut v) = SECONDARY.lock() {
+                v.retain(|&h| h != hwnd as isize);
+            }
             0
         }
         WM_DESTROY => {
+            // Zweitleisten zuerst schließen (Liste vorher leeren: ihr WM_DESTROY räumt sonst mit).
+            let others = secondaries();
+            if let Ok(mut v) = SECONDARY.lock() {
+                v.clear();
+            }
+            for h in others {
+                DestroyWindow(h);
+            }
             // Vor ABM_REMOVE: Wiederherstellen läuft noch über unsere Weiterleitung.
             crate::shell::restore();
             KillTimer(hwnd, TIMER_TICK);
@@ -2102,7 +2288,8 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
             kb_focus: None,
             status: Some(status::poll()),
             hover: Hit::None,
-            tracking: false,
+            hover_hwnd: null_mut(),
+            tracking: null_mut(),
             fullscreen: false,
             anim: Anim::default(),
             tick: 0,
@@ -2124,6 +2311,7 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
     refresh(hwnd, None);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     tray::announce();
+    sync_monitors();
     let notify_target = hwnd as isize;
     crate::usage::spawn(move || {
         PostMessageW(notify_target as HWND, WM_BAR_USAGE, 0, 0);
