@@ -1392,6 +1392,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         let mut abd = appbar_data(hwnd);
         SHAppBarMessage(ABM_NEW, &mut abd);
         set_pos(hwnd);
+        // Nach dem Login kann Explorer später fertig sein als wir: dann seine
+        // Leiste jetzt (erneut) ausblenden und auf Auto-Ausblenden stellen.
+        crate::shell::takeover();
         return 0;
     }
     if shell_msg != 0 && msg == shell_msg {
