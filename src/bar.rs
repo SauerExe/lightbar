@@ -279,7 +279,9 @@ fn layout(width: i32, dpi: u32, n_tasks: usize, n_tray: usize, overflow: bool, b
     let top = (h - px(dpi, BTN_H)) / 2;
     let bottom = top + px(dpi, BTN_H);
     let count = n_tasks as i32 + 1;
-    let mut x = (width - (count * bw + (count - 1) * gap)) / 2;
+    // Ausrichtung wie in Windows eingestellt: linksbündig oder mittig.
+    let left = crate::util::taskbar_left();
+    let mut x = if left { px(dpi, 8) } else { (width - (count * bw + (count - 1) * gap)) / 2 };
     let mut next = || {
         let r = RECT { left: x, top, right: x + bw, bottom };
         x += bw + gap;
@@ -302,10 +304,19 @@ fn layout(width: i32, dpi: u32, n_tasks: usize, n_tray: usize, overflow: bool, b
         .map(|i| RECT { left: tray_l + i * tw, top, right: tray_l + (i + 1) * tw, bottom })
         .collect();
     let chevron = overflow.then(|| RECT { left: tray_l - tw, top, right: tray_l, bottom });
-    let usage = RECT { left: px(dpi, 8), top, right: px(dpi, 8 + USAGE_W), bottom };
-    // Task-Manager direkt rechts neben der Usage-Anzeige (oder ganz links, wenn die aus ist).
-    let tm_left = if { let s = crate::settings::get(); s.show_usage && !s.presentation } { usage.right + px(dpi, 4) } else { px(dpi, 8) };
-    let taskmgr = RECT { left: tm_left, top, right: tm_left + px(dpi, TASKMGR_W), bottom };
+    let (usage, taskmgr) = if left {
+        // Links ist von Start und Apps belegt: Task-Manager (und Usage davor)
+        // rechts vor den Infobereich.
+        let tm_r = chevron.map_or(tray_l, |c| c.left) - px(dpi, 4);
+        let taskmgr = RECT { left: tm_r - px(dpi, TASKMGR_W), top, right: tm_r, bottom };
+        let us_r = taskmgr.left - px(dpi, 4);
+        (RECT { left: us_r - px(dpi, USAGE_W), top, right: us_r, bottom }, taskmgr)
+    } else {
+        let usage = RECT { left: px(dpi, 8), top, right: px(dpi, 8 + USAGE_W), bottom };
+        // Task-Manager direkt rechts neben der Usage-Anzeige (oder ganz links, wenn die aus ist).
+        let tm_left = if { let s = crate::settings::get(); s.show_usage && !s.presentation } { usage.right + px(dpi, 4) } else { px(dpi, 8) };
+        (usage, RECT { left: tm_left, top, right: tm_left + px(dpi, TASKMGR_W), bottom })
+    };
     Layout { usage, taskmgr, start, tasks, tray, chevron, status, clock, desktop }
 }
 
@@ -1679,7 +1690,8 @@ unsafe fn set_pos_secondary(hwnd: HWND) {
 unsafe extern "system" fn collect_monitor(mon: HMONITOR, _: HDC, _: *mut RECT, lp: LPARAM) -> BOOL {
     let mut mi: MONITORINFO = zeroed();
     mi.cbSize = size_of::<MONITORINFO>() as u32;
-    if GetMonitorInfoW(mon, &mut mi) != 0 && mi.dwFlags & MONITORINFOF_PRIMARY == 0 {
+    // „Taskleiste auf allen Anzeigen“ aus: keine Zweitleisten.
+    if crate::util::taskbar_all_monitors() && GetMonitorInfoW(mon, &mut mi) != 0 && mi.dwFlags & MONITORINFOF_PRIMARY == 0 {
         (*(lp as *mut Vec<(HMONITOR, RECT)>)).push((mon, mi.rcMonitor));
     }
     1
@@ -2357,9 +2369,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
-        // Akzentfarbe geändert (Personalisierung) → neu einlesen.
+        // Akzentfarbe oder Taskleisten-Einstellungen geändert → neu einlesen.
         0x0320 | WM_SETTINGCHANGE => {
             reload_accent();
+            if hwnd == self::hwnd() {
+                crate::util::reload_taskbar_prefs();
+                sync_monitors();
+            }
             InvalidateRect(hwnd, null(), 0);
             DefWindowProcW(hwnd, msg, wp, lp)
         }

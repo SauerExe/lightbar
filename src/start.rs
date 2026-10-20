@@ -668,7 +668,8 @@ unsafe fn show() {
     let mut br: RECT = zeroed();
     GetWindowRect(bar, &mut br);
     let (w, hh) = (px(dpi, W), px(dpi, H));
-    let x = br.left + (br.right - br.left - w) / 2;
+    // Wie Windows: bei linksbündiger Taskleiste links, sonst mittig.
+    let x = if crate::util::taskbar_left() { br.left + px(dpi, 12) } else { br.left + (br.right - br.left - w) / 2 };
     let y = br.top - px(dpi, 12) - hh;
     crate::anim::pop_in(h, x, y, w, hh, px(dpi, 18));
     force_foreground(h);
