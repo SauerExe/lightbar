@@ -396,8 +396,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 pub unsafe fn create(inst: HINSTANCE) {
-    let class = w16("RustTaskbarQuick");
-    register_class(inst, &class, Some(wndproc), CS_DROPSHADOW);
+    let class = w16("LightbarQuick");
+    register_class(inst, &class, Some(wndproc), 0);
     let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
         class.as_ptr(),

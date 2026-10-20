@@ -115,7 +115,7 @@ unsafe fn search_index_inner(query: &str, max: usize) -> windows::core::Result<V
     let resolved = solution.Resolve(&condition, SQRO_DONT_SPLIT_WORDS, Some(&now)).map_err(step("Resolve"))?;
 
     let factory: ISearchFolderItemFactory = CoCreateInstance(&SearchFolderItemFactory, None, CLSCTX_INPROC_SERVER).map_err(step("SearchFolderItemFactory"))?;
-    factory.SetDisplayName(w!("rtaskbar"))?;
+    factory.SetDisplayName(w!("Lightbar"))?;
     let home = HSTRING::from(std::env::var("USERPROFILE").unwrap_or_default());
     let scope_item: IShellItem = SHCreateItemFromParsingName(&home, None::<&IBindCtx>)?;
     let scope: IShellItemArray = SHCreateShellItemArrayFromShellItem(&scope_item)?;

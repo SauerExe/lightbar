@@ -69,6 +69,18 @@ pub fn mix(a: COLORREF, b: COLORREF, t: f32) -> COLORREF {
     ch(0) | ch(8) | ch(16)
 }
 
+/// Datenordner `%APPDATA%\Lightbar` (Einstellungen, Anheftungen, Zustand).
+/// Zieht beim ersten Aufruf einmalig vom früheren Namen `rtaskbar` um.
+pub fn data_dir() -> Option<std::path::PathBuf> {
+    let appdata = std::path::PathBuf::from(std::env::var("APPDATA").ok()?);
+    let dir = appdata.join("Lightbar");
+    let legacy = appdata.join("rtaskbar");
+    if !dir.exists() && legacy.exists() {
+        let _ = std::fs::rename(&legacy, &dir);
+    }
+    Some(dir)
+}
+
 pub fn w16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }

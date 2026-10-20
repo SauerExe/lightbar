@@ -632,8 +632,8 @@ unsafe extern "system" fn overflow_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
 
 pub unsafe fn create_overflow(inst: HINSTANCE) {
     use crate::util::*;
-    let class = w16("RustTaskbarTrayOverflow");
-    register_class(inst, &class, Some(overflow_proc), CS_DROPSHADOW | CS_DBLCLKS);
+    let class = w16("LightbarTrayOverflow");
+    register_class(inst, &class, Some(overflow_proc), CS_DBLCLKS);
     let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED, class.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 0, 0, null_mut(), null_mut(), inst, std::ptr::null());
     crate::anim::make_opaque(hwnd);
     let round_pref: u32 = 2;

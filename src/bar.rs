@@ -152,7 +152,7 @@ pub fn hwnd() -> HWND {
 // ------------------------------------------------------------- Anheften
 
 fn pins_path() -> Option<PathBuf> {
-    Some(Path::new(&std::env::var("APPDATA").ok()?).join("rtaskbar").join("taskbar.txt"))
+    Some(crate::util::data_dir()?.join("taskbar.txt"))
 }
 
 /// Angeheftete Gruppenschlüssel. Ältere Dateien enthalten nackte exe-Pfade.
@@ -706,6 +706,7 @@ unsafe fn bar_menu(hwnd: HWND) {
                     glow(13, "Aus", GlowStyle::Off),
                 ],
             ),
+            Item::Sub("Startsymbol", vec![Item::Check(16, "Orb", !s.windows_logo), Item::Check(17, "Windows-Logo", s.windows_logo)]),
             Item::Check(14, "Uhr mit Sekunden", s.clock_seconds),
             Item::Check(15, "Claude/Codex-Usage anzeigen", s.show_usage),
             Item::Check(5, "Tray-Icons einfarbig", s.mono_tray),
@@ -722,6 +723,8 @@ unsafe fn bar_menu(hwnd: HWND) {
         12 => crate::glow::set_style(GlowStyle::Neon),
         13 => crate::glow::set_style(GlowStyle::Off),
         14 => crate::settings::update(|s| s.clock_seconds = !s.clock_seconds),
+        16 => crate::settings::update(|s| s.windows_logo = false),
+        17 => crate::settings::update(|s| s.windows_logo = true),
         15 => crate::settings::update(|s| s.show_usage = !s.show_usage),
         5 => crate::settings::update(|s| s.mono_tray = !s.mono_tray),
         3 => {
@@ -1318,14 +1321,31 @@ unsafe fn draw_usage(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
     }
 }
 
+/// Startsymbol: standardmäßig ein eigener Orb (Akzentfarbe, versetzter dunkler
+/// Kern, Glanzpunkt); auf Wunsch das Windows-Logo (Marke von Microsoft,
+/// deshalb nicht voreingestellt).
 unsafe fn draw_logo(dc: HDC, r: &RECT, dpi: u32) {
-    let (q, gap) = (px(dpi, 8), px(dpi, 1).max(1));
-    let size = 2 * q + gap;
+    if crate::settings::get().windows_logo {
+        let (q, gap) = (px(dpi, 8), px(dpi, 1).max(1));
+        let size = 2 * q + gap;
+        let x = r.left + (r.right - r.left - size) / 2;
+        let y = r.top + (r.bottom - r.top - size) / 2;
+        for (dx, dy) in [(0, 0), (q + gap, 0), (0, q + gap), (q + gap, q + gap)] {
+            fill(dc, &RECT { left: x + dx, top: y + dy, right: x + dx + q, bottom: y + dy + q }, accent());
+        }
+        return;
+    }
+    let size = px(dpi, 20);
     let x = r.left + (r.right - r.left - size) / 2;
     let y = r.top + (r.bottom - r.top - size) / 2;
-    for (dx, dy) in [(0, 0), (q + gap, 0), (0, q + gap), (q + gap, q + gap)] {
-        fill(dc, &RECT { left: x + dx, top: y + dy, right: x + dx + q, bottom: y + dy + q }, accent());
-    }
+    let orb = RECT { left: x, top: y, right: x + size, bottom: y + size };
+    round(dc, &orb, accent(), size);
+    let core = px(dpi, 9);
+    let (cx, cy) = (x + size / 2 + px(dpi, 2), y + size / 2 + px(dpi, 2));
+    round(dc, &RECT { left: cx - core / 2, top: cy - core / 2, right: cx + core / 2, bottom: cy + core / 2 }, BG, core);
+    let shine = px(dpi, 4).max(2);
+    let (sx, sy) = (x + px(dpi, 5), y + px(dpi, 5));
+    round(dc, &RECT { left: sx, top: sy, right: sx + shine, bottom: sy + shine }, mix(accent(), rgb(255, 255, 255), 0.6), shine);
 }
 
 unsafe fn paint(hwnd: HWND) {

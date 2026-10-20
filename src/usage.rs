@@ -67,7 +67,7 @@ impl Drop for Handle {
 /// HTTPS-GET über WinHTTP (Systemproxy, Systemzertifikate). Rückgabe: (Status, Body).
 fn https_get(host: &str, path: &str, headers: &[(&str, String)]) -> Result<(u32, String), String> {
     unsafe {
-        let session = Handle(WinHttpOpen(w16("rtaskbar/0.1").as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null(), null(), 0));
+        let session = Handle(WinHttpOpen(w16("lightbar/0.1").as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null(), null(), 0));
         if session.0.is_null() {
             return Err("WinHTTP nicht verfügbar".into());
         }
@@ -303,7 +303,7 @@ pub fn self_test() {
     let u = fetch();
     let text = format!("{}\n\n{}\n", describe("Claude", &u.claude), describe("Codex", &u.codex));
     if let Ok(appdata) = std::env::var("APPDATA") {
-        let dir = PathBuf::from(appdata).join("rtaskbar");
+        let dir = PathBuf::from(appdata).join("Lightbar");
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(dir.join("usage-test.txt"), text);
     }

@@ -1,4 +1,4 @@
-//! rtaskbar – schlanker Windows-11-Taskleisten- und Startmenü-Nachbau.
+//! Lightbar – schlanker Windows-11-Taskleisten- und Startmenü-Nachbau.
 //!
 //! Reines Win32 + GDI, kein UI-Framework. COM nur dort, wo die Shell es
 //! verlangt (App-Katalog, Icons).
@@ -53,7 +53,7 @@ unsafe fn dark_menus() {
 
 fn main() {
     unsafe {
-        // Diagnose: Index-Suche ohne Oberfläche, Ergebnis nach %APPDATA%\rtaskbar\search-test.txt.
+        // Diagnose: Index-Suche ohne Oberfläche, Ergebnis nach %APPDATA%\Lightbar\search-test.txt.
         if std::env::args().nth(1).as_deref() == Some("--search-test") {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let q = std::env::args().nth(2).unwrap_or_default();
@@ -63,7 +63,7 @@ fn main() {
                 Err(e) => format!("Fehler nach {} ms: {e}", t0.elapsed().as_millis()),
             };
             if let Ok(a) = std::env::var("APPDATA") {
-                let _ = std::fs::write(std::path::Path::new(&a).join("rtaskbar").join("search-test.txt"), text);
+                let _ = std::fs::write(std::path::Path::new(&a).join("Lightbar").join("search-test.txt"), text);
             }
             return;
         }
@@ -76,7 +76,7 @@ fn main() {
             return;
         }
         // Nur eine Instanz: zwei Leisten würden sich gegenseitig Platz reservieren.
-        CreateMutexW(null(), 0, util::w16("rtaskbar-single-instance").as_ptr());
+        CreateMutexW(null(), 0, util::w16("lightbar-single-instance").as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }

@@ -1,8 +1,8 @@
-//! Nutzer-Einstellungen in `%APPDATA%\rtaskbar\settings.txt` (key=value).
+//! Nutzer-Einstellungen in `%APPDATA%\Lightbar\settings.txt` (key=value).
 //! Ersetzt die früheren Marker-Dateien `mono-tray` und `no-glow`, die beim
 //! ersten Laden übernommen und entfernt werden.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -33,14 +33,19 @@ pub struct Settings {
     pub mono_tray: bool,
     pub clock_seconds: bool,
     pub show_usage: bool,
+    /// Windows-Logo statt des eigenen Orbs als Startsymbol. Standard aus: Das
+    /// Logo ist eine Marke von Microsoft und soll nicht ungefragt erscheinen.
+    pub windows_logo: bool,
 }
 
-const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: true };
+// Usage-Anzeige standardmäßig aus: Sie liest lokale Logins und nutzt nicht
+// offiziell dokumentierte Schnittstellen – das soll man bewusst einschalten.
+const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: false, windows_logo: false };
 
 static CURRENT: Mutex<Option<Settings>> = Mutex::new(None);
 
 fn dir() -> Option<PathBuf> {
-    Some(Path::new(&std::env::var("APPDATA").ok()?).join("rtaskbar"))
+    crate::util::data_dir()
 }
 
 fn load() -> Settings {
@@ -58,6 +63,7 @@ fn load() -> Settings {
                     "mono_tray" => s.mono_tray = on,
                     "clock_seconds" => s.clock_seconds = on,
                     "show_usage" => s.show_usage = on,
+                    "windows_logo" => s.windows_logo = on,
                     _ => {}
                 }
             }
@@ -82,11 +88,12 @@ fn save(s: &Settings) {
     let _ = std::fs::create_dir_all(&dir);
     let b = |v: bool| if v { "1" } else { "0" };
     let text = format!(
-        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\n",
+        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\nwindows_logo={}\n",
         s.glow.key(),
         b(s.mono_tray),
         b(s.clock_seconds),
-        b(s.show_usage)
+        b(s.show_usage),
+        b(s.windows_logo)
     );
     let _ = std::fs::write(dir.join("settings.txt"), text);
 }

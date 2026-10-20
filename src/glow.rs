@@ -290,7 +290,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 pub unsafe fn create(inst: HINSTANCE) {
-    let class = w16("RustTaskbarGlow");
+    let class = w16("LightbarGlow");
     register_class(inst, &class, Some(wndproc), 0);
     let hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,

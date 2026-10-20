@@ -202,7 +202,7 @@ const DEFAULT_PINS: &[&str] = &[
 ];
 
 fn pins_path() -> Option<PathBuf> {
-    Some(Path::new(&std::env::var("APPDATA").ok()?).join("rtaskbar").join("pins.txt"))
+    Some(data_dir()?.join("pins.txt"))
 }
 
 fn load_pins(apps: &[App]) -> Vec<String> {
@@ -973,8 +973,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 pub unsafe fn create(inst: HINSTANCE) {
-    let class = w16("RustTaskbarStart");
-    register_class(inst, &class, Some(wndproc), CS_DROPSHADOW);
+    let class = w16("LightbarStart");
+    register_class(inst, &class, Some(wndproc), 0);
     let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
         class.as_ptr(),

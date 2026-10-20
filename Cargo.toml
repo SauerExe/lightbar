@@ -1,8 +1,10 @@
 [package]
-name = "rtaskbar"
+name = "lightbar"
 version = "0.1.0"
 edition = "2021"
-description = "Schlanker Windows-11-Taskleisten-Nachbau in Rust (Win32 + GDI)"
+description = "Lightweight Windows 11 taskbar and Start menu replacement in Rust (Win32 + GDI)"
+license = "MIT"
+repository = "https://github.com/SauerExe/lightbar"
 
 [dependencies]
 serde_json = "1"

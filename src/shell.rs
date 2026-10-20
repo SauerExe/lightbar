@@ -22,7 +22,7 @@ use crate::util::{shell_open, w16};
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn state_file() -> Option<PathBuf> {
-    Some(Path::new(&std::env::var("APPDATA").ok()?).join("rtaskbar").join("explorer-taskbar-state"))
+    Some(crate::util::data_dir()?.join("explorer-taskbar-state"))
 }
 
 unsafe fn process_exe(h: HWND) -> Option<String> {
@@ -40,7 +40,8 @@ unsafe fn process_exe(h: HWND) -> Option<String> {
 }
 
 unsafe fn is_ours(h: HWND) -> bool {
-    process_exe(h).is_some_and(|e| e.ends_with("rtaskbar.exe"))
+    // Auch der frühere Name, damit ein Update die alte Version sauber ablöst.
+    process_exe(h).is_some_and(|e| e.ends_with("lightbar.exe") || e.ends_with("rtaskbar.exe"))
 }
 
 /// Explorers Leisten: Haupt-Taskleiste (nicht unsere) und Zweitmonitor-Leisten.
@@ -129,18 +130,24 @@ pub unsafe fn restore() {
 // --------------------------------------------------------------- Autostart
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const RUN_NAME: &str = "rtaskbar";
+const RUN_NAME: &str = "Lightbar";
+/// Autostart-Eintrag unter dem früheren Namen (wird beim Update entfernt).
+const LEGACY_RUN_NAME: &str = "rtaskbar";
 
 fn install_dir() -> Option<PathBuf> {
-    Some(Path::new(&std::env::var("LOCALAPPDATA").ok()?).join("Programs").join("rtaskbar"))
+    Some(Path::new(&std::env::var("LOCALAPPDATA").ok()?).join("Programs").join("Lightbar"))
 }
 
 unsafe fn set_run(value: Option<&str>) -> bool {
+    set_run_named(RUN_NAME, value)
+}
+
+unsafe fn set_run_named(name: &str, value: Option<&str>) -> bool {
     let mut key: HKEY = null_mut();
     if RegOpenKeyExW(HKEY_CURRENT_USER, w16(RUN_KEY).as_ptr(), 0, KEY_SET_VALUE, &mut key) != 0 {
         return false;
     }
-    let name = w16(RUN_NAME);
+    let name = w16(name);
     let ok = match value {
         Some(v) => {
             let data = w16(v);
@@ -171,7 +178,7 @@ unsafe fn close_running() {
     }
 }
 
-/// `--install`: exe nach %LOCALAPPDATA%\Programs\rtaskbar kopieren, Autostart
+/// `--install`: exe nach %LOCALAPPDATA%\Programs\Lightbar kopieren, Autostart
 /// eintragen, starten. `--uninstall`: beenden, Autostart entfernen, Explorer
 /// wiederherstellen. `--restore`: nur Explorer wiederherstellen.
 /// Rückgabe `true` = Befehl erledigt, Programm soll nicht normal starten.
@@ -181,7 +188,7 @@ pub unsafe fn handle_args() -> bool {
         "--install" => {
             close_running();
             let (Ok(me), Some(dir)) = (std::env::current_exe(), install_dir()) else { return true };
-            let target = dir.join("rtaskbar.exe");
+            let target = dir.join("lightbar.exe");
             let _ = std::fs::create_dir_all(&dir);
             // Kurz warten, bis die alte Instanz die Datei freigibt.
             for _ in 0..20 {
@@ -192,12 +199,25 @@ pub unsafe fn handle_args() -> bool {
             }
             let path = target.to_string_lossy().into_owned();
             set_run(Some(&format!("\"{path}\"")));
+            // Umzug vom früheren Namen: alten Autostart und Programmordner entfernen.
+            set_run_named(LEGACY_RUN_NAME, None);
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                // Die alte exe ist evtl. noch kurz gesperrt, während sie sich beendet.
+                let old = Path::new(&local).join("Programs").join("rtaskbar");
+                for _ in 0..20 {
+                    if !old.exists() || std::fs::remove_dir_all(&old).is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
             shell_open(&path, "", SW_SHOWNORMAL);
             true
         }
         "--uninstall" => {
             close_running();
             set_run(None);
+            set_run_named(LEGACY_RUN_NAME, None);
             restore();
             true
         }
