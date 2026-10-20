@@ -98,11 +98,11 @@ cargo build --release
 target\release\lightbar.exe --install
 ```
 
-`--install` copies the executable to `%LOCALAPPDATA%\Programs\Lightbar`, adds it to autostart and starts it (a running instance is closed first).
+`--install` copies the executable to `%LOCALAPPDATA%\Programs\Lightbar`, adds it to autostart and starts it (a running instance is closed first). Autostart is a scheduled task "Lightbar" that runs when you sign in, with the Run registry key as a fallback.
 
 | Command | Effect |
 |---|---|
-| `lightbar.exe --uninstall` | stop, remove autostart, restore the Windows taskbar |
+| `lightbar.exe --uninstall` | stop, remove autostart (task and Run key), restore the Windows taskbar |
 | `lightbar.exe --restore` | only restore the Windows taskbar (e.g. after a crash) |
 | `lightbar.exe --usage-test` | query usage once, write the result to `%APPDATA%\Lightbar\usage-test.txt` |
 | `lightbar.exe --search-test <term>` | run an index search, write the result to `%APPDATA%\Lightbar\search-test.txt` |

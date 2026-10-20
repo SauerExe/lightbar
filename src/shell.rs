@@ -178,6 +178,67 @@ unsafe fn close_running() {
     }
 }
 
+const TASK_NAME: &str = "Lightbar";
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// schtasks ohne Konsolenfenster; `true` bei Erfolg.
+fn schtasks(args: &[&str]) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("schtasks.exe")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Autostart über die Aufgabenplanung (bei Anmeldung dieses Benutzers).
+/// Zuverlässiger als der Run-Schlüssel: Den arbeitet Explorer selbst ab und
+/// hat Lightbar dort auf manchen Systemen ohne Meldung übersprungen. Startet
+/// außerdem früher. Ein Anmelde-Auslöser nur für den eigenen Benutzer braucht
+/// keine Administratorrechte (anders als `schtasks /sc onlogon`).
+fn set_logon_task(exe: Option<&str>) -> bool {
+    let Some(exe) = exe else {
+        return schtasks(&["/delete", "/tn", TASK_NAME, "/f"]);
+    };
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(d), Ok(u)) => format!("{d}\\{u}"),
+        _ => return false,
+    };
+    let (user, exe) = (xml_escape(&user), xml_escape(exe));
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Lightbar – Taskleiste bei der Anmeldung starten</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{exe}</Command></Exec></Actions>
+</Task>
+"#
+    );
+    let file = std::env::temp_dir().join("lightbar-task.xml");
+    // schtasks erwartet UTF-16 mit BOM.
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(xml.encode_utf16().flat_map(|c| c.to_le_bytes()));
+    if std::fs::write(&file, bytes).is_err() {
+        return false;
+    }
+    let ok = schtasks(&["/create", "/tn", TASK_NAME, "/xml", &file.to_string_lossy(), "/f"]);
+    let _ = std::fs::remove_file(&file);
+    ok
+}
+
 /// `--install`: exe nach %LOCALAPPDATA%\Programs\Lightbar kopieren, Autostart
 /// eintragen, starten. `--uninstall`: beenden, Autostart entfernen, Explorer
 /// wiederherstellen. `--restore`: nur Explorer wiederherstellen.
@@ -199,6 +260,9 @@ pub unsafe fn handle_args() -> bool {
             }
             let path = target.to_string_lossy().into_owned();
             set_run(Some(&format!("\"{path}\"")));
+            // Run-Schlüssel bleibt als Rückfallebene; doppelt gestartet beendet
+            // sich die zweite Instanz sofort (Mutex).
+            set_logon_task(Some(&path));
             // Umzug vom früheren Namen: alten Autostart und Programmordner entfernen.
             set_run_named(LEGACY_RUN_NAME, None);
             if let Ok(local) = std::env::var("LOCALAPPDATA") {
@@ -217,6 +281,7 @@ pub unsafe fn handle_args() -> bool {
         "--uninstall" => {
             close_running();
             set_run(None);
+            set_logon_task(None);
             set_run_named(LEGACY_RUN_NAME, None);
             restore();
             true
