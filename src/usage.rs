@@ -64,11 +64,108 @@ impl Drop for Handle {
     }
 }
 
-/// HTTPS-GET über WinHTTP (Systemproxy, Systemzertifikate).
+/// Proxy aus der Umgebung (`HTTPS_PROXY` / `https_proxy`), z. B.
+/// `http://proxy:3128` oder `http://user:pass@proxy:3128`.
+#[derive(Debug, PartialEq)]
+struct EnvProxy {
+    /// `host:port` für WinHTTP (ohne Schema und Zugangsdaten).
+    server: String,
+    user: Option<String>,
+    pass: Option<String>,
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Some(v) = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Proxy-URL zerlegen. Die Verbindung zum Proxy läuft bei WinHTTP immer per
+/// HTTP CONNECT, daher wird ein `https://`-Schema wie `http://` behandelt.
+fn parse_proxy(url: &str) -> Option<EnvProxy> {
+    let url = url.trim();
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let rest = rest.split('/').next().unwrap_or_default();
+    let (cred, server) = match rest.rsplit_once('@') {
+        Some((c, s)) => (Some(c), s),
+        None => (None, rest),
+    };
+    if server.is_empty() {
+        return None;
+    }
+    let (user, pass) = match cred {
+        Some(c) => match c.split_once(':') {
+            Some((u, p)) => (Some(percent_decode(u)), Some(percent_decode(p))),
+            None => (Some(percent_decode(c)), None),
+        },
+        None => (None, None),
+    };
+    Some(EnvProxy { server: server.to_string(), user, pass })
+}
+
+/// Soll `host` laut NO_PROXY-Liste (Komma-getrennt, `*`, `.domain`,
+/// `domain`) am Umgebungs-Proxy vorbei?
+fn no_proxy_matches(list: &str, host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    list.split(',').map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty()).any(|e| {
+        if e == "*" {
+            return true;
+        }
+        let e = e.trim_start_matches("*.").trim_start_matches('.');
+        host == e || host.ends_with(&format!(".{e}"))
+    })
+}
+
+fn env_proxy(host: &str) -> Option<EnvProxy> {
+    let get = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let url = get("HTTPS_PROXY").or_else(|| get("https_proxy"))?;
+    if get("NO_PROXY").or_else(|| get("no_proxy")).is_some_and(|l| no_proxy_matches(&l, host)) {
+        return None;
+    }
+    parse_proxy(&url)
+}
+
+/// Ist ein WinHTTP-Proxy gesetzt (`netsh winhttp set proxy`)?
+unsafe fn winhttp_proxy_set() -> bool {
+    let mut info: WINHTTP_PROXY_INFO = std::mem::zeroed();
+    if WinHttpGetDefaultProxyConfiguration(&mut info) == 0 {
+        return false;
+    }
+    let named = info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY && !info.lpszProxy.is_null();
+    for p in [info.lpszProxy, info.lpszProxyBypass] {
+        if !p.is_null() {
+            windows_sys::Win32::Foundation::GlobalFree(p as _);
+        }
+    }
+    named
+}
+
+/// HTTPS-GET über WinHTTP (Systemzertifikate). Proxy in dieser Reihenfolge:
+/// `HTTPS_PROXY`/`https_proxy` (mit `NO_PROXY`), der WinHTTP-Proxy
+/// (`netsh winhttp set proxy`), sonst die Windows-Proxy-Einstellungen
+/// (automatisch, inkl. PAC/WPAD).
 /// Rückgabe: (Status, Body, Retry-After in Sekunden, falls der Server eins nennt).
 fn https_get(host: &str, path: &str, headers: &[(&str, String)]) -> Result<(u32, String, Option<i64>), String> {
     unsafe {
-        let session = Handle(WinHttpOpen(w16("lightbar/0.1").as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null(), null(), 0));
+        let agent = w16("lightbar/0.1");
+        let proxy = env_proxy(host);
+        let session = match &proxy {
+            Some(p) => Handle(WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_NAMED_PROXY, w16(&p.server).as_ptr(), null(), 0)),
+            None if winhttp_proxy_set() => Handle(WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, null(), null(), 0)),
+            None => Handle(WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null(), null(), 0)),
+        };
         if session.0.is_null() {
             return Err("WinHTTP nicht verfügbar".into());
         }
@@ -81,12 +178,22 @@ fn https_get(host: &str, path: &str, headers: &[(&str, String)]) -> Result<(u32,
         if req.0.is_null() {
             return Err("Anfrage nicht möglich".into());
         }
+        // Zugangsdaten aus der Proxy-URL: nur an WinHTTP, nie in Fehlermeldungen.
+        if let Some(p) = &proxy {
+            for (option, value) in [(WINHTTP_OPTION_PROXY_USERNAME, &p.user), (WINHTTP_OPTION_PROXY_PASSWORD, &p.pass)] {
+                if let Some(v) = value {
+                    let w = w16(v);
+                    WinHttpSetOption(req.0, option, w.as_ptr() as _, (w.len() - 1) as u32);
+                }
+            }
+        }
+        let via = proxy.as_ref().map(|p| format!(" (über Proxy {})", p.server)).unwrap_or_default();
         let header_text: String = headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
         let h = w16(&header_text);
         if WinHttpSendRequest(req.0, h.as_ptr(), (h.len() - 1) as u32, null(), 0, 0, 0) == 0
             || WinHttpReceiveResponse(req.0, null_mut()) == 0
         {
-            return Err(format!("{host} nicht erreichbar"));
+            return Err(format!("{host} nicht erreichbar{via}"));
         }
         let mut status: u32 = 0;
         let mut size = std::mem::size_of::<u32>() as u32;
@@ -508,5 +615,30 @@ pub fn self_test() {
         let dir = PathBuf::from(appdata).join("Lightbar");
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(dir.join("usage-test.txt"), text);
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn parses_proxy_urls() {
+        assert_eq!(parse_proxy("http://proxy.local:3128"), Some(EnvProxy { server: "proxy.local:3128".into(), user: None, pass: None }));
+        assert_eq!(parse_proxy("proxy:8080/"), Some(EnvProxy { server: "proxy:8080".into(), user: None, pass: None }));
+        assert_eq!(
+            parse_proxy("https://us%40er:p%3Ass@10.0.0.1:8443"),
+            Some(EnvProxy { server: "10.0.0.1:8443".into(), user: Some("us@er".into()), pass: Some("p:ss".into()) })
+        );
+        assert_eq!(parse_proxy("http://"), None);
+    }
+
+    #[test]
+    fn no_proxy_list() {
+        assert!(no_proxy_matches("localhost, .anthropic.com", "api.anthropic.com"));
+        assert!(no_proxy_matches("chatgpt.com", "chatgpt.com"));
+        assert!(no_proxy_matches("*", "chatgpt.com"));
+        assert!(!no_proxy_matches("openai.com", "chatgpt.com"));
+        assert!(!no_proxy_matches("pt.com", "chatgpt.com"));
     }
 }

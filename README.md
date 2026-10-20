@@ -113,6 +113,7 @@ Settings (right-click the taskbar) are stored in `%APPDATA%\Lightbar\settings.tx
 
 - **Antivirus / SmartScreen:** the executable is not code-signed and installs a low-level keyboard hook to take over the Windows key. Some antivirus products flag that pattern. The source is all here.
 - **Usage display:** reads the local logins of Claude Code (`~/.claude/.credentials.json`) and Codex (`~/.codex/auth.json`) and calls their *undocumented* usage endpoints. Tokens are never stored, logged or sent anywhere else. These endpoints may change at any time, and using them may not be covered by the providers' terms – which is why the feature is off by default.
+- **Proxy:** the usage requests use `HTTPS_PROXY` / `https_proxy` if set (respecting `NO_PROXY`; credentials in the URL like `http://user:pass@proxy:3128` are supported), otherwise the WinHTTP proxy (`netsh winhttp set proxy`), otherwise Windows' proxy settings (including PAC/WPAD).
 - Explorer keeps running (desktop, file windows); only its taskbar is hidden.
 
 ## Known limitations
