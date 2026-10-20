@@ -13,6 +13,39 @@ Plain Win32 + GDI, no UI framework, a single ~650 KB executable using about 7 MB
 
 > **Status: experimental hobby project.** It runs as a daily driver on one machine, but it is young and not widely tested. The user interface is currently in German.
 
+## Why Lightbar?
+
+Honest answer, based on what was measured and built – including where it is *not* better.
+
+**1. Search – clearly better**
+- Windows 11 search is a web page in an embedded Edge browser (WebView2): **~134 MB**.
+- Lightbar's search is drawn natively and opens instantly. Taskbar, Start menu and search together use **~7.6 MB**.
+- No Bing web results, no ads. Web search goes to DuckDuckGo – and only when you click it.
+
+**2. A Start menu without Microsoft's extras**
+- No promoted apps or "recommended" ads – "Recommended" shows only your own recently opened files.
+- **Presentation mode** hides your name, files and history with one click – handy for streaming. Windows has nothing like it.
+
+**3. Features Windows doesn't have**
+- Claude / Codex usage right in the taskbar
+- Task Manager button with a live CPU meter
+- Mouse wheel over the speaker icon changes the volume; over an app it cycles through its windows
+- ISO week numbers in the calendar
+- Monochrome tray icons for a calm look
+- Optional animated glow edge
+
+**4. You're in control**
+- Microsoft changes the taskbar with updates and has removed a lot in Windows 11. Lightbar only changes when you want it to, and anything missing can be added.
+- Open source, with honestly measured numbers.
+
+**Where Lightbar is *not* better**
+- **Idle CPU:** on par with Windows (≈1.0 vs ≈1.4 ms/s), no real lead.
+- **Total memory:** Windows' shell processes keep running in the background, so Lightbar's ~7 MB come on top.
+- **Maturity:** Windows is tested on millions of PCs; Lightbar is brand new. Multi-monitor and touch are not yet tested on real hardware.
+- **Missing:** its own notification centre, widgets, app-defined tasks in jump lists.
+
+**In one sentence:** Lightbar is not leaner than the Windows taskbar – but its search is lighter and faster, and it gives you features and freedom that Windows doesn't.
+
 ## Features
 
 - **Taskbar** – apps grouped by AppUserModelID like Windows 11, pinning, drag & drop reordering, live window previews (DWM thumbnails), Win+1…9, middle-click for a new instance, mouse wheel to cycle a group's windows, jump lists (recent and frequent files) in the right-click menu
