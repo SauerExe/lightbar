@@ -180,7 +180,7 @@ fn exe_key(exe: &str) -> String {
 /// Kleinschreibung und Squirrel-Versionsordner entfernen: Discord, Slack & Co.
 /// liegen in …\discord\app-1.0.9264\discord.exe; als Schlüssel zählt
 /// …\discord\discord.exe, damit Anheften Updates überlebt.
-fn normalize_exe(exe: &str) -> String {
+pub fn normalize_exe(exe: &str) -> String {
     let lower = exe.to_lowercase();
     let parts: Vec<&str> = lower.split('\\').collect();
     let is_version_dir = |p: &str| p.strip_prefix("app-").is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.'));
@@ -587,6 +587,28 @@ unsafe fn launch(g: &Group) {
     }
 }
 
+/// Sprungliste ("Zuletzt verwendet") einer Gruppe: über ihre AppUserModelID
+/// oder – bei Desktop-Apps ohne eigene – über die ID im App-Katalog.
+/// Im Präsentationsmodus leer (Dateinamen sind privat).
+fn jump_list_of(g: &Group) -> Vec<(String, String)> {
+    if crate::settings::get().presentation {
+        return Vec::new();
+    }
+    let id = match g.key.strip_prefix("aumid:") {
+        Some(id) => Some(id.to_string()),
+        None => g.exe.as_deref().and_then(crate::start::app_id_for_exe),
+    };
+    id.map(|id| crate::apps::jump_list(&id, 8)).unwrap_or_default()
+}
+
+fn shorten(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max - 1).collect::<String>() + "…"
+    }
+}
+
 /// Anheft-Eintrag, der zu dieser Gruppe gehört (Schlüssel oder exe).
 fn pin_of(g: &Group) -> Option<String> {
     let exe = g.exe.as_deref().map(exe_key);
@@ -658,7 +680,16 @@ unsafe fn task_menu(hwnd: HWND, g: Group) {
     };
     let pin = pin_of(&g);
     let pinned = pin.is_some();
+    let recent = jump_list_of(&g);
+    let recent_labels: Vec<String> = recent.iter().map(|(n, _)| shorten(n, 48)).collect();
     let mut items = Vec::new();
+    if !recent.is_empty() {
+        items.push(Item::Label("Zuletzt verwendet"));
+        for (i, label) in recent_labels.iter().enumerate() {
+            items.push(Item::Cmd(100 + i, label));
+        }
+        items.push(Item::Sep);
+    }
     if !title.is_empty() && title != name {
         items.push(Item::Label(&title));
         items.push(Item::Sep);
@@ -681,6 +712,11 @@ unsafe fn task_menu(hwnd: HWND, g: Group) {
     match menus::popup(hwnd, &items) {
         1 => launch(&g),
         2 => toggle_key(&pin.unwrap_or_else(|| pin_key_for(&g))),
+        id @ 100..=199 => {
+            if let Some((_, path)) = recent.get(id - 100) {
+                shell_open(path, "", SW_SHOWNORMAL);
+            }
+        }
         3 => {
             for &w in &g.windows {
                 PostMessageW(w, WM_CLOSE, 0, 0);

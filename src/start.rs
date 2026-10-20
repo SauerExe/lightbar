@@ -135,6 +135,8 @@ struct State {
     icons: HashMap<String, HBITMAP>,
     query: String,
     results: Vec<Row>,
+    /// exe (normalisiert) → App-Kennung im Katalog; für Sprunglisten, lazy gebaut.
+    exe_ids: Option<HashMap<String, String>>,
     /// Treffer aus dem Windows-Suchindex für iles_for.
     files: Vec<Entry>,
     files_for: String,
@@ -300,7 +302,26 @@ fn rebuild(st: &mut State) {
         }));
     }
     st.all_rows = rows;
+    st.exe_ids = None;
     st.pin_idx = st.pins.iter().filter_map(|id| st.apps.iter().position(|a| &a.id == id)).collect();
+}
+
+/// App-Kennung (AppsFolder-ID) zu einer exe – unter dieser ID führt Windows
+/// die Sprungliste von Desktop-Apps ohne eigene AppUserModelID.
+pub fn app_id_for_exe(exe: &str) -> Option<String> {
+    let want = crate::bar::normalize_exe(exe);
+    with(|st| {
+        if st.exe_ids.is_none() {
+            let map = st
+                .apps
+                .iter()
+                .filter_map(|a| unsafe { apps::target_path(a) }.map(|t| (crate::bar::normalize_exe(&t), a.id.clone())))
+                .collect();
+            st.exe_ids = Some(map);
+        }
+        st.exe_ids.as_ref()?.get(&want).cloned()
+    })
+    .flatten()
 }
 
 fn search(st: &State) -> Vec<Row> {
@@ -1020,6 +1041,7 @@ pub unsafe fn create(inst: HINSTANCE) {
         icons: HashMap::new(),
         query: String::new(),
         results: Vec::new(),
+        exe_ids: None,
         files: Vec::new(),
         files_for: String::new(),
         files_gen: 0,

@@ -15,7 +15,7 @@ Plain Win32 + GDI, no UI framework, a single ~600 KB executable using about 11 M
 
 ## Features
 
-- **Taskbar** – apps grouped by AppUserModelID like Windows 11, pinning, drag & drop reordering, live window previews (DWM thumbnails), Win+1…9, middle-click for a new instance, mouse wheel to cycle a group's windows
+- **Taskbar** – apps grouped by AppUserModelID like Windows 11, pinning, drag & drop reordering, live window previews (DWM thumbnails), Win+1…9, middle-click for a new instance, mouse wheel to cycle a group's windows, jump lists (recent and frequent files) in the right-click menu
 - **Start menu** – all apps including Store apps, pinned apps, recently used files, search across apps, settings and files (Windows Search index), web search fallback, power and account menus
 - **Keyboard** – Win opens the Start menu; Win+S search, Win+X power-user menu, Win+A quick settings, Win+T moves keyboard focus into the taskbar (arrow keys, Enter, context-menu key, Esc)
 - **Screen readers** – UI Automation provider: the taskbar is exposed as a toolbar whose buttons have names, descriptions and can be invoked (Narrator, NVDA)
@@ -69,7 +69,7 @@ Settings (right-click the taskbar) are stored in `%APPDATA%\Lightbar\settings.tx
 ## Known limitations
 
 - Single monitor only
-- No jump lists; notification centre and widgets are Windows' own
+- Jump lists show recent/frequent items only (no app-defined tasks); notification centre and widgets are Windows' own
 - Touch and pen work through Windows' mouse emulation only
 - German UI
 

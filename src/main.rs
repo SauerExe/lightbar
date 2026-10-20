@@ -68,6 +68,16 @@ fn main() {
             }
             return;
         }
+        // Diagnose: Anzahl der Sprunglisten-Einträge einer App-Kennung (ohne Namen).
+        if std::env::args().nth(1).as_deref() == Some("--jumplist-test") {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let id = std::env::args().nth(2).unwrap_or_default();
+            let n = apps::jump_list(&id, 8).len();
+            if let Some(dir) = util::data_dir() {
+                let _ = std::fs::write(dir.join("jumplist-test.txt"), format!("{id}: {n} Einträge\n"));
+            }
+            return;
+        }
         if std::env::args().nth(1).as_deref() == Some("--usage-test") {
             usage::self_test();
             return;
