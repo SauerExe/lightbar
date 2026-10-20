@@ -3,7 +3,7 @@
 A lightweight replacement for the Windows 11 taskbar and Start menu, written in Rust.
 Plain Win32 + GDI, no UI framework, a single ~600 KB executable using about 11 MB of RAM.
 
-![Taskbar](docs/screenshots/taskbar.png)
+![Lightbar demo](docs/demo.gif)
 
 <p>
   <img src="docs/screenshots/start-search.png" width="420" alt="Start menu search">
@@ -24,6 +24,7 @@ Plain Win32 + GDI, no UI framework, a single ~600 KB executable using about 11 M
 - **Task Manager button** with a live CPU meter
 - **Glow edge** above the taskbar (Aurora, accent colour or neon) and subtle animations – optional
 - **Claude / Codex usage** (5-hour and weekly limits) – optional, off by default, see notes
+- **Presentation mode** for streaming or screen sharing – hides your name, recent files, file search results and usage
 - Hides the Windows taskbar while running and restores it on exit; maximised windows and full-screen apps are handled
 
 ## Performance

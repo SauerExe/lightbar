@@ -293,7 +293,7 @@ fn layout(width: i32, dpi: u32, n_tasks: usize, n_tray: usize, overflow: bool, b
     let chevron = overflow.then(|| RECT { left: tray_l - tw, top, right: tray_l, bottom });
     let usage = RECT { left: px(dpi, 8), top, right: px(dpi, 8 + USAGE_W), bottom };
     // Task-Manager direkt rechts neben der Usage-Anzeige (oder ganz links, wenn die aus ist).
-    let tm_left = if crate::settings::get().show_usage { usage.right + px(dpi, 4) } else { px(dpi, 8) };
+    let tm_left = if { let s = crate::settings::get(); s.show_usage && !s.presentation } { usage.right + px(dpi, 4) } else { px(dpi, 8) };
     let taskmgr = RECT { left: tm_left, top, right: tm_left + px(dpi, TASKMGR_W), bottom };
     Layout { usage, taskmgr, start, tasks, tray, chevron, status, clock, desktop }
 }
@@ -333,7 +333,7 @@ unsafe fn hit_at(hwnd: HWND, x: i32, y: i32) -> Hit {
     if inside(&l.taskmgr, x, y) {
         return Hit::TaskMgr;
     }
-    if inside(&l.usage, x, y) && crate::settings::get().show_usage {
+    if inside(&l.usage, x, y) && crate::settings::get().show_usage && !crate::settings::get().presentation {
         return Hit::Usage;
     }
     Hit::None
@@ -710,6 +710,7 @@ unsafe fn bar_menu(hwnd: HWND) {
             Item::Check(14, "Uhr mit Sekunden", s.clock_seconds),
             Item::Check(15, "Claude/Codex-Usage anzeigen", s.show_usage),
             Item::Check(5, "Tray-Icons einfarbig", s.mono_tray),
+            Item::Check(18, "Präsentationsmodus", s.presentation),
             Item::Sep,
             Item::Cmd(3, "Taskleiste beenden"),
         ],
@@ -727,6 +728,7 @@ unsafe fn bar_menu(hwnd: HWND) {
         17 => crate::settings::update(|s| s.windows_logo = true),
         15 => crate::settings::update(|s| s.show_usage = !s.show_usage),
         5 => crate::settings::update(|s| s.mono_tray = !s.mono_tray),
+        18 => crate::settings::update(|s| s.presentation = !s.presentation),
         3 => {
             DestroyWindow(hwnd);
             return;
@@ -1488,7 +1490,7 @@ unsafe fn paint(hwnd: HWND) {
         text(dc, &time, &RECT { bottom: mid, ..cr }, font, TEXT, flags | DT_BOTTOM);
         text(dc, &format!("{:02}.{:02}.{}", st.wDay, st.wMonth, st.wYear), &RECT { top: mid, ..cr }, font, TEXT, flags | DT_TOP);
 
-        if settings.show_usage {
+        if settings.show_usage && !settings.presentation {
             draw_usage(dc, &l.usage, dpi, font, hv("usage"));
         }
         draw_taskmgr(dc, &l.taskmgr, dpi, hv("taskmgr"), taskmgr_icon, cpu);

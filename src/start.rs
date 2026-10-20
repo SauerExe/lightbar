@@ -248,6 +248,9 @@ fn ago(t: SystemTime) -> String {
 
 /// Zuletzt verwendete Dateien aus dem Recent-Ordner der Shell.
 fn load_recent() -> Vec<Entry> {
+    if crate::settings::get().presentation {
+        return Vec::new();
+    }
     let Ok(appdata) = std::env::var("APPDATA") else { return Vec::new() };
     let dir = Path::new(&appdata).join(r"Microsoft\Windows\Recent");
     let mut files: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(dir)
@@ -587,7 +590,7 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     let foot = RECT { left: 0, top: body_bottom, right: w, bottom: h };
     fill(dc, &foot, PANEL);
     fill(dc, &RECT { bottom: foot.top + 1, ..foot }, BORDER);
-    let user = std::env::var("USERNAME").unwrap_or_default();
+    let user = if crate::settings::get().presentation { "Benutzer".to_string() } else { std::env::var("USERNAME").unwrap_or_default() };
     let av = px(d, 32);
     let ar = RECT { left: px(d, PAD + 16), top: foot.top + (px(d, FOOT) - av) / 2, right: px(d, PAD + 16) + av, bottom: foot.top + (px(d, FOOT) + av) / 2 };
     let account = RECT { left: px(d, PAD), top: foot.top + px(d, 12), right: ar.right + px(d, 24) + text_width(dc, &user, f.normal), bottom: h - px(d, 12) };
@@ -736,6 +739,9 @@ fn hit(st: &State, x: i32, y: i32) -> Option<Act> {
 
 /// Index-Suche für die aktuelle Anfrage im Hintergrund starten.
 unsafe fn start_file_search(hwnd: HWND) {
+    if crate::settings::get().presentation {
+        return; // Dateinamen und Pfade sind privat.
+    }
     let Some((query, gen)) = with(|st| {
         st.files_gen += 1;
         (st.query.trim().to_string(), st.files_gen)
