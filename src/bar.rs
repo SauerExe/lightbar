@@ -51,6 +51,8 @@ pub const WM_BAR_WINX: u32 = WM_APP + 30;
 pub const WM_BAR_NUM: u32 = WM_APP + 31;
 pub const WM_BAR_QUICK: u32 = WM_APP + 32;
 const WM_BAR_USAGE: u32 = WM_APP + 33;
+const WM_BAR_INVOKE: u32 = WM_APP + 34;
+pub const WM_BAR_FOCUS: u32 = WM_APP + 35;
 const USAGE_W: i32 = 236;
 const TASKMGR_W: i32 = 40;
 const VK_KEY_D: VIRTUAL_KEY = 0x44;
@@ -110,6 +112,8 @@ struct State {
     order: Vec<String>,
     /// Laufendes Ziehen eines Buttons.
     drag: Option<Drag>,
+    /// Tastaturfokus (Win+T) auf einem Element aus ui_elements.
+    kb_focus: Option<usize>,
     status: Option<Status>,
     hover: Hit,
     tracking: bool,
@@ -952,6 +956,135 @@ unsafe fn set_pos(hwnd: HWND) {
 
 // ---------------------------------------------------------------- Zeichnen
 
+// ------------------------------------------------- Barrierefreiheit (UIA)
+
+/// Ein bedienbares Element der Leiste, wie es Screenreader sehen.
+pub struct UiElement {
+    pub id: String,
+    pub name: String,
+    pub help: String,
+    /// Bildschirmkoordinaten.
+    pub rect: RECT,
+    hit: Hit,
+}
+
+/// Alle Elemente von links nach rechts – dieselbe Quelle wie Layout und Hit-Test.
+pub fn ui_elements() -> Vec<UiElement> {
+    unsafe {
+        let hwnd = hwnd();
+        let Some((l, tray)) = current_layout(hwnd) else { return Vec::new() };
+        let mut origin = POINT { x: 0, y: 0 };
+        ClientToScreen(hwnd, &mut origin);
+        let screen = |r: RECT| RECT { left: r.left + origin.x, top: r.top + origin.y, right: r.right + origin.x, bottom: r.bottom + origin.y };
+        let settings = crate::settings::get();
+        let groups = with(|s| s.groups.clone()).unwrap_or_default();
+        let fg = GetForegroundWindow();
+        let mut out = Vec::new();
+        let mut push = |hit: Hit, id: String, name: String, help: &str, rect: RECT| {
+            out.push(UiElement { id, name, help: help.to_string(), rect: screen(rect), hit });
+        };
+        if settings.show_usage && !settings.presentation {
+            push(Hit::Usage, "usage".into(), tip_text(Hit::Usage).replace('\n', ", "), "Claude- und Codex-Nutzung, klicken zum Aktualisieren", l.usage);
+        }
+        push(Hit::TaskMgr, "taskmgr".into(), tip_text(Hit::TaskMgr).replace('\n', ", "), "Task-Manager öffnen", l.taskmgr);
+        push(Hit::Start, "start".into(), "Start".into(), "Startmenü öffnen", l.start);
+        for (i, g) in groups.iter().enumerate() {
+            let Some(&r) = l.tasks.get(i) else { continue };
+            let state = match g.windows.len() {
+                0 => "angeheftet, nicht geöffnet".to_string(),
+                1 if g.windows[0] == fg => "aktiv".to_string(),
+                1 => window_title(g.windows[0]),
+                n => format!("{n} Fenster"),
+            };
+            push(Hit::Task(i), format!("app:{}", g.slot), group_name(g), &state, r);
+        }
+        if let Some(r) = l.chevron {
+            push(Hit::Chevron, "overflow".into(), "Ausgeblendete Symbole anzeigen".into(), "Infobereich", r);
+        }
+        for (n, &(index, _)) in tray.iter().enumerate() {
+            let name = tray::tip(index);
+            let name = if name.is_empty() { "Infobereich-Symbol".to_string() } else { name };
+            push(Hit::Tray(index), format!("tray:{index}"), name, "Infobereich", l.tray[n]);
+        }
+        push(Hit::Status, "status".into(), tip_text(Hit::Status).replace('\n', ", "), "Schnelleinstellungen öffnen", l.status);
+        push(Hit::Clock, "clock".into(), tip_text(Hit::Clock), "Kalender öffnen", l.clock);
+        push(Hit::Desktop, "desktop".into(), "Desktop anzeigen".into(), "Alle Fenster minimieren", l.desktop);
+        out
+    }
+}
+
+pub fn ui_focus() -> Option<usize> {
+    with(|s| s.kb_focus).flatten()
+}
+
+/// Tastaturfokus auf ein Element setzen (Win+T, Pfeiltasten, Screenreader).
+pub fn ui_set_focus(index: usize) {
+    unsafe {
+        let h = hwnd();
+        let n = ui_elements().len();
+        if n == 0 {
+            return;
+        }
+        let index = index.min(n - 1);
+        with(|s| s.kb_focus = Some(index));
+        if GetForegroundWindow() != h {
+            force_foreground(h);
+        }
+        SetFocus(h);
+        InvalidateRect(h, null(), 0);
+        crate::uia::raise_focus(h as isize, index);
+    }
+}
+
+/// Element auslösen (Enter/Leertaste oder Screenreader) – wie ein Klick.
+pub fn ui_invoke(index: usize) {
+    unsafe {
+        PostMessageW(hwnd(), WM_BAR_INVOKE, index, 0);
+    }
+}
+
+/// Klick (links oder rechts) mittig auf ein Element schicken.
+unsafe fn click_element(hwnd: HWND, index: usize, msg: u32) {
+    let Some(e) = ui_elements().into_iter().nth(index) else { return };
+    let mut pt = POINT { x: (e.rect.left + e.rect.right) / 2, y: (e.rect.top + e.rect.bottom) / 2 };
+    ScreenToClient(hwnd, &mut pt);
+    let lp = (pt.x as u16 as isize) | ((pt.y as u16 as isize) << 16);
+    let _ = e.hit;
+    wndproc(hwnd, msg, 0, lp);
+}
+
+/// Tastatur im Fokusmodus; `true`, wenn die Taste verbraucht wurde.
+unsafe fn focus_key(hwnd: HWND, vk: u16) -> bool {
+    let Some(cur) = ui_focus() else { return false };
+    let n = ui_elements().len();
+    let shift = GetKeyState(VK_SHIFT as i32) < 0;
+    match vk {
+        VK_RIGHT | VK_TAB if !shift => ui_set_focus((cur + 1) % n.max(1)),
+        VK_LEFT | VK_TAB => ui_set_focus((cur + n.max(1) - 1) % n.max(1)),
+        VK_HOME => ui_set_focus(0),
+        VK_END => ui_set_focus(n.saturating_sub(1)),
+        VK_RETURN | VK_SPACE => click_element(hwnd, cur, WM_LBUTTONUP),
+        VK_APPS | VK_F10 => click_element(hwnd, cur, WM_RBUTTONUP),
+        VK_ESCAPE => {
+            with(|s| s.kb_focus = None);
+            InvalidateRect(hwnd, null(), 0);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Fokusrahmen in Client-Koordinaten (für das Zeichnen).
+unsafe fn focus_rect(hwnd: HWND) -> Option<RECT> {
+    let i = ui_focus()?;
+    let e = ui_elements().into_iter().nth(i)?;
+    let mut tl = POINT { x: e.rect.left, y: e.rect.top };
+    let mut br = POINT { x: e.rect.right, y: e.rect.bottom };
+    ScreenToClient(hwnd, &mut tl);
+    ScreenToClient(hwnd, &mut br);
+    Some(RECT { left: tl.x, top: tl.y, right: br.x, bottom: br.y })
+}
+
 // ------------------------------------------------------------- Animation
 
 /// Animierte Werte der Leiste. Ziele kommen aus Layout und Zustand,
@@ -1369,6 +1502,7 @@ unsafe fn paint(hwnd: HWND) {
     let hv = |id: &str| anim.hover.get(id).copied().unwrap_or(0.0);
     let tray = tray::visible();
     let overflow = !tray::overflow().is_empty();
+    let focus = focus_rect(hwnd);
     let settings = crate::settings::get();
     let mono_on = settings.mono_tray;
     paint_buffered(hwnd, |dc, w, h| {
@@ -1495,6 +1629,12 @@ unsafe fn paint(hwnd: HWND) {
         }
         draw_taskmgr(dc, &l.taskmgr, dpi, hv("taskmgr"), taskmgr_icon, cpu);
 
+        // Tastaturfokus (Win+T): deutlich sichtbarer Rahmen.
+        if let Some(r) = focus {
+            outline(dc, &r, TEXT, radius);
+            outline(dc, &RECT { left: r.left + 1, top: r.top + 1, right: r.right - 1, bottom: r.bottom - 1 }, TEXT, radius);
+        }
+
         // "Desktop anzeigen": dünne Kante ganz rechts, blendet ein.
         let k = hv("desktop");
         if k > 0.01 {
@@ -1585,6 +1725,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_BAR_USAGE => {
             InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        // Screenreader fragen nach unserem UI-Automation-Provider.
+        WM_GETOBJECT if lp as i32 == windows::Win32::UI::Accessibility::UiaRootObjectId => {
+            use windows::Win32::Foundation as wf;
+            let root = crate::uia::root(hwnd as isize);
+            windows::Win32::UI::Accessibility::UiaReturnRawElementProvider(wf::HWND(hwnd as _), wf::WPARAM(wp), wf::LPARAM(lp), &root).0
+        }
+        WM_BAR_INVOKE => {
+            click_element(hwnd, wp, WM_LBUTTONUP);
+            0
+        }
+        WM_BAR_FOCUS => {
+            // Win+T: auf die erste App, sonst auf Start.
+            let els = ui_elements();
+            let first = els.iter().position(|e| matches!(e.hit, Hit::Task(_))).or_else(|| els.iter().position(|e| e.hit == Hit::Start));
+            ui_set_focus(first.unwrap_or(0));
+            0
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN if focus_key(hwnd, wp as u16) => 0,
+        WM_KILLFOCUS => {
+            if with(|s| s.kb_focus.take().is_some()).unwrap_or(false) {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_BAR_NUM => {
@@ -1881,6 +2045,7 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
             pins: load_pins(),
             order: Vec::new(),
             drag: None,
+            kb_focus: None,
             status: Some(status::poll()),
             hover: Hit::None,
             tracking: false,

@@ -20,6 +20,7 @@ mod start;
 mod status;
 mod tooltip;
 mod tray;
+mod uia;
 mod usage;
 mod util;
 

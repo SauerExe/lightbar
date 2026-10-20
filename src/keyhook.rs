@@ -26,6 +26,7 @@ const VK_MASK: VIRTUAL_KEY = 0xE8;
 const VK_KEY_S: u16 = b'S' as u16;
 const VK_KEY_X: u16 = b'X' as u16;
 const VK_KEY_A: u16 = b'A' as u16;
+const VK_KEY_T: u16 = b'T' as u16;
 
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 static COMBO: AtomicBool = AtomicBool::new(false);
@@ -64,6 +65,7 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                     VK_KEY_S => (start::hwnd(), start::WM_TOGGLE, 1),
                     VK_KEY_X => (bar::hwnd(), bar::WM_BAR_WINX, 0),
                     VK_KEY_A => (bar::hwnd(), bar::WM_BAR_QUICK, 0),
+                    VK_KEY_T => (bar::hwnd(), bar::WM_BAR_FOCUS, 0),
                     0x31..=0x39 => (bar::hwnd(), bar::WM_BAR_NUM, (vk - 0x31) as usize),
                     _ => return CallNextHookEx(null_mut(), code, wp, lp),
                 };
