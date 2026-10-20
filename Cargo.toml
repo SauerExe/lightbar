@@ -1,6 +1,6 @@
 [package]
 name = "lightbar"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Lightweight Windows 11 taskbar and Start menu replacement in Rust (Win32 + GDI)"
 license = "MIT"
