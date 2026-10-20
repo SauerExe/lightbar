@@ -5,11 +5,13 @@
 //! orange bei Apps, die Aufmerksamkeit wollen, und färbt sich warm, wenn ein
 //! Claude-/Codex-Limit fast erreicht ist.
 //!
-//! Eigenes Layered-Fenster mit Pro-Pixel-Alpha (UpdateLayeredWindow),
+//! Eigene Layered-Fenster mit Pro-Pixel-Alpha (UpdateLayeredWindow),
 //! klickdurchlässig und nie aktiv. Gerendert wird spaltenweise in einen
-//! DIB-Puffer – rund 40 000 Pixel pro Bild bei 30 fps.
+//! DIB-Puffer – rund 40 000 Pixel pro Leiste und Bild bei 30 fps. Auf
+//! mehreren Monitoren hat jede Leiste ihr Leuchtfenster; Farbverlauf und Komet
+//! laufen in Bildschirmkoordinaten als ein Band von links nach rechts.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -32,16 +34,29 @@ struct Flash {
     start: Instant,
 }
 
-struct State {
+/// Ein Leuchtfenster über einer Leiste (Haupt- oder Zweitleiste).
+struct Surface {
     hwnd: HWND,
+    bar: HWND,
+    /// Position auf dem Bildschirm.
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    bmp: HBITMAP,
+    bits: *mut u8,
+}
+
+struct State {
+    inst: HINSTANCE,
     start: Instant,
     visible: bool,
     dpi: u32,
-    w: i32,
-    h: i32,
     dc: HDC,
-    bmp: HBITMAP,
-    bits: *mut u8,
+    surfaces: Vec<Surface>,
+    /// Linker Rand und Breite aller Monitore zusammen: Farbverlauf und Komet
+    /// laufen als ein Band von links nach rechts über alle Leisten.
+    span: (i32, i32),
     hover_x: Option<i32>,
     /// Geglättete Hover-Position und -Stärke, damit das Glühen mitgleitet.
     hover_pos: f32,
@@ -52,6 +67,8 @@ struct State {
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    /// Fenster, an dem der Bildtakt für alle Leuchtfenster hängt.
+    static TIMER_OWNER: Cell<HWND> = const { Cell::new(null_mut()) };
 }
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
@@ -82,59 +99,115 @@ pub fn flash(x: i32) {
     with(|s| s.flashes.push(Flash { x, start: Instant::now() }));
 }
 
-/// An die Leiste anlegen bzw. ausblenden (Vollbild, abgeschaltet).
-pub unsafe fn sync() {
-    let bar = crate::bar::hwnd();
-    let Some(hwnd) = with(|s| s.hwnd) else { return };
-    let show = crate::settings::get().glow != GlowStyle::Off && !bar.is_null() && IsWindowVisible(bar) != 0;
-    if !show {
-        KillTimer(hwnd, TIMER_FRAME);
-        ShowWindow(hwnd, SW_HIDE);
-        with(|s| s.visible = false);
+unsafe fn create_window(inst: HINSTANCE) -> HWND {
+    let class = w16("LightbarGlow");
+    CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        class.as_ptr(),
+        null(),
+        WS_POPUP,
+        0,
+        0,
+        0,
+        0,
+        null_mut(),
+        null_mut(),
+        inst,
+        null(),
+    )
+}
+
+unsafe fn free(sf: &Surface) {
+    DestroyWindow(sf.hwnd);
+    if !sf.bmp.is_null() {
+        DeleteObject(sf.bmp);
+    }
+}
+
+/// Puffer für die Fläche in passender Größe bereithalten.
+unsafe fn ensure_buffer(sf: &mut Surface, w: i32, h: i32) {
+    if sf.w == w && sf.h == h && !sf.bmp.is_null() {
         return;
     }
-    let mut br: RECT = zeroed();
-    GetWindowRect(bar, &mut br);
-    let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(bar);
-    let (w, h) = (br.right - br.left, px(dpi, GLOW_H) + px(dpi, LINE_H));
-    resize(w, h, dpi);
-    SetWindowPos(hwnd, HWND_TOPMOST, br.left, br.top - px(dpi, GLOW_H), w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    let was = with(|s| std::mem::replace(&mut s.visible, true)).unwrap_or(true);
-    if !was {
-        SetTimer(hwnd, TIMER_FRAME, 33, None);
+    if !sf.bmp.is_null() {
+        DeleteObject(sf.bmp);
     }
-    frame();
+    let mut bi: BITMAPINFO = zeroed();
+    bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h; // von oben nach unten
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    let mut bits: *mut c_void = null_mut();
+    sf.bmp = CreateDIBSection(null_mut(), &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    sf.bits = bits as *mut u8;
+    sf.w = w;
+    sf.h = h;
+}
+
+/// An alle sichtbaren Leisten anlegen bzw. ausblenden (Vollbild, abgeschaltet).
+pub unsafe fn sync() {
+    let Some((inst, mut old)) = with(|s| (s.inst, std::mem::take(&mut s.surfaces))) else { return };
+    let bars: Vec<HWND> = if crate::settings::get().glow != GlowStyle::Off {
+        crate::bar::all_bars().into_iter().filter(|&b| !b.is_null() && IsWindowVisible(b) != 0).collect()
+    } else {
+        Vec::new()
+    };
+    let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(crate::bar::hwnd()).max(96);
+    let span = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1));
+    let glow_h = px(dpi, GLOW_H);
+    let h = glow_h + px(dpi, LINE_H);
+    let mut surfaces = Vec::new();
+    for bar in bars {
+        let mut br: RECT = zeroed();
+        GetWindowRect(bar, &mut br);
+        let w = br.right - br.left;
+        let mut sf = match old.iter().position(|o| o.bar == bar) {
+            Some(i) => old.remove(i),
+            None => {
+                let hwnd = create_window(inst);
+                if hwnd.is_null() {
+                    continue;
+                }
+                Surface { hwnd, bar, x: 0, y: 0, w: 0, h: 0, bmp: null_mut(), bits: null_mut() }
+            }
+        };
+        ensure_buffer(&mut sf, w, h);
+        sf.x = br.left;
+        sf.y = br.top - glow_h;
+        SetWindowPos(sf.hwnd, HWND_TOPMOST, sf.x, sf.y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        surfaces.push(sf);
+    }
+    for o in &old {
+        free(o);
+    }
+    let first = surfaces.first().map(|s| s.hwnd).unwrap_or(null_mut());
+    with(|s| {
+        s.visible = !surfaces.is_empty();
+        s.surfaces = surfaces;
+        s.dpi = dpi;
+        s.span = span;
+    });
+    // Ein Takt für alle Fenster, am ersten Leuchtfenster.
+    let prev = TIMER_OWNER.with(|t| t.replace(first));
+    if prev != first {
+        if !prev.is_null() && IsWindow(prev) != 0 {
+            KillTimer(prev, TIMER_FRAME);
+        }
+        if !first.is_null() {
+            SetTimer(first, TIMER_FRAME, 33, None);
+        }
+    }
+    if !first.is_null() {
+        frame();
+    }
 }
 
 /// Über der Leiste halten (die schiebt sich selbst gelegentlich nach vorne).
 pub unsafe fn raise() {
-    if let Some((hwnd, true)) = with(|s| (s.hwnd, s.visible)) {
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    for h in with(|s| s.surfaces.iter().map(|f| f.hwnd).collect::<Vec<_>>()).unwrap_or_default() {
+        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
-}
-
-unsafe fn resize(w: i32, h: i32, dpi: u32) {
-    with(|s| {
-        s.dpi = dpi;
-        if s.w == w && s.h == h && !s.bmp.is_null() {
-            return;
-        }
-        if !s.bmp.is_null() {
-            DeleteObject(s.bmp);
-        }
-        let mut bi: BITMAPINFO = zeroed();
-        bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-        bi.bmiHeader.biWidth = w;
-        bi.bmiHeader.biHeight = -h; // von oben nach unten
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        let mut bits: *mut c_void = null_mut();
-        s.bmp = CreateDIBSection(s.dc, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-        SelectObject(s.dc, s.bmp);
-        s.bits = bits as *mut u8;
-        s.w = w;
-        s.h = h;
-    });
 }
 
 fn rgb_f(c: COLORREF) -> (f32, f32, f32) {
@@ -186,25 +259,20 @@ unsafe fn frame() {
     let cool = stops(style);
     // Neon fließt schneller und über mehr Farbe pro Breite.
     let (spread, speed) = if style == GlowStyle::Neon { (2.4, 0.16) } else { (1.4, 0.06) };
-    let Some((hwnd, dc, w, h)) = with(|s| {
-        if s.bits.is_null() || !s.visible {
-            return None;
+    let Some((dc, jobs)) = with(|s| {
+        if !s.visible {
+            return (s.dc, Vec::new());
         }
         let t = s.start.elapsed().as_secs_f32();
-        let (w, h, d) = (s.w, s.h, s.dpi);
-        let line = px(d, LINE_H).max(1);
-        let glow = h - line;
+        let d = s.dpi;
         let scale = d as f32 / 96.0;
+        let (span_l, span_w) = (s.span.0 as f32, s.span.1 as f32);
 
-        // Hover-Glühen gleitet der Maus hinterher und blendet weich ein/aus.
-        let screen_left = {
-            let mut r: RECT = zeroed();
-            GetWindowRect(s.hwnd, &mut r);
-            r.left
-        };
+        // Hover-Glühen gleitet der Maus hinterher und blendet weich ein/aus
+        // (alles in Bildschirmkoordinaten).
         match s.hover_x {
             Some(x) => {
-                let target = (x - screen_left) as f32;
+                let target = x as f32;
                 if s.hover_amt < 0.01 {
                     s.hover_pos = target;
                 }
@@ -215,64 +283,79 @@ unsafe fn frame() {
         }
         s.flashes.retain(|f| f.start.elapsed().as_secs_f32() < 1.2);
 
-        // Komet: alle ~7 s einmal quer über die Leiste.
-        let period = 7.0;
-        let ct = (t % period) / 1.6;
-        let comet = (ct < 1.0).then(|| ct * (w as f32 + 400.0 * scale) - 200.0 * scale);
+        // Komet: alle ~7 s einmal von links nach rechts über alle Leisten
+        // (bei breiterer Gesamtfläche entsprechend länger unterwegs).
+        let travel = 1.6 * (span_w / (1920.0 * scale)).max(1.0);
+        let ct = (t % (travel + 5.4)) / travel;
+        let comet = (ct < 1.0).then(|| span_l + ct * (span_w + 400.0 * scale) - 200.0 * scale);
+        let pulse = 0.5 + 0.5 * (t * 6.0).sin();
+        let flashes: Vec<(f32, f32)> = s.flashes.iter().map(|f| (f.x as f32, f.start.elapsed().as_secs_f32() / 1.2)).collect();
+        let line = px(d, LINE_H).max(1);
 
-        let pixels = std::slice::from_raw_parts_mut(s.bits, (w * h * 4) as usize);
-        // Ausblend-Verlauf nach oben hängt nur von der Zeile ab: einmal pro Bild
-        // statt für jedes der ~40 000 Pixel (powf ist teuer).
-        let fade: Vec<f32> = (0..glow).map(|y| 0.5 * ((y + 1) as f32 / glow as f32).powf(2.4)).collect();
-        for x in 0..w {
-            let xf = x as f32;
-            let mut i = 0.42 + 0.18 * (xf * 0.006 / scale + t * 1.1).sin() + 0.12 * (xf * 0.013 / scale - t * 1.7).sin();
-            if let Some(cx) = comet {
-                i += 1.1 * (-((xf - cx) / (110.0 * scale)).powi(2)).exp();
+        let mut jobs = Vec::new();
+        for sf in &s.surfaces {
+            if sf.bits.is_null() {
+                continue;
             }
-            i += 0.9 * s.hover_amt * (-((xf - s.hover_pos) / (70.0 * scale)).powi(2)).exp();
-            let pulse = 0.5 + 0.5 * (t * 6.0).sin();
-            let mut orange = 0.0f32;
-            for &ax in &s.attention {
-                orange += (0.6 + 0.6 * pulse) * (-((xf - (ax - screen_left) as f32) / (60.0 * scale)).powi(2)).exp();
+            let (w, h) = (sf.w, sf.h);
+            let glow = h - line;
+            let pixels = std::slice::from_raw_parts_mut(sf.bits, (w * h * 4) as usize);
+            // Ausblend-Verlauf nach oben hängt nur von der Zeile ab: einmal pro Bild
+            // statt für jedes Pixel (powf ist teuer).
+            let fade: Vec<f32> = (0..glow).map(|y| 0.5 * ((y + 1) as f32 / glow as f32).powf(2.4)).collect();
+            for x in 0..w {
+                // Bildschirm-x: das Muster läuft nahtlos über alle Monitore.
+                let xf = (sf.x + x) as f32;
+                let gx = xf - span_l;
+                let mut i = 0.42 + 0.18 * (gx * 0.006 / scale + t * 1.1).sin() + 0.12 * (gx * 0.013 / scale - t * 1.7).sin();
+                if let Some(cx) = comet {
+                    i += 1.1 * (-((xf - cx) / (110.0 * scale)).powi(2)).exp();
+                }
+                i += 0.9 * s.hover_amt * (-((xf - s.hover_pos) / (70.0 * scale)).powi(2)).exp();
+                let mut orange = 0.0f32;
+                for &ax in &s.attention {
+                    orange += (0.6 + 0.6 * pulse) * (-((xf - ax as f32) / (60.0 * scale)).powi(2)).exp();
+                }
+                for &(fx, ft) in &flashes {
+                    let spread = 40.0 + 260.0 * ft;
+                    i += 1.2 * (1.0 - ft) * (-((xf - fx) / (spread * scale)).powi(2)).exp();
+                }
+                let i = i.clamp(0.0, 1.6);
+                let (mut r, mut g, mut b) = palette(&cool, gx / span_w * spread - t * speed, warm);
+                let o = orange.clamp(0.0, 1.0);
+                r += (255.0 - r) * o;
+                g += (140.0 - g) * o;
+                b += (0.0 - b) * o;
+                let i = i.max(o * 1.2);
+                let line_alpha = (0.55 + 0.45 * i).min(1.0);
+                for y in 0..h {
+                    // Unten die Linie, darüber weiches Ausstrahlen (y = 0 ist der obere Rand).
+                    let a = if y >= glow { line_alpha } else { (i * fade[y as usize]).min(1.0) };
+                    let idx = ((y * w + x) * 4) as usize;
+                    // Vormultipliziertes BGRA für UpdateLayeredWindow.
+                    pixels[idx] = (b * a) as u8;
+                    pixels[idx + 1] = (g * a) as u8;
+                    pixels[idx + 2] = (r * a) as u8;
+                    pixels[idx + 3] = (a * 255.0) as u8;
+                }
             }
-            for f in &s.flashes {
-                let ft = f.start.elapsed().as_secs_f32() / 1.2;
-                let spread = 40.0 + 260.0 * ft;
-                i += 1.2 * (1.0 - ft) * (-((xf - (f.x - screen_left) as f32) / (spread * scale)).powi(2)).exp();
-            }
-            let i = i.clamp(0.0, 1.6);
-            let (mut r, mut g, mut b) = palette(&cool, xf / w as f32 * spread - t * speed, warm);
-            let o = orange.clamp(0.0, 1.0);
-            r += (255.0 - r) * o;
-            g += (140.0 - g) * o;
-            b += (0.0 - b) * o;
-            let i = i.max(o * 1.2);
-            let line_alpha = (0.55 + 0.45 * i).min(1.0);
-            for y in 0..h {
-                // Unten die Linie, darüber weiches Ausstrahlen (y = 0 ist der obere Rand).
-                let a = if y >= glow { line_alpha } else { (i * fade[y as usize]).min(1.0) };
-                let idx = ((y * w + x) * 4) as usize;
-                // Vormultipliziertes BGRA für UpdateLayeredWindow.
-                pixels[idx] = (b * a) as u8;
-                pixels[idx + 1] = (g * a) as u8;
-                pixels[idx + 2] = (r * a) as u8;
-                pixels[idx + 3] = (a * 255.0) as u8;
-            }
+            jobs.push((sf.hwnd, sf.bmp, POINT { x: sf.x, y: sf.y }, SIZE { cx: w, cy: h }));
         }
-        Some((s.hwnd, s.dc, w, h))
-    })
-    .flatten() else {
+        (s.dc, jobs)
+    }) else {
         return;
     };
-    let mut r: RECT = zeroed();
-    GetWindowRect(hwnd, &mut r);
-    let pos = POINT { x: r.left, y: r.top };
-    let size = SIZE { cx: w, cy: h };
+    if jobs.is_empty() {
+        return;
+    }
+    let screen = GetDC(null_mut());
     let src = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
-    let screen = GetDC(null_mut());
-    UpdateLayeredWindow(hwnd, screen, &pos, &size, dc, &src, 0, &blend, ULW_ALPHA);
+    for (hwnd, bmp, pos, size) in jobs {
+        let old = SelectObject(dc, bmp);
+        UpdateLayeredWindow(hwnd, screen, &pos, &size, dc, &src, 0, &blend, ULW_ALPHA);
+        SelectObject(dc, old);
+    }
     ReleaseDC(null_mut(), screen);
 }
 
@@ -291,37 +374,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 pub unsafe fn create(inst: HINSTANCE) {
     let class = w16("LightbarGlow");
     register_class(inst, &class, Some(wndproc), 0);
-    let hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-        class.as_ptr(),
-        null(),
-        WS_POPUP,
-        0,
-        0,
-        0,
-        0,
-        null_mut(),
-        null_mut(),
-        inst,
-        null(),
-    );
-    if hwnd.is_null() {
-        return;
-    }
     let screen = GetDC(null_mut());
     let dc = CreateCompatibleDC(screen);
     ReleaseDC(null_mut(), screen);
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
-            hwnd,
+            inst,
             start: Instant::now(),
             visible: false,
             dpi: 96,
-            w: 0,
-            h: 0,
             dc,
-            bmp: null_mut(),
-            bits: null_mut(),
+            surfaces: Vec::new(),
+            span: (0, 1),
             hover_x: None,
             hover_pos: 0.0,
             hover_amt: 0.0,

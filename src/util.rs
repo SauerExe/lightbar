@@ -55,56 +55,6 @@ unsafe fn read_accent() -> Option<COLORREF> {
     );
     (ok == 0 && size >= 8).then(|| rgb(buf[4], buf[5], buf[6]))
 }
-
-// ------------------------------------------------- Taskleisten-Einstellungen
-
-/// Bit 0 = gültig, Bit 1 = linksbündig, Bit 2 = auf allen Bildschirmen.
-static TASKBAR_PREFS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Windows' eigene Taskleisten-Einstellungen (Einstellungen › Personalisierung
-/// › Taskleiste). Gecacht; `reload_taskbar_prefs` bei WM_SETTINGCHANGE.
-fn taskbar_prefs() -> u32 {
-    let p = TASKBAR_PREFS.load(std::sync::atomic::Ordering::Relaxed);
-    if p & 1 != 0 {
-        return p;
-    }
-    // Fehlt ein Wert, gilt Windows' Vorgabe: mittig, auf allen Bildschirmen.
-    let left = unsafe { read_explorer_dword("TaskbarAl") } == Some(0);
-    let all = unsafe { read_explorer_dword("MMTaskbarEnabled") } != Some(0);
-    let p = 1 | (left as u32) << 1 | (all as u32) << 2;
-    TASKBAR_PREFS.store(p, std::sync::atomic::Ordering::Relaxed);
-    p
-}
-
-/// Taskleistenausrichtung „Links“ statt „Zentriert“.
-pub fn taskbar_left() -> bool {
-    taskbar_prefs() & 2 != 0
-}
-
-/// „Taskleiste auf allen Anzeigen anzeigen“.
-pub fn taskbar_all_monitors() -> bool {
-    taskbar_prefs() & 4 != 0
-}
-
-pub fn reload_taskbar_prefs() {
-    TASKBAR_PREFS.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-unsafe fn read_explorer_dword(name: &str) -> Option<u32> {
-    use windows_sys::Win32::System::Registry::*;
-    let mut v = 0u32;
-    let mut size = size_of::<u32>() as u32;
-    let ok = RegGetValueW(
-        HKEY_CURRENT_USER,
-        w16(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced").as_ptr(),
-        w16(name).as_ptr(),
-        RRF_RT_REG_DWORD,
-        null_mut(),
-        &mut v as *mut u32 as _,
-        &mut size,
-    );
-    (ok == 0).then_some(v)
-}
 pub const DIM: COLORREF = rgb(140, 140, 140);
 pub const TEXT: COLORREF = rgb(255, 255, 255);
 pub const SUBTEXT: COLORREF = rgb(190, 190, 190);
