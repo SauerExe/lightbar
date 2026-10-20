@@ -1850,9 +1850,19 @@ unsafe fn ensure_work_area(bar: HWND) {
     let mut work = monitor_rect(bar, true);
     if work.bottom > br.top {
         work.bottom = br.top;
-        SystemParametersInfoW(SPI_SETWORKAREA, 0, &mut work as *mut RECT as *mut c_void, SPIF_SENDCHANGE);
+        set_work_area(work);
         fit_maximized(bar);
     }
+}
+
+/// Arbeitsbereich setzen, ohne WM_SETTINGCHANGE zu verschicken.
+/// Mit SPIF_SENDCHANGE rechnet Explorer daraufhin neu, setzt den Bereich
+/// zurück, wir setzen ihn wieder … – er sprang im Halbsekundentakt, und weil
+/// die Meldung synchron an alle Fenster geht, hing die Leiste dabei an
+/// Explorer bzw. PowerToys FancyZones fest (kein WM_PAINT, unsichtbar).
+/// Maximierte Fenster passt `fit_maximized` an.
+unsafe fn set_work_area(mut work: RECT) {
+    SystemParametersInfoW(SPI_SETWORKAREA, 0, &mut work as *mut RECT as *mut c_void, 0);
 }
 
 /// Gegenstück beim Entfernen einer Zweitleiste: Endet der Arbeitsbereich noch
@@ -1864,7 +1874,7 @@ unsafe fn release_work_area(bar: HWND) {
     let m = monitor_rect(bar, false);
     if work.bottom == br.top && br.bottom == m.bottom {
         work.bottom = m.bottom;
-        SystemParametersInfoW(SPI_SETWORKAREA, 0, &mut work as *mut RECT as *mut c_void, SPIF_SENDCHANGE);
+        set_work_area(work);
     }
 }
 
