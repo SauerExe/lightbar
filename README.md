@@ -68,9 +68,9 @@ Settings (right-click the taskbar) are stored in `%APPDATA%\Lightbar\settings.tx
 
 ## Known limitations
 
-- Single monitor only
+- Single monitor only (the taskbar appears on the primary display)
 - Jump lists show recent/frequent items only (no app-defined tasks); notification centre and widgets are Windows' own
-- Touch and pen work through Windows' mouse emulation only
+- Touch and pen work through Windows' mouse emulation (tap = click, press-and-hold = right-click); untested on real touch hardware
 - German UI
 
 ## License

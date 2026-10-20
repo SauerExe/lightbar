@@ -1180,7 +1180,9 @@ unsafe fn drag_move(hwnd: HWND, x: i32) -> bool {
         let drag = s.drag.as_mut()?;
         drag.x = x;
         if !drag.active {
-            if (x - drag.start_x).abs() < px(d, 6) {
+            // Mit Finger/Stift wackelt ein Tipp mehr – erst ab größerer Strecke ziehen.
+            let threshold = if from_touch() { 20 } else { 6 };
+            if (x - drag.start_x).abs() < px(d, threshold) {
                 return Some(false);
             }
             drag.active = true;

@@ -89,6 +89,13 @@ pub fn px(dpi: u32, v: i32) -> i32 {
     v * dpi as i32 / 96
 }
 
+/// Stammt die aktuelle Mausnachricht von Touch oder Stift? Windows markiert
+/// emulierte Mausnachrichten mit einer Signatur in den Extra-Infos.
+pub fn from_touch() -> bool {
+    const MI_WP_SIGNATURE: usize = 0xFF51_5700;
+    (unsafe { GetMessageExtraInfo() } as usize & 0xFFFF_FF00) == MI_WP_SIGNATURE
+}
+
 pub fn inside(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
