@@ -41,6 +41,19 @@ Lightbar is event-driven: when nothing happens it does almost nothing (no pollin
 
 Without the glow, Lightbar is on par with the Windows taskbar. The animated glow costs about 20 ms of CPU per second. Windows' own shell processes (Explorer, Start menu host, search host) keep running in the background, so total memory goes up by Lightbar's ~7 MB rather than down.
 
+### What Windows 11 is built with
+
+A common assumption is that the Windows 11 taskbar is written in JavaScript. Checked on Windows 11 24H2 (build 26100):
+
+| Windows 11 component | Technology | Private memory |
+|---|---|---|
+| Taskbar (`explorer.exe`, `Taskbar.View.dll`) | native C++ with XAML | part of Explorer |
+| Start menu (`StartMenuExperienceHost.exe`) | native C++ with XAML | ~150 MB |
+| **Search** (`SearchHost.exe`) | **web UI in an embedded Edge browser (WebView2, HTML/JavaScript)** | **~134 MB** (94 MB host + 41 MB WebView2) |
+| **Lightbar** (taskbar + Start menu + search) | native Rust, Win32 + GDI | **~7.6 MB** |
+
+So the taskbar itself was never JavaScript – which is why Lightbar is only on par there. Search is where it differs most: Lightbar replaces a web page in an embedded browser with a natively drawn list that opens instantly. Windows keeps `SearchHost.exe` running in the background regardless, so that memory is not freed – it just goes unused.
+
 ## Install
 
 Download `lightbar.exe` from the [releases](../../releases) or build it yourself:
