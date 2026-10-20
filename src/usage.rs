@@ -341,6 +341,10 @@ fn apply(slot: &mut Slot, result: Result<Limits, Failure>, t: i64) {
 /// Fällige Dienste abfragen. `manual`: auf Klick, aber nicht öfter als
 /// einmal pro Minute und nie während einer 429-Pause.
 fn run_due(manual: bool) -> bool {
+    // Ausgeschaltet: keine Login-Dateien lesen, nichts abfragen.
+    if !crate::settings::get().show_usage {
+        return false;
+    }
     let t = now();
     let due: Vec<usize> = match SLOTS.lock() {
         Ok(s) => (0..2)
