@@ -102,10 +102,54 @@ enum Hit {
 #[derive(Clone)]
 struct Drag {
     slot: String,
-    start_x: i32,
-    x: i32,
+    /// Mausposition entlang der Leiste (Client-x, senkrecht Client-y): beim
+    /// Drücken und jetzt.
+    start: i32,
+    pos: i32,
     /// Erst ab ein paar Pixeln Bewegung wird aus dem Klick ein Ziehen.
     active: bool,
+}
+
+/// Koordinate entlang der Leiste: x bei waagerechter, y bei senkrechter Leiste.
+fn along(vertical: bool, x: i32, y: i32) -> i32 {
+    if vertical { y } else { x }
+}
+
+/// Anfang (links bzw. oben) eines Rechtecks entlang der Leiste.
+fn lead(vertical: bool, r: &RECT) -> i32 {
+    if vertical { r.top } else { r.left }
+}
+
+/// Mitte eines Rechtecks entlang der Leiste.
+fn mid(vertical: bool, r: &RECT) -> i32 {
+    if vertical { (r.top + r.bottom) / 2 } else { (r.left + r.right) / 2 }
+}
+
+/// Rechteck um `d` entlang der Leiste verschoben.
+fn shifted(vertical: bool, r: &RECT, d: i32) -> RECT {
+    if vertical {
+        RECT { top: r.top + d, bottom: r.bottom + d, ..*r }
+    } else {
+        RECT { left: r.left + d, right: r.right + d, ..*r }
+    }
+}
+
+/// Neuer Platz des gezogenen Buttons `cur`: so viele andere Buttons, wie ihre
+/// Mitte vor dem Zeiger (`pos`, entlang der Leiste) liegt.
+fn drop_index(tasks: &[RECT], vertical: bool, cur: usize, pos: i32) -> usize {
+    tasks.iter().enumerate().filter(|(i, r)| *i != cur && mid(vertical, r) < pos).count()
+}
+
+/// Innenkante der Leiste (Breite × Höhe `w` × `h`, Client-Koordinaten), die zum
+/// Bildschirm zeigt: dort sitzt die feine Trennlinie, `t` Pixel stark.
+fn inner_edge(edge: crate::display::Edge, w: i32, h: i32, t: i32) -> RECT {
+    use crate::display::Edge;
+    match edge {
+        Edge::Bottom => RECT { left: 0, top: 0, right: w, bottom: t },
+        Edge::Top => RECT { left: 0, top: h - t, right: w, bottom: h },
+        Edge::Left => RECT { left: w - t, top: 0, right: w, bottom: h },
+        Edge::Right => RECT { left: 0, top: 0, right: t, bottom: h },
+    }
 }
 
 /// Ein Button: alle Fenster einer App (wie bei Windows 11 gruppiert).
@@ -1780,35 +1824,30 @@ unsafe fn kick(hwnd: HWND) {
 /// Leiste, deren Layout die Animation gerade antreibt.
 static ANIM_OWNER: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
-/// Gleiten (anim.x) gilt nur für die Leiste, die es berechnet; die anderen
-/// zeichnen ihre Buttons an der Zielposition.
+/// Gleiten (anim.x, entlang der Leiste – senkrecht also nach y) gilt nur für
+/// die Leiste, die es berechnet; die anderen zeichnen ihre Buttons an der
+/// Zielposition.
 fn animates_positions(hwnd: HWND) -> bool {
-    // Senkrechte Leiste: kein seitliches Gleiten (die Buttons stehen untereinander).
-    if crate::display::edge().vertical() {
-        return false;
-    }
     let owner = ANIM_OWNER.load(Ordering::Relaxed);
     owner == hwnd || (owner.is_null() && hwnd == self::hwnd())
 }
 
 /// Während des Ziehens: Button folgt der Maus, die anderen weichen aus.
-/// `true`, wenn gerade gezogen wird (dann kein normales Hover).
-unsafe fn drag_move(hwnd: HWND, x: i32) -> bool {
-    // Umsortieren per Ziehen ist waagerecht gedacht; senkrecht vorerst nicht.
-    if crate::display::edge().vertical() {
-        // drag bleibt inaktiv stehen: drag_end gibt die Maus wieder frei.
-        return false;
-    }
+/// `true`, wenn gerade gezogen wird (dann kein normales Hover). Senkrecht
+/// zählt die Bewegung nach y, waagerecht die nach x.
+unsafe fn drag_move(hwnd: HWND, x: i32, y: i32) -> bool {
+    let vertical = crate::display::edge().vertical();
+    let pos = along(vertical, x, y);
     let Some((l, _)) = current_layout(hwnd) else { return false };
     let dpi = bar_dpi(hwnd);
     let moving = with(|s| {
         let d = dpi;
         let drag = s.drag.as_mut()?;
-        drag.x = x;
+        drag.pos = pos;
         if !drag.active {
             // Mit Finger/Stift wackelt ein Tipp mehr – erst ab größerer Strecke ziehen.
             let threshold = if from_touch() { 20 } else { 6 };
-            if (x - drag.start_x).abs() < px(d, threshold) {
+            if (pos - drag.start).abs() < px(d, threshold) {
                 return Some(false);
             }
             drag.active = true;
@@ -1816,8 +1855,7 @@ unsafe fn drag_move(hwnd: HWND, x: i32) -> bool {
         }
         let slot = drag.slot.clone();
         let cur = s.groups.iter().position(|g| g.slot == slot)?;
-        // Ziel = Anzahl der anderen Buttons, deren Mitte links vom Zeiger liegt.
-        let target = l.tasks.iter().enumerate().filter(|(i, r)| *i != cur && (r.left + r.right) / 2 < x).count();
+        let target = drop_index(&l.tasks, vertical, cur, pos);
         if target != cur && target < s.groups.len() {
             let g = s.groups.remove(cur);
             s.groups.insert(target, g);
@@ -1864,6 +1902,7 @@ unsafe fn step_anim(hwnd: HWND) -> bool {
     let Some((l, _)) = current_layout(hwnd) else { return false };
     let dpi = bar_dpi(hwnd);
     let fg = GetForegroundWindow();
+    let vertical = crate::display::edge().vertical();
     let mut bar_origin = POINT { x: 0, y: 0 };
     ClientToScreen(hwnd, &mut bar_origin);
     let (moving, new_buttons) = with(|s| {
@@ -1895,10 +1934,11 @@ unsafe fn step_anim(hwnd: HWND) -> bool {
             approach(s.anim.ind.entry(id.clone()).or_insert(0.0), ind, 0.22, 0.3, &mut moving);
             approach(s.anim.appear.entry(id.clone()).or_insert(0.0), 1.0, 0.16, 0.01, &mut moving);
             if !s.anim.x.contains_key(&id) && had_buttons {
-                new_buttons.push(bar_origin.x + (r.left + r.right) / 2);
+                new_buttons.push(along(vertical, bar_origin.x, bar_origin.y) + mid(vertical, r));
             }
-            // Relativ zum Startknopf: Haupt- und Zweitleiste haben verschiedene Breiten.
-            let rel = (r.left - l.start.left) as f32;
+            // Relativ zum Startknopf: Haupt- und Zweitleiste haben verschiedene
+            // Breiten. Gleiten entlang der Leiste (senkrecht nach y).
+            let rel = (lead(vertical, r) - lead(vertical, &l.start)) as f32;
             approach(s.anim.x.entry(id.clone()).or_insert(rel), rel, 0.22, 0.5, &mut moving);
             live.push(id);
         }
@@ -1922,8 +1962,8 @@ unsafe fn step_anim(hwnd: HWND) -> bool {
     })
     .unwrap_or((false, Vec::new()));
     // Neu geöffnete App: Lichtimpuls im Leuchtrand.
-    for x in new_buttons {
-        crate::glow::flash(x);
+    for at in new_buttons {
+        crate::glow::flash(at);
     }
     moving
 }
@@ -1935,10 +1975,13 @@ unsafe fn sync_glow(hwnd: HWND) {
         return;
     }
     let Some((l, _)) = current_layout(hwnd) else { return };
+    // Positionen entlang der Leiste (Bildschirm-x, senkrecht Bildschirm-y).
+    let vertical = crate::display::edge().vertical();
     let mut origin = POINT { x: 0, y: 0 };
     ClientToScreen(hwnd, &mut origin);
+    let origin = along(vertical, origin.x, origin.y);
     let hover_hit = with(|s| if s.hover_hwnd == hwnd { s.hover } else { Hit::None }).unwrap_or(Hit::None);
-    let hover = rect_of(hwnd, hover_hit).map(|r| origin.x + (r.left + r.right) / 2);
+    let hover = rect_of(hwnd, hover_hit).map(|r| origin + mid(vertical, &r));
     let Some(attention) = with(|s| {
         s.attention.retain(|&w| IsWindow(w) != 0);
         let attention = s
@@ -1946,7 +1989,7 @@ unsafe fn sync_glow(hwnd: HWND) {
             .iter()
             .enumerate()
             .filter(|(_, g)| g.windows.iter().any(|w| s.attention.contains(w)))
-            .filter_map(|(i, _)| l.tasks.get(i).map(|r| origin.x + (r.left + r.right) / 2))
+            .filter_map(|(i, _)| l.tasks.get(i).map(|r| origin + mid(vertical, r)))
             .collect::<Vec<i32>>();
         attention
     }) else {
@@ -2790,7 +2833,7 @@ unsafe fn paint(hwnd: HWND) {
             .iter()
             .map(|g| (format!("g:{}", g.key), g.windows.clone(), g.icon, g.windows.iter().any(|w| s.attention.contains(w))))
             .collect();
-        let dragged = s.drag.as_ref().filter(|d| d.active).and_then(|d| s.groups.iter().find(|g| g.slot == d.slot).map(|g| (format!("g:{}", g.key), d.x)));
+        let dragged = s.drag.as_ref().filter(|d| d.active).and_then(|d| s.groups.iter().find(|g| g.slot == d.slot).map(|g| (format!("g:{}", g.key), d.pos)));
         (s.dpi, s.font, s.icons, s.status.clone(), groups, s.anim.clone(), s.start.elapsed().as_secs_f32(), s.taskmgr_icon, s.cpu, dragged, s.hover_hwnd == hwnd)
     });
     let Some((_, _, _, status, groups, anim, t, taskmgr_icon, cpu, dragged, hover_here)) = snapshot else {
@@ -2801,7 +2844,9 @@ unsafe fn paint(hwnd: HWND) {
     };
     let (dpi, font, icons) = bar_fonts(hwnd);
     let slide = animates_positions(hwnd);
-    let hv = |id: &str| if hover_here { anim.hover.get(id).copied().unwrap_or(0.0) } else { 0.0 };
+    let edge = crate::display::edge();
+    let vertical = edge.vertical();
+    let hv =|id: &str| if hover_here { anim.hover.get(id).copied().unwrap_or(0.0) } else { 0.0 };
     let Some((l, tray)) = current_layout(hwnd) else {
         ValidateRect(hwnd, null());
         return;
@@ -2812,7 +2857,8 @@ unsafe fn paint(hwnd: HWND) {
     paint_buffered(hwnd, |dc, w, h| {
         let rc = RECT { left: 0, top: 0, right: w, bottom: h };
         fill(dc, &rc, BG);
-        fill(dc, &RECT { left: 0, top: 0, right: w, bottom: px(dpi, 1).max(1) }, BORDER);
+        // Trennlinie an der Kante zum Bildschirm (unten: oben, seitlich: innen).
+        fill(dc, &inner_edge(edge, w, h, px(dpi, 1).max(1)), BORDER);
 
         let battery = status.as_ref().and_then(|s| s.battery);
         let radius = px(dpi, 6);
@@ -2852,14 +2898,14 @@ unsafe fn paint(hwnd: HWND) {
         let is = px(dpi, metrics(crate::display::small_buttons()).icon);
         for (i, (id, windows, icon, attention)) in groups.iter().enumerate() {
             let Some(base) = l.tasks.get(i) else { continue };
-            // Weich nachrutschende Position.
-            let dx = if slide { anim.x.get(id).map(|x| x.round() as i32 - (base.left - l.start.left)).unwrap_or(0) } else { 0 };
-            let mut r = RECT { left: base.left + dx, right: base.right + dx, ..*base };
-            // Gezogener Button klebt am Mauszeiger.
+            // Weich nachrutschende Position (entlang der Leiste).
+            let rel = lead(vertical, base) - lead(vertical, &l.start);
+            let d = if slide { anim.x.get(id).map(|x| x.round() as i32 - rel).unwrap_or(0) } else { 0 };
+            let mut r = shifted(vertical, base, d);
+            // Gezogener Button klebt am Mauszeiger (senkrecht nur in y).
             let is_dragged = dragged.as_ref().is_some_and(|(did, _)| did == id);
-            if let Some((_, mx)) = dragged.as_ref().filter(|_| is_dragged) {
-                let w = base.right - base.left;
-                r = RECT { left: mx - w / 2, right: mx - w / 2 + w, ..*base };
+            if let Some((_, pos)) = dragged.as_ref().filter(|_| is_dragged) {
+                r = shifted(vertical, base, pos - mid(vertical, base));
                 round(dc, &r, mix(ACTIVE, rgb(72, 72, 72), 0.6), radius);
             }
             let active = windows.iter().any(|w| *w == fg);
@@ -3249,7 +3295,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSEMOVE => {
             let (x, y) = xy(lp);
-            if drag_move(hwnd, x) {
+            if drag_move(hwnd, x, y) {
                 return 0;
             }
             let h = hit_at(hwnd, x, y);
@@ -3325,7 +3371,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             if let (WM_LBUTTONDOWN, Hit::Task(i)) = (msg, hit) {
                 // Möglicher Beginn eines Ziehens; zum Ziehen wird es erst ab ein paar Pixeln.
-                with(|s| s.drag = s.groups.get(i).map(|g| Drag { slot: g.slot.clone(), start_x: x, x, active: false }));
+                let pos = along(crate::display::edge().vertical(), x, y);
+                with(|s| s.drag = s.groups.get(i).map(|g| Drag { slot: g.slot.clone(), start: pos, pos, active: false }));
                 SetCapture(hwnd);
             }
             if msg == WM_LBUTTONDOWN && matches!(hit, Hit::Task(_)) {
@@ -3672,6 +3719,55 @@ mod tests {
 #[cfg(test)]
 mod vertical_tests {
     use super::*;
+
+    /// Ziehen in einer senkrechten Leiste: der Einfügeplatz richtet sich nach y,
+    /// der gezogene Button wandert nur in y, waagerecht bleibt alles wie gehabt.
+    #[test]
+    fn drag_reorders_along_bar() {
+        let dpi = 96;
+        let i = LayoutInput { width: px(dpi, BAR_W_V), vertical: true, length: 1080, dpi, n_tasks: 4, n_tray: 0, hidden_tray: false, battery: true, primary: false, usage: false, align_left: true, small: false, search: 0, task_view: false };
+        let l = layout(&i);
+        assert_eq!(l.tasks.len(), 4);
+        let t = &l.tasks;
+        // Die Buttons stehen untereinander, alle in derselben Spalte.
+        assert!(t.windows(2).all(|p| p[0].bottom <= p[1].top && p[0].left == p[1].left));
+        // Ersten Button bis unter die Mitte des dritten ziehen: Platz 2.
+        assert_eq!(drop_index(t, true, 0, mid(true, &t[2]) + 1), 2);
+        // Ganz nach oben: Platz 0; ganz nach unten: letzter Platz.
+        assert_eq!(drop_index(t, true, 3, t[0].top - 50), 0);
+        assert_eq!(drop_index(t, true, 0, t[3].bottom + 50), 3);
+        // Mit der x-Koordinate (alle Mitten gleich) gäbe es kein sinnvolles Ziel:
+        // along() muss senkrecht y liefern.
+        assert_eq!(along(true, 10, 500), 500);
+        assert_eq!(along(false, 10, 500), 10);
+        // Gezogener Button: in y am Zeiger zentriert, Spalte unverändert.
+        let pos = 700;
+        let r = shifted(true, &t[0], pos - mid(true, &t[0]));
+        assert_eq!((r.left, r.right), (t[0].left, t[0].right));
+        assert_eq!(mid(true, &r), pos);
+        assert_eq!(r.bottom - r.top, t[0].bottom - t[0].top);
+        // Waagerecht: Verschiebung nur in x.
+        let r = shifted(false, &t[0], 30);
+        assert_eq!((r.top, r.bottom, r.left), (t[0].top, t[0].bottom, t[0].left + 30));
+        assert_eq!(lead(true, &t[1]), t[1].top);
+        assert_eq!(lead(false, &t[1]), t[1].left);
+    }
+
+    /// Die Trennlinie liegt an der Kante, die zum Bildschirm zeigt.
+    #[test]
+    fn border_on_inner_edge() {
+        use crate::display::Edge;
+        let (w, h) = (72, 1080);
+        let r = inner_edge(Edge::Left, w, h, 1);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (71, 0, 72, 1080));
+        let r = inner_edge(Edge::Right, w, h, 1);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 0, 1, 1080));
+        let (w, h) = (1920, 48);
+        let r = inner_edge(Edge::Bottom, w, h, 1);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 0, 1920, 1));
+        let r = inner_edge(Edge::Top, w, h, 1);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 47, 1920, 48));
+    }
 
     fn overlap(a: &RECT, b: &RECT) -> bool {
         a.right > a.left && b.right > b.left && a.bottom > a.top && b.bottom > b.top && a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom

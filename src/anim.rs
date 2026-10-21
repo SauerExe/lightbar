@@ -1,5 +1,6 @@
 //! Einblend-Animation für Popups (Startmenü, Schnelleinstellungen, Vorschau,
-//! Überlauf, Tooltips): von leicht unterhalb hochgleiten und dabei einblenden.
+//! Überlauf, Tooltips): von der Leiste weg ein Stück gleiten (unten: von
+//! leicht unterhalb hoch, seitlich: von der Seite herein) und dabei einblenden.
 //!
 //! Die Popups sind Layered-Fenster; animiert wird nur deren Gesamt-Alpha und
 //! Position – der Inhalt wird nicht neu gezeichnet. Ein Thread-Timer ohne
@@ -19,7 +20,8 @@ struct Pop {
     start: Instant,
     x: i32,
     y: i32,
-    offset: i32,
+    /// Startversatz (dx, dy) zur Zielposition.
+    offset: (i32, i32),
 }
 
 thread_local! {
@@ -37,11 +39,12 @@ pub unsafe fn make_opaque(hwnd: HWND) {
     SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
 }
 
-/// Popup an (x, y) mit Größe (w, h) zeigen und von `offset` Pixeln darunter
-/// hochgleiten lassen. Aktiviert nicht – Fokus setzt der Aufrufer.
-pub unsafe fn pop_in(hwnd: HWND, x: i32, y: i32, w: i32, h: i32, offset: i32) {
+/// Popup an (x, y) mit Größe (w, h) zeigen und vom Versatz `offset` (dx, dy,
+/// siehe `display::pop_offset`) an seinen Platz gleiten lassen. Aktiviert
+/// nicht – Fokus setzt der Aufrufer.
+pub unsafe fn pop_in(hwnd: HWND, x: i32, y: i32, w: i32, h: i32, offset: (i32, i32)) {
     SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
-    SetWindowPos(hwnd, HWND_TOPMOST, x, y + offset, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(hwnd, HWND_TOPMOST, x + offset.0, y + offset.1, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     POPS.with(|p| {
         let mut p = p.borrow_mut();
         p.retain(|q| q.hwnd != hwnd);
@@ -61,7 +64,8 @@ unsafe extern "system" fn tick(_: HWND, _: u32, _: usize, _: u32) {
             .iter()
             .map(|q| {
                 let e = ease_out(q.start.elapsed().as_secs_f32() / DURATION);
-                (q.hwnd, q.x, q.y + ((1.0 - e) * q.offset as f32).round() as i32, (e * 255.0) as u8)
+                let rest = |o: i32| ((1.0 - e) * o as f32).round() as i32;
+                (q.hwnd, q.x + rest(q.offset.0), q.y + rest(q.offset.1), (e * 255.0) as u8)
             })
             .collect();
         p.retain(|q| q.start.elapsed().as_secs_f32() < DURATION);
