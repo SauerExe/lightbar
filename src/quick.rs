@@ -273,9 +273,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_ERASEBKGND => 1,
+        // Maus-Capture verloren (anderes Fenster, Esc): Ziehen ist vorbei.
+        WM_CAPTURECHANGED => {
+            with(|st| st.dragging = false);
+            0
+        }
         WM_ACTIVATE => {
             if (wp & 0xffff) as u32 == WA_INACTIVE {
                 ShowWindow(hwnd, SW_HIDE);
+                // Mitten im Ziehen geschlossen (Win, Alt+Tab): sonst springt die
+                // Lautstärke beim nächsten Öffnen zur Mausposition.
+                if with(|st| std::mem::replace(&mut st.dragging, false)) == Some(true) {
+                    ReleaseCapture();
+                }
                 KillTimer(hwnd, TIMER_POLL);
             }
             0

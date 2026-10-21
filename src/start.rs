@@ -134,10 +134,12 @@ struct State {
     recent: Vec<Entry>,
     icons: HashMap<String, HBITMAP>,
     query: String,
+    /// Strg+A: ganze Suche markiert – Tippen oder Einfügen ersetzt sie.
+    select_all: bool,
     results: Vec<Row>,
     /// exe (normalisiert) → App-Kennung im Katalog; für Sprunglisten, lazy gebaut.
     exe_ids: Option<HashMap<String, String>>,
-    /// Treffer aus dem Windows-Suchindex für iles_for.
+    /// Treffer aus dem Windows-Suchindex für `files_for`.
     files: Vec<Entry>,
     files_for: String,
     /// Laufende Nummer der Index-Suche; ältere Antworten werden verworfen.
@@ -390,6 +392,17 @@ fn search(st: &State) -> Vec<Row> {
 
 // ------------------------------------------------------------- Zeichnen
 
+/// Zwischengespeicherte Icons freigeben: Datei-Icons oder (all) alle.
+unsafe fn purge_icons(st: &mut State, all: bool) {
+    st.icons.retain(|k, b| {
+        let keep = !all && !k.starts_with('p');
+        if !keep && !b.is_null() {
+            DeleteObject(*b);
+        }
+        keep
+    });
+}
+
 unsafe fn icon_bitmap(st: &mut State, t: &Target, size: i32) -> HBITMAP {
     let key = match t {
         Target::App(i) => format!("a{size}:{}", st.apps[*i].id),
@@ -583,6 +596,11 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     if st.query.is_empty() {
         text(dc, "Nach Apps, Einstellungen und Dateien suchen", &tr, f.normal, DIM, LINE);
     } else {
+        if st.select_all {
+            // Markierung wie in einem Textfeld hinter dem Text.
+            let sw = text_width(dc, &st.query, f.normal).min(tr.right - tx);
+            fill(dc, &RECT { left: tx - px(d, 1), top: field.top + px(d, 9), right: tx + sw + px(d, 1), bottom: field.bottom - px(d, 9) }, mix(FIELD, accent(), 0.55));
+        }
         text(dc, &st.query, &tr, f.normal, TEXT, LINE);
     }
     let cx = (tx + text_width(dc, &st.query, f.normal)).min(tr.right);
@@ -656,10 +674,13 @@ unsafe fn show() {
                 f.delete();
             }
             st.fonts = Some(Fonts::new(dpi));
+            // Andere Skalierung: alle Icons werden in neuer Größe gebraucht.
+            purge_icons(st, true);
             st.dpi = dpi;
         }
         st.recent = recent;
         st.query.clear();
+        st.select_all = false;
         st.results.clear();
         st.view = View::Home;
         st.sel = 0;
@@ -688,6 +709,9 @@ unsafe fn hide() {
     let h = hwnd();
     if IsWindowVisible(h) != 0 {
         ShowWindow(h, SW_HIDE);
+        // Datei-Icons (Suche, Empfohlen) freigeben – sonst wüchse der Cache mit
+        // jeder je angezeigten Datei. App-Icons bleiben (begrenzt, oft gebraucht).
+        with(|st| purge_icons(st, false));
         // Katalog im Hintergrund auffrischen, solange keiner hinschaut.
         PostMessageW(h, WM_RELOAD, 0, 0);
     }
@@ -786,7 +810,10 @@ unsafe fn start_file_search(hwnd: HWND) {
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
         let found = apps::search_index(&query, 12);
         if let Ok(mut r) = FILE_RESULTS.lock() {
-            *r = Some((gen, query, found));
+            // Ein langsamer älterer Lauf überschreibt kein neueres Ergebnis.
+            if r.as_ref().map_or(true, |(g, _, _)| *g < gen) {
+                *r = Some((gen, query, found));
+            }
         }
         PostMessageW(target as HWND, WM_FILES, gen as usize, 0);
     });
@@ -794,7 +821,9 @@ unsafe fn start_file_search(hwnd: HWND) {
 
 /// Index-Treffer übernehmen, wenn sie noch zur aktuellen Eingabe gehören.
 unsafe fn apply_file_results(hwnd: HWND, gen: u64) {
-    let Some((rgen, query, found)) = FILE_RESULTS.lock().ok().and_then(|mut r| r.take()) else { return };
+    // Nur das Ergebnis zu dieser Nachricht abholen – ein neueres bleibt für
+    // seine eigene Nachricht liegen.
+    let Some((rgen, query, found)) = FILE_RESULTS.lock().ok().and_then(|mut r| if r.as_ref().is_some_and(|(g, _, _)| *g == gen) { r.take() } else { None }) else { return };
     let applied = with(|st| {
         if rgen != gen || gen != st.files_gen || query != st.query.trim() {
             return false;
@@ -818,7 +847,71 @@ unsafe fn apply_file_results(hwnd: HWND, gen: u64) {
     }
 }
 
+/// Suchtext ändern (Einfügen, Ausschneiden, Wort löschen) und neu suchen.
+/// `f` bekommt den Text und ob er komplett markiert ist (Strg+A).
+unsafe fn edit_query(hwnd: HWND, f: impl FnOnce(&mut String, bool)) {
+    with(|st| {
+        f(&mut st.query, st.select_all);
+        st.select_all = false;
+        st.results = if st.query.is_empty() { Vec::new() } else { search(st) };
+        st.sel = 0;
+        st.scroll = 0;
+    });
+    SetTimer(hwnd, TIMER_FILES, 160, None);
+    InvalidateRect(hwnd, null(), 0);
+}
+
+/// Strg-Kürzel im Suchfeld wie in einem normalen Textfeld.
+unsafe fn on_ctrl_key(hwnd: HWND, vk: u16) -> bool {
+    const VK_A: u16 = b'A' as u16;
+    const VK_C: u16 = b'C' as u16;
+    const VK_V: u16 = b'V' as u16;
+    const VK_X: u16 = b'X' as u16;
+    match vk {
+        VK_A => {
+            with(|st| st.select_all = !st.query.is_empty());
+            InvalidateRect(hwnd, null(), 0);
+        }
+        VK_C | VK_X => {
+            let q = with(|st| st.query.clone()).unwrap_or_default();
+            if !q.is_empty() {
+                set_clipboard_text(hwnd, &q);
+            }
+            if vk == VK_X {
+                edit_query(hwnd, |q, _| q.clear());
+            }
+        }
+        VK_V => {
+            // Nur die erste Zeile, ohne Steuerzeichen (Tabs, Zeilenumbrüche).
+            let Some(t) = clipboard_text(hwnd) else { return true };
+            let line: String = t.lines().next().unwrap_or("").chars().filter(|c| !c.is_control()).collect();
+            edit_query(hwnd, |q, all| {
+                if all {
+                    q.clear();
+                }
+                q.push_str(line.trim());
+            });
+        }
+        // Strg+Rücktaste: letztes Wort löschen.
+        VK_BACK => edit_query(hwnd, |q, all| {
+            if all {
+                q.clear();
+                return;
+            }
+            let trimmed = q.trim_end().len();
+            // Hinter dem Leerzeichen schneiden – es kann mehr als ein Byte lang sein.
+            let cut = q[..trimmed].char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
+            q.truncate(cut);
+        }),
+        _ => return false,
+    }
+    true
+}
+
 unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
+    if GetKeyState(VK_CONTROL as i32) < 0 && on_ctrl_key(hwnd, vk) {
+        return true;
+    }
     let mut open_target = None;
     let mut close = false;
     let mut schedule_files = false;
@@ -826,6 +919,7 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
         let count = st.results.len();
         match vk {
             VK_ESCAPE => {
+                st.select_all = false;
                 if st.query.is_empty() && st.view == View::Home {
                     close = true;
                 } else {
@@ -835,7 +929,11 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
                 }
             }
             VK_BACK => {
-                st.query.pop();
+                if std::mem::take(&mut st.select_all) {
+                    st.query.clear();
+                } else {
+                    st.query.pop();
+                }
                 st.results = if st.query.is_empty() { Vec::new() } else { search(st) };
                 schedule_files = true;
                 st.sel = 0;
@@ -993,6 +1091,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_CHAR => {
             if let Some(c) = char::from_u32(wp as u32).filter(|c| !c.is_control()) {
                 with(|st| {
+                    // Nach Strg+A ersetzt das erste Zeichen die markierte Suche.
+                    if std::mem::take(&mut st.select_all) {
+                        st.query.clear();
+                    }
                     st.query.push(c);
                     st.results = search(st);
                     st.sel = 0;
@@ -1049,6 +1151,7 @@ pub unsafe fn create(inst: HINSTANCE) {
         recent: Vec::new(),
         icons: HashMap::new(),
         query: String::new(),
+        select_all: false,
         results: Vec::new(),
         exe_ids: None,
         files: Vec::new(),

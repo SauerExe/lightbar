@@ -89,7 +89,9 @@ pub unsafe fn show(targets: &[HWND], icon: HICON, center_x: i32, bar_top: i32, d
     // Passt nicht alles nebeneinander, werden die Miniaturen kleiner.
     let pad = px(dpi, PAD);
     let title_h = px(dpi, TITLE_H);
-    let sw = GetSystemMetrics(SM_CXSCREEN);
+    // Bildschirm der Leiste, über der die Vorschau aufgeht (auch Zweitleisten).
+    let m = work_area_at(center_x, bar_top - 1);
+    let sw = m.right - m.left;
     let fit = ((sw - px(dpi, 16)) / targets.len() as i32 - 2 * pad).max(px(dpi, 80));
     let max_w = px(dpi, MAX_W).min(fit);
     let max_h = px(dpi, MAX_H) * max_w / px(dpi, MAX_W);
@@ -105,7 +107,12 @@ pub unsafe fn show(targets: &[HWND], icon: HICON, center_x: i32, bar_top: i32, d
         if registered {
             DwmQueryThumbnailSourceSize(thumb, &mut src);
         }
-        let placeholder = !registered || IsIconic(target) != 0 || src.cx <= 0 || src.cy <= 0;
+        // Auch minimierte Fenster haben oft noch ein vollwertiges Bild bei DWM –
+        // dann zeigen wir es. Nur ohne Bild (verborgene Fenster, Größe 0) oder
+        // bei einem minimierten Fenster, von dem DWM nur den kleinen
+        // Titelleisten-Stummel kennt, kommt das App-Symbol.
+        let stub = IsIconic(target) != 0 && src.cx <= px(96, 260) && src.cy <= px(96, 140);
+        let placeholder = !registered || src.cx <= 0 || src.cy <= 0 || stub;
         let (tw, th) = if placeholder {
             (max_w, max_h * 2 / 3)
         } else {
@@ -147,7 +154,7 @@ pub unsafe fn show(targets: &[HWND], icon: HICON, center_x: i32, bar_top: i32, d
         s.items = items;
     });
 
-    let x = (center_x - w / 2).clamp(px(dpi, 4), (sw - w - px(dpi, 4)).max(0));
+    let x = (center_x - w / 2).clamp(m.left + px(dpi, 4), (m.right - w - px(dpi, 4)).max(m.left));
     let y = bar_top - hgt - px(dpi, 8);
     // Beim Wechsel zwischen Buttons nur verschieben, sonst hochgleiten.
     if visible() {

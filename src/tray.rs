@@ -102,7 +102,8 @@ fn expand_known(path: &str) -> String {
         return format!("{root}\\System32{}", &path[38..]);
     }
     for (guid, var) in KNOWN_FOLDERS {
-        if path.len() >= guid.len() && path[..guid.len()].eq_ignore_ascii_case(guid) {
+        // get(): nie mitten in einem Umlaut schneiden (Pfade stammen aus der Registry).
+        if path.get(..guid.len()).is_some_and(|p| p.eq_ignore_ascii_case(guid)) {
             let root = std::env::var(var).unwrap_or_default();
             return format!("{root}{}", &path[guid.len()..]);
         }
@@ -262,6 +263,14 @@ pub unsafe fn handle_copydata(lp: LPARAM) -> Option<LRESULT> {
             _ => false,
         }
     });
+    // Offener Überlauf: sofort neu zeichnen. Seine Felder verweisen auf Plätze in
+    // der Icon-Liste, die sich beim Entfernen verschieben – ein Klick träfe
+    // sonst die falsche App.
+    let overflow = HWND_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed);
+    if !overflow.is_null() && IsWindowVisible(overflow) != 0 {
+        InvalidateRect(overflow, std::ptr::null(), 0);
+        windows_sys::Win32::Graphics::Gdi::UpdateWindow(overflow);
+    }
     Some(ok as LRESULT)
 }
 
@@ -438,7 +447,9 @@ pub unsafe fn mono(icon: HICON, size: i32) -> HICON {
     if let Some(m) = MONO.with(|c| c.borrow().iter().find(|e| e.0 == icon && e.1 == size).map(|e| e.2)) {
         return m;
     }
-    let m = make_mono(icon, size);
+    // Fehlgeschlagen (z. B. GDI erschöpft): Original zeigen, nichts merken –
+    // sonst würde das fremde Icon später als "unseres" freigegeben.
+    let Some(m) = make_mono(icon, size) else { return icon };
     MONO.with(|c| {
         let mut c = c.borrow_mut();
         // Alte Einträge freigeben, deren Quell-Icon es nicht mehr gibt.
@@ -455,7 +466,7 @@ pub unsafe fn mono(icon: HICON, size: i32) -> HICON {
     m
 }
 
-unsafe fn make_mono(icon: HICON, size: i32) -> HICON {
+unsafe fn make_mono(icon: HICON, size: i32) -> Option<HICON> {
     use windows_sys::Win32::Graphics::Gdi::*;
     let mut bi: BITMAPINFO = zeroed();
     bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
@@ -466,6 +477,13 @@ unsafe fn make_mono(icon: HICON, size: i32) -> HICON {
     let mut bits: *mut c_void = null_mut();
     let screen = GetDC(null_mut());
     let dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    if dib.is_null() || bits.is_null() {
+        ReleaseDC(null_mut(), screen);
+        if !dib.is_null() {
+            DeleteObject(dib);
+        }
+        return None;
+    }
     let dc = CreateCompatibleDC(screen);
     ReleaseDC(null_mut(), screen);
     let old = SelectObject(dc, dib);
@@ -505,11 +523,7 @@ unsafe fn make_mono(icon: HICON, size: i32) -> HICON {
     let out = CreateIconIndirect(&info);
     DeleteObject(mask);
     DeleteObject(dib);
-    if out.is_null() {
-        icon
-    } else {
-        out
-    }
+    (!out.is_null()).then_some(out)
 }
 
 // ------------------------------------------------------------ Überlauf

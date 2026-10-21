@@ -49,7 +49,11 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         if !injected {
             if vk == VK_LWIN || vk == VK_RWIN {
                 if down {
-                    if !WIN_DOWN.swap(true, Ordering::Relaxed) {
+                    // Neuer Druck – auch wenn wir das letzte Loslassen verpasst haben
+                    // (Win+L: das kommt auf dem Sperrbildschirm an): Vor diesem Ereignis
+                    // war dann keine Win-Taste wirklich unten. Tastenwiederholung beim
+                    // Festhalten zählt nicht als neuer Druck.
+                    if !WIN_DOWN.swap(true, Ordering::Relaxed) || !win_physically_down() {
                         COMBO.store(false, Ordering::Relaxed);
                     }
                 } else {

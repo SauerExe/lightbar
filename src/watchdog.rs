@@ -9,6 +9,7 @@
 //!   Nachricht, auf die sie ein benanntes Ereignis setzt. Hängt ihr Thread in
 //!   einem blockierenden Aufruf, kommt die Nachricht nie an – direkt gesendete
 //!   Nachrichten (`WM_NULL`) würden dagegen weiter beantwortet,
+//! - bewacht auch die Instanz, die er neu startet (keine Lücke beim Hochfahren),
 //! - gibt nach zu vielen Neustarts kurz hintereinander auf und holt die
 //!   Windows-Taskleiste zurück.
 
@@ -27,9 +28,11 @@ pub const WM_BAR_PING: u32 = WM_APP + 38;
 /// So lange (in Ping-Runden à 10 s) darf die Leiste schweigen, bevor sie als
 /// hängend gilt.
 const MAX_SILENT: u32 = 6;
-/// Höchstens so viele Neustarts innerhalb von `RESTART_WINDOW` Sekunden.
+/// Höchstens so viele Neustarts innerhalb von `RESTART_WINDOW` Sekunden. Ein
+/// Neustart nach einem Hänger dauert schon gut 90 s – das Fenster muss deutlich
+/// länger sein, sonst greift die Bremse bei Dauerhängern nie.
 const MAX_RESTARTS: usize = 3;
-const RESTART_WINDOW: u64 = 120;
+const RESTART_WINDOW: u64 = 600;
 
 fn alive_event_name(pid: u32) -> Vec<u16> {
     w16(&format!("Local\\lightbar-alive-{pid}"))
@@ -100,39 +103,22 @@ unsafe fn bar_of(pid: u32) -> HWND {
     }
 }
 
-unsafe fn restart_or_give_up(reason: &str) {
-    // Beim Abmelden/Herunterfahren beendet Windows Lightbar selbst.
-    if GetSystemMetrics(SM_SHUTTINGDOWN) != 0 {
-        log(&format!("Wächter: {reason} – System fährt herunter, kein Neustart"));
-        return;
-    }
-    if allow_restart() {
-        log(&format!("Wächter: {reason} – starte Lightbar neu"));
-        if let Ok(me) = std::env::current_exe() {
-            let _ = std::process::Command::new(me).spawn();
-        }
-    } else {
-        log(&format!("Wächter: {reason} – zu viele Neustarts, Windows-Taskleiste wird wiederhergestellt"));
-        crate::shell::restore();
-    }
-}
+/// Umgebungsvariable für eine vom Wächter neu gestartete Instanz: Sie wird
+/// schon bewacht und startet keinen eigenen Wächter.
+pub const WATCHED: &str = "LIGHTBAR_WATCHED";
 
-/// `--watchdog <pid>`: läuft, bis Lightbar endet.
-pub unsafe fn run(pid: u32) {
-    let proc = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, 0, pid);
-    if proc.is_null() {
-        return;
-    }
+/// Ausgang einer Instanz: `None` = regulär beendet, sonst der Grund.
+unsafe fn watch(proc: HANDLE, pid: u32) -> Option<String> {
     let alive = CreateEventW(null(), 0, 0, alive_event_name(pid).as_ptr());
     let mut silent = 0u32;
-    loop {
+    let exited = |proc: HANDLE| {
+        let mut code = 0u32;
+        GetExitCodeProcess(proc, &mut code);
+        (code != 0).then(|| format!("Lightbar unerwartet beendet (Code 0x{code:X})"))
+    };
+    let outcome = loop {
         if WaitForSingleObject(proc, 10_000) == WAIT_OBJECT_0 {
-            let mut code = 0u32;
-            GetExitCodeProcess(proc, &mut code);
-            if code != 0 {
-                restart_or_give_up(&format!("Lightbar unerwartet beendet (Code 0x{code:X})"));
-            }
-            break;
+            break exited(proc);
         }
         // Noch keine Leiste (Start wartet evtl. auf Explorer): nichts zu prüfen.
         let bar = bar_of(pid);
@@ -140,20 +126,55 @@ pub unsafe fn run(pid: u32) {
             continue;
         }
         PostMessageW(bar, WM_BAR_PING, 0, 0);
-        if WaitForSingleObject(alive, 5_000) == WAIT_OBJECT_0 {
-            silent = 0;
-            continue;
+        // Auf die Antwort warten – oder darauf, dass der Prozess endet (dann
+        // sofort reagieren, z. B. damit --install die exe nicht gesperrt findet).
+        let handles = [alive, proc];
+        match WaitForMultipleObjects(2, handles.as_ptr(), 0, 5_000) {
+            WAIT_OBJECT_0 => silent = 0,
+            w if w == WAIT_OBJECT_0 + 1 => break exited(proc),
+            _ => {
+                silent += 1;
+                if silent >= MAX_SILENT {
+                    TerminateProcess(proc, 0xDEAD);
+                    WaitForSingleObject(proc, 5_000);
+                    break Some(format!("Leiste reagiert seit {} s nicht", silent * 15));
+                }
+            }
         }
-        silent += 1;
-        if silent >= MAX_SILENT {
-            TerminateProcess(proc, 0xDEAD);
-            WaitForSingleObject(proc, 5_000);
-            restart_or_give_up(&format!("Leiste reagiert seit {} s nicht", silent * 15));
-            break;
-        }
-    }
+    };
     if !alive.is_null() {
         CloseHandle(alive);
     }
-    CloseHandle(proc);
+    outcome
+}
+
+/// `--watchdog <pid>`: bewacht die Instanz und jede, die er selbst neu
+/// startet, bis eine regulär endet oder er aufgibt.
+pub unsafe fn run(pid: u32) {
+    let mut proc = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, 0, pid);
+    let mut pid = pid;
+    while !proc.is_null() {
+        let reason = watch(proc, pid);
+        CloseHandle(proc);
+        let Some(reason) = reason else { return };
+        // Beim Abmelden/Herunterfahren beendet Windows Lightbar selbst.
+        if GetSystemMetrics(SM_SHUTTINGDOWN) != 0 {
+            log(&format!("Wächter: {reason} – System fährt herunter, kein Neustart"));
+            return;
+        }
+        if !allow_restart() {
+            log(&format!("Wächter: {reason} – zu viele Neustarts, Windows-Taskleiste wird wiederhergestellt"));
+            crate::shell::restore();
+            return;
+        }
+        log(&format!("Wächter: {reason} – starte Lightbar neu"));
+        let child = std::env::current_exe().and_then(|me| std::process::Command::new(me).env(WATCHED, "1").spawn());
+        let Ok(child) = child else {
+            log("Wächter: Neustart fehlgeschlagen, Windows-Taskleiste wird wiederhergestellt");
+            crate::shell::restore();
+            return;
+        };
+        pid = child.id();
+        proc = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, 0, pid);
+    }
 }

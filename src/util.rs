@@ -168,7 +168,8 @@ pub unsafe fn force_foreground(h: HWND) {
     let me = GetCurrentThreadId();
     if fg_thread != 0 && fg_thread != me && AttachThreadInput(me, fg_thread, 1) != 0 {
         let ok = SetForegroundWindow(h);
-        BringWindowToTop(h);
+        // Asynchron: Hängt die Ziel-App, darf die Leiste nicht mit hängen.
+        SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
         AttachThreadInput(me, fg_thread, 0);
         if ok != 0 {
             return;
@@ -342,4 +343,67 @@ pub unsafe fn register_class(inst: HINSTANCE, name: &[u16], proc_: WNDPROC, styl
         hIconSm: null_mut(),
     };
     RegisterClassExW(&wc);
+}
+
+/// Arbeitsbereich des Bildschirms an einem Punkt (für Popups über einer
+/// Zweitleiste: nicht auf den Hauptbildschirm begrenzen).
+pub unsafe fn work_area_at(x: i32, y: i32) -> RECT {
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    let mut mi: MONITORINFO = std::mem::zeroed();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    GetMonitorInfoW(MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST), &mut mi);
+    mi.rcMonitor
+}
+
+const CF_UNICODETEXT: u32 = 13;
+
+/// Text aus der Zwischenablage (nur Unicode-Text), sonst None.
+pub unsafe fn clipboard_text(owner: HWND) -> Option<String> {
+    use windows_sys::Win32::System::DataExchange::*;
+    use windows_sys::Win32::System::Memory::*;
+    if OpenClipboard(owner) == 0 {
+        return None;
+    }
+    let mut out = None;
+    let h = GetClipboardData(CF_UNICODETEXT);
+    if !h.is_null() {
+        let p = GlobalLock(h) as *const u16;
+        if !p.is_null() {
+            // Höchstens bis zum Ende des Speicherblocks lesen.
+            let max = GlobalSize(h) / 2;
+            let len = (0..max).take_while(|&i| *p.add(i) != 0).count();
+            out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)));
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    out
+}
+
+/// Text in die Zwischenablage legen.
+pub unsafe fn set_clipboard_text(owner: HWND, s: &str) {
+    use windows_sys::Win32::System::DataExchange::*;
+    use windows_sys::Win32::System::Memory::*;
+    let w = w16(s);
+    let mem = GlobalAlloc(GMEM_MOVEABLE, w.len() * 2);
+    if mem.is_null() {
+        return;
+    }
+    let p = GlobalLock(mem) as *mut u16;
+    if p.is_null() {
+        GlobalFree(mem);
+        return;
+    }
+    std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
+    GlobalUnlock(mem);
+    if OpenClipboard(owner) == 0 {
+        GlobalFree(mem);
+        return;
+    }
+    EmptyClipboard();
+    // Gehört danach der Zwischenablage; nur bei Fehler selbst freigeben.
+    if SetClipboardData(CF_UNICODETEXT, mem as HANDLE).is_null() {
+        GlobalFree(mem);
+    }
+    CloseClipboard();
 }

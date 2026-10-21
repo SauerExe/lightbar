@@ -920,7 +920,8 @@ unsafe fn bar_menu(hwnd: HWND) {
         13 => crate::glow::set_style(GlowStyle::Off),
         14 => {
             crate::settings::update(|s| s.clock_seconds = !s.clock_seconds);
-            schedule_clock(hwnd);
+            // Der Uhr-Takt läuft an der Hauptleiste, auch wenn das Menü auf einer Zweitleiste kam.
+            schedule_clock(self::hwnd());
         }
         16 => crate::settings::update(|s| s.start_logo = StartLogo::Orb),
         17 => crate::settings::update(|s| s.start_logo = StartLogo::Windows),
@@ -998,7 +999,7 @@ unsafe fn tip_text(hit: Hit) -> String {
         }
         Hit::Usage => {
             let u = crate::usage::current().unwrap_or_default();
-            format!("{}\n\n{}\n\nKlicken zum Aktualisieren", crate::usage::describe("Claude", &u.claude, u.claude_at), crate::usage::describe("Codex", &u.codex, u.codex_at))
+            format!("{}\n\n{}\n\nKlicken zum Aktualisieren, Rechtsklick zum Anmelden", crate::usage::describe("Claude", &u.claude, u.claude_at), crate::usage::describe("Codex", &u.codex, u.codex_at))
         }
         Hit::None => String::new(),
     }
@@ -1168,6 +1169,48 @@ unsafe fn install_win_events() {
 unsafe fn activate_nth(n: usize) {
     if let Some(g) = with(|s| s.groups.get(n).cloned()).flatten() {
         click_group(&g);
+    }
+}
+
+/// Usage neu abfragen und die Leiste danach neu zeichnen.
+unsafe fn refresh_usage(hwnd: HWND) {
+    let h = hwnd as isize;
+    crate::usage::refresh_now(move || {
+        PostMessageW(h as HWND, WM_BAR_USAGE, 0, 0);
+    });
+}
+
+/// Befehl in einem sichtbaren Terminal ausführen (Windows Terminal, sonst
+/// Eingabeaufforderung); das Fenster bleibt danach offen.
+unsafe fn run_in_terminal(cmd: &str) {
+    if !shell_exec("open", "wt.exe", &format!("cmd /k {cmd}")) {
+        shell_exec("open", "cmd.exe", &format!("/k {cmd}"));
+    }
+}
+
+/// Rechtsklick auf die Usage-Anzeige: neu anmelden, wenn ein Login
+/// abgelaufen ist ("nicht verfügbar"), oder sofort aktualisieren.
+unsafe fn usage_menu(hwnd: HWND) {
+    let id = menus::popup(
+        hwnd,
+        &[
+            Item::Cmd(1, "Jetzt aktualisieren"),
+            Item::Sep,
+            Item::Cmd(2, "Bei Claude anmelden …"),
+            Item::Cmd(3, "Bei Codex anmelden …"),
+            Item::Sep,
+            Item::Cmd(4, "Usage-Anzeige ausblenden"),
+        ],
+    );
+    match id {
+        1 => refresh_usage(hwnd),
+        2 => run_in_terminal("claude auth login"),
+        3 => run_in_terminal("codex login"),
+        4 => {
+            crate::settings::update(|s| s.show_usage = false);
+            InvalidateRect(hwnd, null(), 0);
+        }
+        _ => {}
     }
 }
 
@@ -1449,7 +1492,24 @@ fn approach(v: &mut f32, target: f32, speed: f32, eps: f32, moving: &mut bool) {
 
 /// Animation anstoßen (läuft mit ~60 fps, bis alles ruht).
 unsafe fn kick(hwnd: HWND) {
+    // Den Animationszustand teilen sich alle Leisten; rechnen darf immer nur
+    // eine (die zuletzt angestoßene). Zwei Leisten mit unterschiedlicher
+    // Skalierung oder Breite zögen ihn sonst endlos in verschiedene Richtungen.
+    let prev = ANIM_OWNER.swap(hwnd, Ordering::Relaxed);
+    if !prev.is_null() && prev != hwnd {
+        KillTimer(prev, TIMER_ANIM);
+    }
     SetTimer(hwnd, TIMER_ANIM, 16, None);
+}
+
+/// Leiste, deren Layout die Animation gerade antreibt.
+static ANIM_OWNER: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+
+/// Gleiten (anim.x) gilt nur für die Leiste, die es berechnet; die anderen
+/// zeichnen ihre Buttons an der Zielposition.
+fn animates_positions(hwnd: HWND) -> bool {
+    let owner = ANIM_OWNER.load(Ordering::Relaxed);
+    owner == hwnd || (owner.is_null() && hwnd == self::hwnd())
 }
 
 /// Während des Ziehens: Button folgt der Maus, die anderen weichen aus.
@@ -1568,8 +1628,10 @@ unsafe fn step_anim(hwnd: HWND) -> bool {
                 s.anim.press = None;
             }
         }
-        // Aufmerksamkeit pulsiert dauerhaft.
-        if !s.attention.is_empty() {
+        // Aufmerksamkeit pulsiert dauerhaft – aber nur für Fenster mit Button
+        // (z. B. nicht für ein blinkendes Fenster auf einem anderen Desktop).
+        s.attention.retain(|&w| IsWindow(w) != 0);
+        if s.groups.iter().any(|g| g.windows.iter().any(|w| s.attention.contains(w))) {
             moving = true;
         }
         (moving, new_buttons)
@@ -1616,6 +1678,22 @@ unsafe fn same_monitor(a: HWND, b: HWND) -> bool {
     MonitorFromWindow(a, MONITOR_DEFAULTTONEAREST) == MonitorFromWindow(b, MONITOR_DEFAULTTONEAREST)
 }
 
+/// Echtes Vollbild-Fenster ohne Rahmen (Spiele, Videoplayer): weder
+/// Titelleiste noch Größenrahmen. Rahmenlose Electron-Apps (Discord, VS Code)
+/// haben einen Größenrahmen und zählen nicht dazu.
+unsafe fn borderless(h: HWND) -> bool {
+    let style = GetWindowLongW(h, GWL_STYLE) as u32;
+    style & WS_CAPTION != WS_CAPTION && style & WS_THICKFRAME == 0
+}
+
+/// Bedeckt das Fenster seinen ganzen Monitor (inklusive Platz der Leiste)?
+unsafe fn covers_monitor(h: HWND) -> bool {
+    let m = monitor_rect(h, false);
+    let mut r: RECT = zeroed();
+    GetWindowRect(h, &mut r);
+    r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+}
+
 /// Maximierte Fenster, die noch nach dem alten Arbeitsbereich ausgerichtet
 /// sind (z. B. maximiert, bevor unsere Leiste Platz reserviert hat), ragen
 /// unter die Leiste. Windows passt sie nicht von selbst an – also kürzen.
@@ -1624,7 +1702,8 @@ pub unsafe fn fit_maximized(bar: HWND) {
     let mut windows: Vec<HWND> = Vec::new();
     EnumWindows(Some(enum_cb), &mut windows as *mut _ as LPARAM);
     for h in windows {
-        if IsZoomed(h) == 0 || !same_monitor(h, bar) {
+        // Rahmenlose "maximierte" Vollbild-Fenster (Spiele, Videoplayer) nicht kürzen.
+        if IsZoomed(h) == 0 || !same_monitor(h, bar) || (borderless(h) && covers_monitor(h)) {
             continue;
         }
         let mut r: RECT = zeroed();
@@ -1642,7 +1721,9 @@ pub unsafe fn fit_maximized(bar: HWND) {
 /// Maximierte Fenster zählen nicht – die lassen die Leiste frei.
 unsafe fn foreground_fullscreen(bar: HWND) -> bool {
     let fg = GetForegroundWindow();
-    if fg.is_null() || IsZoomed(fg) != 0 || !same_monitor(fg, bar) {
+    // Maximierte Fenster lassen die Leiste frei – außer rahmenlose (Spiele und
+    // Videoplayer maximieren sich ohne Titelleiste über den ganzen Monitor).
+    if fg.is_null() || (IsZoomed(fg) != 0 && !borderless(fg)) || !same_monitor(fg, bar) {
         return false;
     }
     let mut pid = 0u32;
@@ -1891,6 +1972,25 @@ unsafe fn set_pos_secondary(hwnd: HWND) {
     ensure_work_area(hwnd);
 }
 
+/// Unterkante des Arbeitsbereichs, die wir selbst gesetzt haben, je Monitor.
+/// Nur diesen Wert passen wir später auch nach unten an (z. B. kleinere
+/// Skalierung → niedrigere Leiste); einen kleineren Bereich, den jemand
+/// anderes reserviert hat (eine weitere AppBar), lassen wir in Ruhe.
+static SET_BY_US: std::sync::Mutex<Vec<(isize, i32)>> = std::sync::Mutex::new(Vec::new());
+
+fn set_by_us(mon: isize) -> Option<i32> {
+    SET_BY_US.lock().ok()?.iter().find(|e| e.0 == mon).map(|e| e.1)
+}
+
+fn remember_set(mon: isize, bottom: Option<i32>) {
+    if let Ok(mut v) = SET_BY_US.lock() {
+        v.retain(|e| e.0 != mon);
+        if let Some(b) = bottom {
+            v.push((mon, b));
+        }
+    }
+}
+
 /// Die Leiste muss ihren Platz auch wirklich vom Arbeitsbereich abziehen,
 /// sonst legen sich maximierte Fenster darunter. Normalerweise erledigt das
 /// Explorer über die AppBar-Anmeldung; hat er es nicht getan (gemeldet auf
@@ -1903,10 +2003,14 @@ unsafe fn ensure_work_area(bar: HWND) {
     let mut br: RECT = zeroed();
     GetWindowRect(bar, &mut br);
     let mut work = monitor_rect(bar, true);
-    if work.bottom > br.top {
+    let mon = MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST) as isize;
+    let too_big = work.bottom > br.top;
+    let ours_too_small = work.bottom < br.top && set_by_us(mon) == Some(work.bottom);
+    if too_big || ours_too_small {
         let before = work.bottom;
         work.bottom = br.top;
         set_work_area(work);
+        remember_set(mon, Some(br.top));
         // Explorer hat den Platz der Leiste nicht reserviert. Höchstens einmal pro
         // Minute protokollieren, falls er immer wieder dagegenhält.
         static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1928,16 +2032,18 @@ unsafe fn set_work_area(mut work: RECT) {
     SystemParametersInfoW(SPI_SETWORKAREA, 0, &mut work as *mut RECT as *mut c_void, 0);
 }
 
-/// Gegenstück beim Entfernen einer Zweitleiste: Endet der Arbeitsbereich noch
-/// genau an ihrer Oberkante, geben wir den Platz selbst frei.
+/// Gegenstück beim Entfernen einer Zweitleiste: den Platz, den wir selbst
+/// reserviert hatten, wieder freigeben.
 unsafe fn release_work_area(bar: HWND) {
-    let mut br: RECT = zeroed();
-    GetWindowRect(bar, &mut br);
     let mut work = monitor_rect(bar, true);
     let m = monitor_rect(bar, false);
-    if work.bottom == br.top && br.bottom == m.bottom {
+    let mon = MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST) as isize;
+    // Nur zurückgeben, was wir selbst gesetzt haben (die Leiste kann beim
+    // Abstecken eines Monitors schon woanders hingeschoben worden sein).
+    if set_by_us(mon) == Some(work.bottom) {
         work.bottom = m.bottom;
         set_work_area(work);
+        remember_set(mon, None);
     }
 }
 
@@ -2000,6 +2106,7 @@ unsafe fn create_secondary(inst: HINSTANCE, rect: RECT) -> Option<HWND> {
     SHAppBarMessage(ABM_NEW, &mut abd);
     set_pos_secondary(hwnd);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    ensure_work_area(hwnd);
     Some(hwnd)
 }
 
@@ -2239,6 +2346,7 @@ unsafe fn paint(hwnd: HWND) {
         return;
     };
     let (dpi, font, icons) = bar_fonts(hwnd);
+    let slide = animates_positions(hwnd);
     let hv = |id: &str| if hover_here { anim.hover.get(id).copied().unwrap_or(0.0) } else { 0.0 };
     let Some((l, tray)) = current_layout(hwnd) else {
         ValidateRect(hwnd, null());
@@ -2267,7 +2375,7 @@ unsafe fn paint(hwnd: HWND) {
         for (i, (id, windows, icon, attention)) in groups.iter().enumerate() {
             let Some(base) = l.tasks.get(i) else { continue };
             // Weich nachrutschende Position.
-            let dx = anim.x.get(id).map(|x| x.round() as i32 - (base.left - l.start.left)).unwrap_or(0);
+            let dx = if slide { anim.x.get(id).map(|x| x.round() as i32 - (base.left - l.start.left)).unwrap_or(0) } else { 0 };
             let mut r = RECT { left: base.left + dx, right: base.right + dx, ..*base };
             // Gezogener Button klebt am Mauszeiger.
             let is_dragged = dragged.as_ref().is_some_and(|(did, _)| did == id);
@@ -2571,6 +2679,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER if wp == TIMER_FULL => {
             update_fullscreen(hwnd);
             tick_secondaries();
+            // Die ausgeblendete Hauptleiste bekommt kein WM_PAINT – und nur sie hat
+            // bisher die Zweitleisten mitgezeichnet. Solange: hier direkt (Uhr,
+            // Fensterliste, aktive App bleiben so auf den anderen Monitoren aktuell).
+            if with(|s| s.fullscreen).unwrap_or(false) {
+                for h in secondaries() {
+                    InvalidateRect(h, null(), 0);
+                }
+            }
             let still = with(|s| s.fullscreen).unwrap_or(false) || secondaries().iter().any(|&h| IsWindowVisible(h) == 0);
             if !still {
                 KillTimer(hwnd, TIMER_FULL);
@@ -2835,7 +2951,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Hit::More => more_menu(hwnd),
                 Hit::Status => status_menu(hwnd),
                 Hit::Clock => clock_menu(hwnd),
-                Hit::Desktop | Hit::Usage | Hit::TaskMgr | Hit::None => bar_menu(hwnd),
+                Hit::Usage => usage_menu(hwnd),
+                Hit::Desktop | Hit::TaskMgr | Hit::None => bar_menu(hwnd),
             }
             InvalidateRect(hwnd, null(), 0);
             0
@@ -2879,6 +2996,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let mut abd = appbar_data(hwnd);
             SHAppBarMessage(ABM_REMOVE, &mut abd);
             release_work_area(hwnd);
+            // Lag die Zweitleiste zuletzt auf dem Hauptbildschirm (Monitor abgesteckt),
+            // braucht die Hauptleiste ihren Platz jetzt wieder selbst.
+            ensure_work_area(self::hwnd());
             if let Ok(mut v) = SECONDARY.lock() {
                 v.retain(|&h| h != hwnd as isize);
             }
@@ -2973,6 +3093,8 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
     install_win_events();
     refresh(hwnd, None);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    // set_pos lief noch unsichtbar – jetzt den Arbeitsbereich prüfen.
+    ensure_work_area(hwnd);
     tray::announce();
     sync_monitors();
     let notify_target = hwnd as isize;

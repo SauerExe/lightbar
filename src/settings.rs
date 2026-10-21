@@ -75,8 +75,21 @@ fn load() -> Settings {
     let mut s = DEFAULTS;
     let Some(dir) = dir() else { return s };
     let file = dir.join("settings.txt");
-    match std::fs::read_to_string(&file) {
-        Ok(text) => {
+    // Kurz gesperrt (Virenscanner, Synchronisierung)? Ein paarmal versuchen.
+    // Kaputte Zeichen nach einer Handbearbeitung kosten nur diese Zeile.
+    let mut read = std::fs::read(&file);
+    for _ in 0..5 {
+        match &read {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                read = std::fs::read(&file);
+            }
+            _ => break,
+        }
+    }
+    match read {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
             for line in text.lines() {
                 let Some((k, v)) = line.split_once('=') else { continue };
                 let (k, v) = (k.trim(), v.trim());
@@ -94,8 +107,13 @@ fn load() -> Settings {
                 }
             }
         }
+        // Nicht lesbar: mit Standardwerten laufen, die Datei aber nicht
+        // überschreiben (sonst wäre z. B. der Präsentationsmodus still weg).
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            crate::util::log(&format!("settings.txt nicht lesbar ({e}) – Standardwerte für diese Sitzung"));
+        }
         Err(_) => {
-            // Übernahme der alten Marker-Dateien.
+            // Erster Start: Übernahme der alten Marker-Dateien.
             let (mono, noglow) = (dir.join("mono-tray"), dir.join("no-glow"));
             s.mono_tray = mono.exists();
             if noglow.exists() {

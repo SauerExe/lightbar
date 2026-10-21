@@ -178,6 +178,10 @@ fn https_get(host: &str, path: &str, headers: &[(&str, String)]) -> Result<(u32,
         if req.0.is_null() {
             return Err("Anfrage nicht möglich".into());
         }
+        // Keine Weiterleitungen folgen: WinHTTP schickte dabei den Authorization-
+        // Header mit, das Token ginge so womöglich an einen anderen Host.
+        let mut no_redirect: u32 = WINHTTP_DISABLE_REDIRECTS;
+        WinHttpSetOption(req.0, WINHTTP_OPTION_DISABLE_FEATURE, &mut no_redirect as *mut u32 as _, size_of::<u32>() as u32);
         // Zugangsdaten aus der Proxy-URL: nur an WinHTTP, nie in Fehlermeldungen.
         if let Some(p) = &proxy {
             for (option, value) in [(WINHTTP_OPTION_PROXY_USERNAME, &p.user), (WINHTTP_OPTION_PROXY_PASSWORD, &p.pass)] {
@@ -259,8 +263,8 @@ fn parse_iso(s: &str) -> Option<i64> {
         let off = &s[19 + pos..];
         if off.len() >= 6 {
             let sign = if off.starts_with('-') { -1 } else { 1 };
-            let oh = off[1..3].parse::<i64>().ok()?;
-            let om = off[4..6].parse::<i64>().ok()?;
+            let oh = off.get(1..3)?.parse::<i64>().ok()?;
+            let om = off.get(4..6)?.parse::<i64>().ok()?;
             t -= sign * (oh * 3600 + om * 60);
         }
     }

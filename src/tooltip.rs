@@ -89,8 +89,8 @@ pub unsafe fn show(s: &str, center_x: i32, top_y: i32, dpi: u32) {
     ReleaseDC(null_mut(), dc);
     let (tw, th) = (r.right + px(dpi, 20), r.bottom + px(dpi, 12));
     let mut x = center_x - tw / 2;
-    let sw = GetSystemMetrics(SM_CXSCREEN);
-    x = x.clamp(px(dpi, 4), (sw - tw - px(dpi, 4)).max(0));
+    let m = work_area_at(center_x, top_y - 1);
+    x = x.clamp(m.left + px(dpi, 4), (m.right - tw - px(dpi, 4)).max(m.left));
     let y = top_y - th - px(dpi, 8);
     if IsWindowVisible(hwnd) != 0 {
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, tw, th, SWP_NOACTIVATE | SWP_SHOWWINDOW);

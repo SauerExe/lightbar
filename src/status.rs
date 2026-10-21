@@ -108,7 +108,14 @@ unsafe fn endpoint(h: &mut Handles) -> Option<IAudioEndpointVolume> {
             return Some(ep.clone());
         }
     }
-    let ep = open_endpoint(h)?;
+    let Some(ep) = open_endpoint(h) else {
+        // Beim Gerätewechsel kann das neue Standardgerät kurz noch fehlen: den
+        // Wechsel nicht "verbrauchen", sonst bliebe das entfernte Gerät für immer.
+        if changed {
+            DEVICE_CHANGED.store(true, Ordering::Relaxed);
+        }
+        return None;
+    };
     if let Some(cb) = &h.volume_watch {
         if let Some((old, _)) = h.endpoint.take() {
             let _ = old.UnregisterControlChangeNotify(cb);

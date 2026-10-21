@@ -88,29 +88,48 @@ unsafe fn appbar_state(set: Option<u32>) -> u32 {
     }
 }
 
+/// Markierung an Explorers Leisten: "von Lightbar versteckt". Sie bleibt am
+/// Fenster, auch wenn Lightbar abstürzt, und verschwindet mit Explorer.
+const HIDDEN_PROP: &str = "LightbarHidden";
+
+unsafe fn hide_explorer_bar(h: HWND) {
+    SetPropW(h, w16(HIDDEN_PROP).as_ptr(), 1 as HANDLE);
+    ShowWindowAsync(h, SW_HIDE);
+}
+
 /// Windows-Taskleiste ausblenden. Der Originalzustand wird nur beim ersten
 /// Mal gemerkt und die Datei danach nie überschrieben (erst `--uninstall`
 /// entfernt sie): Liest ein späterer Start den Zustand neu, kann er unseren
 /// eigenen "automatisch ausblenden" als Original erwischen – dann bliebe die
 /// Windows-Leiste ohne Lightbar dauerhaft versteckt.
 pub unsafe fn takeover() {
+    // Ohne gemerkten Originalzustand kein "automatisch ausblenden": Den könnten
+    // wir später nicht zurücknehmen, er bliebe für immer.
+    let mut remembered = false;
     if let Some(f) = state_file() {
-        if !f.exists() {
+        remembered = f.exists();
+        if !remembered {
             let mut original = appbar_state(None);
-            // Explorers Leiste ist schon versteckt: Das war Lightbar (ein früherer
-            // Lauf ohne gemerkten Zustand). Dann ist "nicht ausblenden" das Original.
-            if original & ABS_AUTOHIDE != 0 && explorer_bars().iter().any(|&h| IsWindowVisible(h) == 0) {
+            // Explorers Leiste trägt unsere Markierung: Ein früherer Lauf ohne
+            // gemerkten Zustand hat sie versteckt – das Autohide stammt dann von
+            // uns, das Original ist "nicht ausblenden".
+            let ours = explorer_bars().iter().any(|&h| !GetPropW(h, w16(HIDDEN_PROP).as_ptr()).is_null());
+            if original & ABS_AUTOHIDE != 0 && ours {
                 original = ABS_ALWAYSONTOP;
             }
             if let Some(dir) = f.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(&f, original.to_string());
+            remembered = std::fs::write(&f, original.to_string()).is_ok();
         }
     }
-    appbar_state(Some(ABS_AUTOHIDE));
+    if remembered {
+        appbar_state(Some(ABS_AUTOHIDE));
+    } else {
+        crate::util::log("Originalzustand der Windows-Taskleiste nicht speicherbar – kein automatisches Ausblenden");
+    }
     for h in explorer_bars() {
-        ShowWindowAsync(h, SW_HIDE);
+        hide_explorer_bar(h);
     }
     ACTIVE.store(true, Ordering::Relaxed);
 }
@@ -123,7 +142,7 @@ pub unsafe fn ensure_hidden() {
     }
     for h in explorer_bars() {
         if IsWindowVisible(h) != 0 {
-            ShowWindowAsync(h, SW_HIDE);
+            hide_explorer_bar(h);
         }
     }
 }
@@ -138,6 +157,7 @@ pub unsafe fn restore() {
         appbar_state(Some(state));
     }
     for h in explorer_bars() {
+        RemovePropW(h, w16(HIDDEN_PROP).as_ptr());
         ShowWindowAsync(h, SW_SHOWNA);
     }
 }
@@ -191,6 +211,49 @@ unsafe fn close_running() {
             SendMessageTimeoutW(h, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 5000, &mut r);
         }
     }
+    // Warten, bis wirklich alle anderen Lightbar-Prozesse weg sind – auch der
+    // Wächter, der sonst die exe sperrt (--install kopiert dann nicht) oder
+    // eine hängende Instanz nach --uninstall wieder hochholt. Wer nach 8 s noch
+    // läuft, wird beendet.
+    let start = std::time::Instant::now();
+    while !other_instances().is_empty() && start.elapsed() < std::time::Duration::from_secs(8) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    for pid in other_instances() {
+        let p = OpenProcess(windows_sys::Win32::System::Threading::PROCESS_TERMINATE, 0, pid);
+        if !p.is_null() {
+            crate::util::log(&format!("Prozess {pid} reagierte nicht auf Beenden – hart beendet"));
+            windows_sys::Win32::System::Threading::TerminateProcess(p, 1);
+            CloseHandle(p);
+        }
+    }
+}
+
+/// Andere laufende Lightbar-Prozesse (Leiste und Wächter), ohne diesen.
+unsafe fn other_instances() -> Vec<u32> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+    let me = std::process::id();
+    let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if snap == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let mut all: Vec<(u32, u32, String)> = Vec::new();
+    let mut e: PROCESSENTRY32W = std::mem::zeroed();
+    e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    let mut ok = Process32FirstW(snap, &mut e) != 0;
+    while ok {
+        let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+        all.push((e.th32ProcessID, e.th32ParentProcessID, String::from_utf16_lossy(&e.szExeFile[..n]).to_lowercase()));
+        ok = Process32NextW(snap, &mut e) != 0;
+    }
+    CloseHandle(snap);
+    // Den eigenen Elternprozess auslassen: Beim Ausbruch aus einem
+    // Paket-Container wartet er auf genau diesen Befehl.
+    let parent = all.iter().find(|p| p.0 == me).map(|p| p.1).unwrap_or(0);
+    all.into_iter()
+        .filter(|(pid, _, name)| (name == "lightbar.exe" || name == "rtaskbar.exe") && *pid != me && *pid != parent)
+        .map(|p| p.0)
+        .collect()
 }
 
 const TASK_NAME: &str = "Lightbar";

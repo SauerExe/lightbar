@@ -105,6 +105,13 @@ fn main() {
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
+        // Wächter gleich zu Beginn, damit auch ein Absturz beim Hochfahren
+        // auffällt. Vom Wächter neu gestartet: Der bewacht uns schon. Den Merker
+        // entfernen, damit ihn von hier gestartete Programme nicht erben.
+        if std::env::var_os(watchdog::WATCHED).is_none() {
+            watchdog::spawn();
+        }
+        std::env::remove_var(watchdog::WATCHED);
         let t0 = std::time::Instant::now();
         shell::wait_for_explorer(std::time::Duration::from_secs(30));
         util::log(&format!("Start {} (auf Explorer gewartet: {} ms)", env!("CARGO_PKG_VERSION"), t0.elapsed().as_millis()));
@@ -113,7 +120,9 @@ fn main() {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let inst = GetModuleHandleW(null());
         if bar::create(inst).is_null() {
-            util::log("Leiste konnte nicht angelegt werden – Ende");
+            util::log("Leiste konnte nicht angelegt werden – Ende, Windows-Taskleiste wiederhergestellt");
+            // Evtl. hat eine abgestürzte Vorgängerin Explorers Leiste versteckt.
+            shell::restore();
             return;
         }
         start::create(inst);
@@ -126,7 +135,6 @@ fn main() {
         keyhook::spawn();
         shell::takeover();
         bar::schedule_rehide();
-        watchdog::spawn();
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
