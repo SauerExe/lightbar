@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::mem::{size_of, zeroed};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -711,8 +711,8 @@ unsafe fn show() {
         st.sel = 0;
         st.scroll = 0;
     });
-    let mut br: RECT = zeroed();
-    GetWindowRect(bar, &mut br);
+    // Angedockte Lage – beim automatischen Ausblenden kann die Leiste gerade weggeschoben sein.
+    let br = crate::bar::docked_rect(bar);
     // An der Leiste, wie in Windows eingestellt: links oder mittig (bei einer
     // seitlichen Leiste oben). Auf kleinen oder hochkant gestellten
     // Bildschirmen kürzer bzw. eingerückt.

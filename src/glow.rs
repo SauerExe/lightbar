@@ -147,7 +147,8 @@ unsafe fn ensure_buffer(sf: &mut Surface, w: i32, h: i32) {
     sf.h = h;
 }
 
-/// An alle sichtbaren Leisten anlegen bzw. ausblenden (Vollbild, abgeschaltet).
+/// An alle sichtbaren Leisten anlegen bzw. ausblenden (Vollbild, abgeschaltet,
+/// automatisch ausgeblendet).
 pub unsafe fn sync() {
     let Some((inst, mut old)) = with(|s| (s.inst, std::mem::take(&mut s.surfaces))) else { return };
     // Seitliche Leisten bekommen (noch) keinen Leuchtrand: das Band müsste
@@ -155,7 +156,7 @@ pub unsafe fn sync() {
     let edge = crate::display::edge();
     let flip = edge == crate::display::Edge::Top;
     let bars: Vec<HWND> = if crate::settings::get().glow != GlowStyle::Off && !edge.vertical() {
-        crate::bar::all_bars().into_iter().filter(|&b| !b.is_null() && IsWindowVisible(b) != 0).collect()
+        crate::bar::all_bars().into_iter().filter(|&b| !b.is_null() && IsWindowVisible(b) != 0 && crate::bar::fully_shown(b)).collect()
     } else {
         Vec::new()
     };

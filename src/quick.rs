@@ -45,6 +45,12 @@ fn hwnd() -> HWND {
     HWND_QUICK.load(Ordering::Relaxed)
 }
 
+/// Schnelleinstellungen offen?
+pub fn visible() -> bool {
+    let h = hwnd();
+    unsafe { !h.is_null() && IsWindowVisible(h) != 0 }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
     Wifi,
@@ -245,8 +251,8 @@ pub unsafe fn toggle() {
         st.status = Some(status);
     });
     query_radios();
-    let mut br: RECT = zeroed();
-    GetWindowRect(bar, &mut br);
+    // Angedockte Lage – beim automatischen Ausblenden kann die Leiste gerade weggeschoben sein.
+    let br = crate::bar::docked_rect(bar);
     let (w, hh) = (px(dpi, W), px(dpi, H));
     // Am Ende der Leiste (rechts bzw. bei einer seitlichen Leiste unten).
     let (x, y) = crate::display::place_near(br, w, hh, px(dpi, 12), crate::display::Along::End);

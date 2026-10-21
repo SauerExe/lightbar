@@ -88,22 +88,22 @@ pub fn edge() -> Edge {
     Edge::from(EDGE.load(Ordering::Relaxed) as u32 - 1).unwrap_or(Edge::Bottom)
 }
 
-fn read_edge() -> Edge {
-    if let Some(e) = reg_dword("TaskbarLocation").and_then(Edge::from) {
-        return e;
-    }
+/// Byte `i` aus `StuckRects3\Settings` (Explorers Taskleisten-Zustand).
+fn stuck_rects_byte(i: usize) -> Option<u8> {
     unsafe {
         let mut buf = [0u8; 64];
         let mut size = buf.len() as u32;
         let key = w16("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StuckRects3");
         let ok = RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), w16("Settings").as_ptr(), RRF_RT_REG_BINARY, null_mut(), buf.as_mut_ptr() as *mut _, &mut size);
-        if ok == ERROR_SUCCESS && size > 12 {
-            if let Some(e) = Edge::from(buf[12] as u32) {
-                return e;
-            }
-        }
+        (ok == ERROR_SUCCESS && size as usize > i).then_some(buf[i])
     }
-    Edge::Bottom
+}
+
+fn read_edge() -> Edge {
+    if let Some(e) = reg_dword("TaskbarLocation").and_then(Edge::from) {
+        return e;
+    }
+    stuck_rects_byte(12).and_then(|b| Edge::from(b as u32)).unwrap_or(Edge::Bottom)
 }
 
 /// Nach WM_SETTINGCHANGE: Ausrichtung, Position und die übrigen
@@ -130,6 +130,7 @@ const SECONDS: u32 = 1 << 3;
 const DESKTOP_CORNER: u32 = 1 << 4;
 const FLASHING: u32 = 1 << 5;
 const TASK_VIEW: u32 = 1 << 6;
+const AUTOHIDE: u32 = 1 << 7;
 const SEARCH_SHIFT: u32 = 8;
 
 fn read_flags() -> u32 {
@@ -154,6 +155,10 @@ fn read_flags() -> u32 {
     // (0 aus, 1 Symbol, 2 Suchfeld, 3 Symbol mit Beschriftung; Standard Symbol).
     if reg_dword("ShowTaskViewButton") != Some(0) {
         f |= TASK_VIEW;
+    }
+    // "Taskleiste automatisch ausblenden": StuckRects3, Byte 8, Bit 0x01.
+    if stuck_rects_byte(8).is_some_and(|b| b & 0x01 != 0) {
+        f |= AUTOHIDE;
     }
     let search = reg_dword_at("Software\\Microsoft\\Windows\\CurrentVersion\\Search", "SearchboxTaskbarMode").unwrap_or(1).min(3);
     f | (search << SEARCH_SHIFT)
@@ -214,6 +219,13 @@ pub fn desktop_corner() -> bool {
 /// Apps dürfen blinken (Aufmerksamkeit).
 pub fn flashing() -> bool {
     flags() & FLASHING != 0
+}
+
+/// "Taskleiste automatisch ausblenden", wie es gerade in der Registry steht.
+/// Achtung: Nach der Übernahme stellt Lightbar Explorer selbst auf Ausblenden
+/// (`shell::takeover`) – was der Nutzer will, ermittelt `bar::autohide_wanted`.
+pub fn autohide() -> bool {
+    flags() & AUTOHIDE != 0
 }
 
 /// Schaltfläche "Aufgabenansicht" anzeigen.

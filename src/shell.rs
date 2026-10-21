@@ -9,7 +9,7 @@
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Registry::*;
@@ -131,6 +131,7 @@ pub unsafe fn takeover() {
         }
     }
     if remembered {
+        FORCED_AT.store(windows_sys::Win32::System::SystemInformation::GetTickCount64(), Ordering::Relaxed);
         appbar_state(Some(ABS_AUTOHIDE));
     } else {
         crate::util::log("Originalzustand der Windows-Taskleiste nicht speicherbar – kein automatisches Ausblenden");
@@ -155,6 +156,41 @@ pub unsafe fn ensure_hidden() {
         if IsWindowVisible(h) != 0 || explorer_first {
             hide_explorer_bar(h);
         }
+    }
+}
+
+/// Zeitpunkt (GetTickCount64), zu dem `takeover` Explorer zuletzt auf
+/// "automatisch ausblenden" gestellt hat.
+static FORCED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Explorers Leisten sind übernommen (versteckt, von uns auf Ausblenden gestellt).
+pub fn active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Hat `takeover` gerade erst (vor wenigen Sekunden) selbst auf Ausblenden
+/// gestellt? Eine Änderung in der Registry stammt dann von uns, nicht vom Nutzer.
+pub fn forced_recently() -> bool {
+    let at = FORCED_AT.load(Ordering::Relaxed);
+    at != 0 && unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }.saturating_sub(at) < 5000
+}
+
+/// "Automatisch ausblenden" im gemerkten Originalzustand – also wie der Nutzer
+/// es will, solange Explorer von uns auf Ausblenden gestellt ist.
+pub fn remembered_autohide() -> Option<bool> {
+    let state = std::fs::read_to_string(state_file()?).ok()?.trim().parse::<u32>().ok()?;
+    Some(state & ABS_AUTOHIDE != 0)
+}
+
+/// Der Nutzer hat "automatisch ausblenden" in Windows umgestellt, während
+/// Lightbar läuft: als neuen Originalzustand merken. Das ist eine bewusste
+/// Wahl (nicht unser eigenes Ausblenden) – `restore` stellt sie so wieder her.
+pub fn remember_autohide(on: bool) {
+    let Some(f) = state_file() else { return };
+    let Some(old) = std::fs::read_to_string(&f).ok().and_then(|s| s.trim().parse::<u32>().ok()) else { return };
+    let state = if on { old | ABS_AUTOHIDE } else { (old & !ABS_AUTOHIDE) | ABS_ALWAYSONTOP };
+    if state != old {
+        let _ = std::fs::write(&f, state.to_string());
     }
 }
 
