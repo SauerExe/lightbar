@@ -133,6 +133,8 @@ struct State {
     pin_idx: Vec<usize>,
     recent: Vec<Entry>,
     icons: HashMap<String, HBITMAP>,
+    /// Kontobild für die Fußleiste: (Größe, Bitmap); Größe 0 = noch nicht geladen.
+    avatar: (i32, HBITMAP),
     query: String,
     results: Vec<Row>,
     /// exe (normalisiert) → App-Kennung im Katalog; für Sprunglisten, lazy gebaut.
@@ -619,9 +621,15 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
         round(dc, &account, HOVER, px(d, 6));
     }
     st.hits.push((account, Act::Account));
-    round(dc, &ar, ACTIVE, av);
-    let initial: String = user.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
-    text(dc, &initial, &ar, f.bold, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    let s = crate::settings::get();
+    let picture = if s.start_avatar && !s.presentation { avatar(st, av) } else { null_mut() };
+    if picture.is_null() {
+        round(dc, &ar, ACTIVE, av);
+        let initial: String = user.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+        text(dc, &initial, &ar, f.bold, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    } else {
+        draw_alpha(dc, picture, ar.left, ar.top, av);
+    }
     text(dc, &user, &RECT { left: ar.right + px(d, 12), right: w / 2, ..foot }, f.normal, TEXT, LINE);
     let pb = RECT { left: w - px(d, PAD + 40), top: foot.top + px(d, 12), right: w - px(d, PAD), bottom: h - px(d, 12) };
     if inside(&pb, st.mouse.0, st.mouse.1) {
@@ -629,6 +637,23 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     }
     text(dc, "\u{E7E8}", &pb, f.icons, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     st.hits.push((pb, Act::Power));
+}
+
+/// Kontobild in `size`, beim ersten Bedarf geladen. Null, wenn es keins gibt.
+unsafe fn avatar(st: &mut State, size: i32) -> HBITMAP {
+    if st.avatar.0 != size {
+        drop_avatar(st);
+        st.avatar = (size, apps::account_picture(size));
+    }
+    st.avatar.1
+}
+
+/// Verwirft das Kontobild; beim nächsten Zeichnen wird es neu gelesen.
+unsafe fn drop_avatar(st: &mut State) {
+    if !st.avatar.1.is_null() {
+        DeleteObject(st.avatar.1);
+    }
+    st.avatar = (0, null_mut());
 }
 
 // ------------------------------------------------------------- Aktionen
@@ -908,6 +933,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_RELOAD => {
             let apps = apps::enumerate();
             with(|st| {
+                // Kontobild kann sich geändert haben.
+                drop_avatar(st);
                 if !apps.is_empty() {
                     st.apps = apps;
                     rebuild(st);
@@ -1048,6 +1075,7 @@ pub unsafe fn create(inst: HINSTANCE) {
         pin_idx: Vec::new(),
         recent: Vec::new(),
         icons: HashMap::new(),
+        avatar: (0, null_mut()),
         query: String::new(),
         results: Vec::new(),
         exe_ids: None,

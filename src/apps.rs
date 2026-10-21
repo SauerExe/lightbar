@@ -239,6 +239,100 @@ unsafe fn image(item: &IShellItem, size: i32) -> HBITMAP {
     }
 }
 
+/// Kontobild des angemeldeten Nutzers, kreisrund in `size` Pixeln (vormultipliziertes
+/// Alpha). Windows legt es in mehreren Größen ab und trägt die Pfade unter
+/// `HKLM\…\AccountPicture\Users\<SID>` ein. Null, wenn es keins gibt.
+pub unsafe fn account_picture(size: i32) -> HBITMAP {
+    const SIZES: [i32; 11] = [32, 40, 48, 64, 96, 192, 208, 240, 424, 448, 1080];
+    let Some(sid) = user_sid() else { return null_mut() };
+    let key = format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\AccountPicture\Users\{sid}");
+    // Kleinste Ablage, die mindestens so groß ist; sonst die größte vorhandene.
+    let mut order: Vec<i32> = SIZES.iter().copied().filter(|&s| s >= size).collect();
+    order.extend(SIZES.iter().rev().copied().filter(|&s| s < size));
+    let Some(path) = order.into_iter().find_map(|s| reg_string(&key, &format!("Image{s}"))) else { return null_mut() };
+    let p = HSTRING::from(path.as_str());
+    let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&p, None::<&IBindCtx>) else { return null_mut() };
+    let Ok(factory) = item.cast::<IShellItemImageFactory>() else { return null_mut() };
+    let Ok(bmp) = factory.GetImage(SIZE { cx: size, cy: size }, SIIGBF_THUMBNAILONLY) else { return null_mut() };
+    let bmp = bmp.0 as HBITMAP;
+    if !circle_mask(bmp, size) {
+        DeleteObject(bmp);
+        return null_mut();
+    }
+    bmp
+}
+
+/// SID des angemeldeten Nutzers als Zeichenkette (`S-1-5-21-…`).
+unsafe fn user_sid() -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = null_mut();
+    if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+        return None;
+    }
+    let mut buf = [0u64; 64];
+    let mut len = 0u32;
+    let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr() as _, size_of::<[u64; 64]>() as u32, &mut len);
+    CloseHandle(token);
+    if ok == 0 {
+        return None;
+    }
+    let user = &*(buf.as_ptr() as *const TOKEN_USER);
+    let mut s: windows_sys::core::PWSTR = null_mut();
+    if ConvertSidToStringSidW(user.User.Sid, &mut s) == 0 {
+        return None;
+    }
+    let len = (0..).take_while(|&i| *s.add(i) != 0).count();
+    let sid = String::from_utf16_lossy(std::slice::from_raw_parts(s, len));
+    LocalFree(s as _);
+    Some(sid)
+}
+
+/// REG_SZ unter HKLM lesen.
+unsafe fn reg_string(key: &str, name: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let mut buf = [0u16; 1024];
+    let mut bytes = size_of::<[u16; 1024]>() as u32;
+    let (k, n) = (crate::util::w16(key), crate::util::w16(name));
+    if RegGetValueW(HKEY_LOCAL_MACHINE, k.as_ptr(), n.as_ptr(), RRF_RT_REG_SZ, null_mut(), buf.as_mut_ptr() as _, &mut bytes) != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len])).filter(|s| !s.is_empty())
+}
+
+/// Bild deckend machen und auf einen Kreis zuschneiden, Rand geglättet.
+/// `false`, wenn es keine 32-bit-Bitmap in `size` ist.
+unsafe fn circle_mask(bmp: HBITMAP, size: i32) -> bool {
+    let mut bm: BITMAP = zeroed();
+    if GetObjectW(bmp, size_of::<BITMAP>() as i32, &mut bm as *mut _ as _) == 0
+        || bm.bmBits.is_null()
+        || bm.bmBitsPixel != 32
+        || bm.bmWidth != size
+        || bm.bmHeight.abs() != size
+    {
+        return false;
+    }
+    let stride = bm.bmWidthBytes as usize;
+    let px = std::slice::from_raw_parts_mut(bm.bmBits as *mut u8, stride * size as usize);
+    let (c, r) = (size as f32 / 2.0, size as f32 / 2.0);
+    for y in 0..size as usize {
+        for x in 0..size as usize {
+            let (dx, dy) = (x as f32 + 0.5 - c, y as f32 + 0.5 - c);
+            let cover = (r - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+            let a = (cover * 255.0).round() as u32;
+            let p = &mut px[y * stride + x * 4..][..4];
+            for ch in &mut p[..3] {
+                *ch = (*ch as u32 * a / 255) as u8;
+            }
+            p[3] = a as u8;
+        }
+    }
+    true
+}
+
 /// AlphaBlend erwartet vormultipliziertes Alpha; die Shell liefert je nach
 /// Quelle beides. Erkennen statt raten: Farbe > Alpha geht nur unmultipliziert.
 unsafe fn premultiply(bmp: HBITMAP) {
