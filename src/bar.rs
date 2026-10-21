@@ -74,6 +74,8 @@ pub const WM_BAR_FOCUS: u32 = WM_APP + 35;
 /// Lautstärke/Netz/Akku geändert (gepostet aus status).
 pub const WM_BAR_STATUS: u32 = WM_APP + 36;
 const WM_BAR_EVENT: u32 = WM_APP + 37;
+/// Taskleisten-Einstellungen in der Registry geändert (siehe `display::watch`).
+const WM_BAR_SETTINGS: u32 = WM_APP + 39;
 const USAGE_W: i32 = 236;
 const TASKMGR_W: i32 = 40;
 const VK_KEY_D: VIRTUAL_KEY = 0x44;
@@ -3203,6 +3205,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             dump_profile();
             0
         }
+        WM_BAR_SETTINGS => {
+            apply_taskbar_settings();
+            0
+        }
         // Wächter fragt, ob die Leiste noch Nachrichten verarbeitet.
         crate::watchdog::WM_BAR_PING => {
             crate::watchdog::pong();
@@ -3576,6 +3582,11 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
     ensure_work_area(hwnd);
     tray::announce();
     sync_monitors();
+    // Taskleisten-Einstellungen sofort übernehmen, auch ohne WM_SETTINGCHANGE.
+    let settings_target = hwnd as isize;
+    crate::display::watch(move || {
+        PostMessageW(settings_target as HWND, WM_BAR_SETTINGS, 0, 0);
+    });
     let notify_target = hwnd as isize;
     crate::usage::spawn(move || {
         PostMessageW(notify_target as HWND, WM_BAR_USAGE, 0, 0);

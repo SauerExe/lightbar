@@ -449,3 +449,39 @@ pub fn set_wanted(id: &str, on: bool) {
         save(p);
     });
 }
+
+// ------------------------------------------------ Änderungen sofort merken
+
+/// Registry-Schlüssel der Taskleisten-Einstellungen überwachen und bei jeder
+/// Änderung `notify` aufrufen. Windows schickt bei manchen Einstellungen (z. B.
+/// der Position) kein WM_SETTINGCHANGE – so wirken sie trotzdem sofort.
+pub fn watch(notify: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || unsafe {
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects, INFINITE};
+        let keys = [ADVANCED, r"Software\Microsoft\Windows\CurrentVersion\Search", r"Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3"];
+        let mut handles: Vec<(HKEY, HANDLE)> = Vec::new();
+        for k in keys {
+            let mut key: HKEY = null_mut();
+            if RegOpenKeyExW(HKEY_CURRENT_USER, w16(k).as_ptr(), 0, KEY_NOTIFY, &mut key) != ERROR_SUCCESS {
+                continue;
+            }
+            let event = CreateEventW(null(), 0, 0, null());
+            handles.push((key, event));
+        }
+        if handles.is_empty() {
+            return;
+        }
+        loop {
+            for &(key, event) in &handles {
+                RegNotifyChangeKeyValue(key, 0, REG_NOTIFY_CHANGE_LAST_SET, event, 1);
+            }
+            let events: Vec<HANDLE> = handles.iter().map(|h| h.1).collect();
+            if WaitForMultipleObjects(events.len() as u32, events.as_ptr(), 0, INFINITE) >= events.len() as u32 {
+                return;
+            }
+            // Einstellungen-App schreibt oft mehrere Werte nacheinander.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            notify();
+        }
+    });
+}
