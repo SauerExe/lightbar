@@ -277,13 +277,19 @@ pub unsafe fn room_near(anchor: RECT, gap: i32) -> (i32, i32) {
     }
 }
 
-/// Einblend-Versatz für Popups: von der Leiste weg gleiten (unten: von unten
-/// hoch, oben: von oben herab). Seitlich nur einblenden.
-pub fn pop_offset(base: i32) -> i32 {
-    match edge() {
-        Edge::Bottom => base,
-        Edge::Top => -base,
-        _ => 0,
+/// Einblend-Versatz (dx, dy) für Popups: von der Leiste weg gleiten (unten: von
+/// unten hoch, oben: von oben herab, links: von links herein, rechts: von
+/// rechts herein).
+pub fn pop_offset(base: i32) -> (i32, i32) {
+    offset_from(edge(), base)
+}
+
+fn offset_from(edge: Edge, base: i32) -> (i32, i32) {
+    match edge {
+        Edge::Bottom => (0, base),
+        Edge::Top => (0, -base),
+        Edge::Left => (-base, 0),
+        Edge::Right => (base, 0),
     }
 }
 
@@ -484,4 +490,19 @@ pub fn watch(notify: impl Fn() + Send + 'static) {
             notify();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Popups starten auf der Seite der Leiste und gleiten von ihr weg in den
+    /// Bildschirm: der Versatz zeigt immer zur Leiste hin.
+    #[test]
+    fn pop_offset_points_toward_bar() {
+        assert_eq!(offset_from(Edge::Bottom, 12), (0, 12));
+        assert_eq!(offset_from(Edge::Top, 12), (0, -12));
+        assert_eq!(offset_from(Edge::Left, 12), (-12, 0));
+        assert_eq!(offset_from(Edge::Right, 12), (12, 0));
+    }
 }
