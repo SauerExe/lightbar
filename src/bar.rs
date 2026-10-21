@@ -10,7 +10,7 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::*;
@@ -60,6 +60,12 @@ const TIMER_WORKAREA: usize = 9;
 /// Einmal kurz nach der Übernahme: Explorer blendet seine Leiste beim Wechsel
 /// auf "automatisch ausblenden" selbst wieder ein.
 const TIMER_REHIDE: usize = 10;
+/// Automatisch ausblenden: je Leiste Maus, Popups und Blinken prüfen
+/// (beim Gleiten im Bildtakt).
+const TIMER_AUTOHIDE: usize = 11;
+/// Kurz nach dem Umschalten von "automatisch ausblenden": maximierte Fenster
+/// an den neuen Arbeitsbereich anpassen.
+const TIMER_REFIT: usize = 12;
 
 /// Explorers Leiste kurz nach der Übernahme noch einmal ausblenden.
 pub unsafe fn schedule_rehide() {
@@ -2320,6 +2326,12 @@ unsafe fn docked_correctly(hwnd: HWND) -> bool {
     let m = monitor_rect(hwnd, false);
     let mut r: RECT = zeroed();
     GetWindowRect(hwnd, &mut r);
+    if autohide_on() {
+        // Ausgeblendet liegt die Leiste (teilweise) neben dem Bildschirm.
+        let edge = crate::display::edge();
+        let full = edge_rect(m, edge, t);
+        return SLIDES.with(|s| s.borrow().get(&(hwnd as isize)).is_some_and(|sl| same_rect(&sl.full, &full) && sl.applied >= 0 && same_rect(&r, &slid_rect(full, edge, sl.applied))));
+    }
     match crate::display::edge() {
         Edge::Bottom => r.bottom == m.bottom && r.bottom - r.top == t && r.left == m.left && r.right == m.right,
         Edge::Top => r.top == m.top && r.bottom - r.top == t && r.left == m.left && r.right == m.right,
@@ -2335,13 +2347,19 @@ unsafe fn dock(hwnd: HWND, dpi: u32) {
     let edge = crate::display::edge();
     let t = thickness(dpi);
     let m = monitor_rect(hwnd, false);
+    if autohide_on() {
+        // Automatisch ausblenden: kein Platz reservieren (kein ABM_SETPOS), die
+        // Leiste gleitet über den Fenstern ein und aus.
+        dock_autohide(hwnd, edge_rect(m, edge, t));
+        ensure_work_area(hwnd);
+        return;
+    }
+    if SLIDES.with(|s| s.borrow_mut().remove(&(hwnd as isize))).is_some() {
+        KillTimer(hwnd, TIMER_AUTOHIDE);
+        SetWindowRgn(hwnd, null_mut(), 1);
+    }
     let mut abd = appbar_data(hwnd);
-    abd.rc = match edge {
-        Edge::Bottom => RECT { top: m.bottom - t, ..m },
-        Edge::Top => RECT { bottom: m.top + t, ..m },
-        Edge::Left => RECT { right: m.left + t, ..m },
-        Edge::Right => RECT { left: m.right - t, ..m },
-    };
+    abd.rc = edge_rect(m, edge, t);
     // Explorer schiebt uns ggf. vor andere AppBars an dieser Kante; danach
     // wieder auf unsere Dicke bringen.
     SHAppBarMessage(ABM_QUERYPOS, &mut abd);
@@ -2355,6 +2373,320 @@ unsafe fn dock(hwnd: HWND, dpi: u32) {
     let r = abd.rc;
     MoveWindow(hwnd, r.left, r.top, r.right - r.left, r.bottom - r.top, 1);
     ensure_work_area(hwnd);
+}
+
+/// Angedockte Lage einer Leiste der Dicke `t` an `edge` des Monitors `m`.
+fn edge_rect(m: RECT, edge: crate::display::Edge, t: i32) -> RECT {
+    use crate::display::Edge;
+    match edge {
+        Edge::Bottom => RECT { top: m.bottom - t, ..m },
+        Edge::Top => RECT { bottom: m.top + t, ..m },
+        Edge::Left => RECT { right: m.left + t, ..m },
+        Edge::Right => RECT { left: m.right - t, ..m },
+    }
+}
+
+fn same_rect(a: &RECT, b: &RECT) -> bool {
+    (a.left, a.top, a.right, a.bottom) == (b.left, b.top, b.right, b.bottom)
+}
+
+// ------------------------------------------------- Automatisch ausblenden
+//
+// Wie in Windows ("Taskleiste automatisch ausblenden"): Die Leiste reserviert
+// keinen Platz und gleitet bis auf einen schmalen Streifen an den Rand. Sie
+// kommt zurück, wenn die Maus den Streifen berührt, ein Popup der Leiste
+// (Start, Kalender, Schnelleinstellungen, Menü, Vorschau) offen ist oder eine
+// App blinkt, und verschwindet kurz nachdem die Maus sie verlassen hat. Das
+// Fenster behält seine Größe; es wird nur verschoben und auf den Teil
+// beschnitten, der auf seinem Bildschirm liegt (sonst ragte es auf einen
+// angrenzenden Monitor).
+
+/// Sichtbarer Streifen einer ausgeblendeten Leiste (physische Pixel, wie Windows).
+const STRIP: i32 = 2;
+/// Dauer des Ein- bzw. Ausgleitens.
+const SLIDE_S: f32 = 0.15;
+/// So lange nach dem Verlassen der Maus bleibt die Leiste noch stehen.
+const HIDE_DELAY_MS: u128 = 400;
+const POLL_MS: u32 = 100;
+const FRAME_MS: u32 = 15;
+
+/// Automatisch ausblenden ist für alle Leisten aktiv (siehe `sync_autohide`).
+static AUTOHIDE: AtomicBool = AtomicBool::new(false);
+/// Zuletzt in der Registry gesehener Wert: 0 = noch nie gelesen, 1 = aus, 2 = an.
+static AUTOHIDE_SEEN: AtomicU8 = AtomicU8::new(0);
+
+/// Gleit-Zustand einer Leiste.
+struct Slide {
+    /// Angedockte (ganz eingeblendete) Lage.
+    full: RECT,
+    /// 0 = bis auf den Streifen weg, 1 = ganz da.
+    shown: f32,
+    /// Ziel: einblenden.
+    show: bool,
+    /// Zuletzt gab es einen Grund zum Zeigen (Maus, Popup, Blinken).
+    last_want: Instant,
+    last_step: Instant,
+    /// Gleitet gerade.
+    moving: bool,
+    /// Zuletzt gesetzte sichtbare Dicke; -1 = noch nie gesetzt.
+    applied: i32,
+}
+
+thread_local! {
+    static SLIDES: RefCell<HashMap<isize, Slide>> = RefCell::new(HashMap::new());
+}
+
+fn autohide_on() -> bool {
+    AUTOHIDE.load(Ordering::Relaxed)
+}
+
+/// Will der Nutzer die Leiste automatisch ausblenden? Grundlage ist die
+/// Windows-Einstellung (`display::autohide`). Nach der Übernahme steht Explorer
+/// aber von uns auf Ausblenden – dann gilt der gemerkte Originalzustand. Stellt
+/// der Nutzer die Einstellung um, während Lightbar läuft, wird das zum neuen
+/// Originalzustand (unser eigenes Umstellen bei der Übernahme zählt nicht).
+fn autohide_wanted() -> bool {
+    let reg = crate::display::autohide();
+    // Kurz nach der Übernahme ist "an" unser eigener Wert, egal was die
+    // Registry schon zeigt (Explorer schreibt ihn evtl. etwas später).
+    let now: u8 = if reg || crate::shell::forced_recently() { 2 } else { 1 };
+    let seen = AUTOHIDE_SEEN.swap(now, Ordering::Relaxed);
+    if seen != 0 && seen != now && crate::shell::active() && !crate::shell::forced_recently() {
+        crate::util::log(&format!("Taskleiste automatisch ausblenden in Windows umgestellt: {}", if reg { "an" } else { "aus" }));
+        crate::shell::remember_autohide(reg);
+    }
+    crate::shell::remembered_autohide().unwrap_or(reg)
+}
+
+/// Windows-Einstellung "automatisch ausblenden" übernehmen. Beim Umschalten
+/// melden sich alle Leisten neu als AppBar an: Das hebt die Platzreservierung
+/// auf bzw. setzt sie neu (`dock`).
+unsafe fn sync_autohide() {
+    let on = autohide_wanted();
+    if AUTOHIDE.swap(on, Ordering::Relaxed) == on {
+        return;
+    }
+    crate::util::log(&format!("Automatisch ausblenden: {}", if on { "an" } else { "aus" }));
+    crate::preview::hide();
+    crate::tooltip::hide();
+    for b in all_bars() {
+        let mut abd = appbar_data(b);
+        SHAppBarMessage(ABM_REMOVE, &mut abd);
+        SHAppBarMessage(ABM_NEW, &mut abd);
+        set_pos(b);
+    }
+    // Explorer zeigt seine Leiste beim Umstellen gern wieder an.
+    crate::shell::ensure_hidden();
+    crate::glow::sync();
+    SetTimer(self::hwnd(), TIMER_REFIT, 500, None);
+}
+
+/// Leiste für automatisches Ausblenden andocken: Lage merken, an die
+/// aktuelle Gleitposition legen, Zeitgeber starten.
+unsafe fn dock_autohide(hwnd: HWND, full: RECT) {
+    let now = Instant::now();
+    SLIDES.with(|s| {
+        let mut s = s.borrow_mut();
+        let sl = s.entry(hwnd as isize).or_insert(Slide { full, shown: 1.0, show: true, last_want: now, last_step: now, moving: false, applied: -1 });
+        sl.full = full;
+        sl.applied = -1;
+    });
+    apply_slide(hwnd);
+    SetTimer(hwnd, TIMER_AUTOHIDE, POLL_MS, None);
+}
+
+/// Lage der Leiste bei sichtbarer Dicke `vis`: um den Rest zum Rand hin verschoben.
+fn slid_rect(full: RECT, edge: crate::display::Edge, vis: i32) -> RECT {
+    use crate::display::Edge;
+    let t = if edge.vertical() { full.right - full.left } else { full.bottom - full.top };
+    let d = (t - vis).max(0);
+    let (dx, dy) = match edge {
+        Edge::Bottom => (0, d),
+        Edge::Top => (0, -d),
+        Edge::Left => (-d, 0),
+        Edge::Right => (d, 0),
+    };
+    RECT { left: full.left + dx, top: full.top + dy, right: full.right + dx, bottom: full.bottom + dy }
+}
+
+/// Sichtbarer Teil (Fensterkoordinaten) einer Leiste der Größe `w` × `h` bei Dicke `vis`.
+fn visible_part(edge: crate::display::Edge, w: i32, h: i32, vis: i32) -> RECT {
+    use crate::display::Edge;
+    match edge {
+        Edge::Bottom => RECT { left: 0, top: 0, right: w, bottom: vis },
+        Edge::Top => RECT { left: 0, top: h - vis, right: w, bottom: h },
+        Edge::Left => RECT { left: w - vis, top: 0, right: w, bottom: h },
+        Edge::Right => RECT { left: 0, top: 0, right: vis, bottom: h },
+    }
+}
+
+/// Sichtbare Dicke bei Fortschritt `shown` (0..1), weich beschleunigt und gebremst.
+fn slide_thickness(t: i32, shown: f32) -> i32 {
+    let p = shown.clamp(0.0, 1.0);
+    let e = p * p * (3.0 - 2.0 * p);
+    let strip = STRIP.min(t);
+    strip + ((t - strip) as f32 * e).round() as i32
+}
+
+/// Leiste an ihre Gleitposition legen (nur wenn sie sich geändert hat).
+unsafe fn apply_slide(hwnd: HWND) {
+    let edge = crate::display::edge();
+    let Some((full, vis)) = SLIDES.with(|s| {
+        let mut s = s.borrow_mut();
+        let sl = s.get_mut(&(hwnd as isize))?;
+        let t = if edge.vertical() { sl.full.right - sl.full.left } else { sl.full.bottom - sl.full.top };
+        let vis = slide_thickness(t, sl.shown);
+        if vis == sl.applied {
+            return None;
+        }
+        sl.applied = vis;
+        Some((sl.full, vis))
+    }) else {
+        return;
+    };
+    let (w, h) = (full.right - full.left, full.bottom - full.top);
+    let r = slid_rect(full, edge, vis);
+    let t = if edge.vertical() { w } else { h };
+    SetWindowPos(hwnd, null_mut(), r.left, r.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    if vis >= t {
+        SetWindowRgn(hwnd, null_mut(), 1);
+    } else {
+        let p = visible_part(edge, w, h, vis);
+        // Die Region gehört danach dem System.
+        SetWindowRgn(hwnd, CreateRectRgn(p.left, p.top, p.right, p.bottom), 1);
+    }
+}
+
+/// Ganz eingeblendet (oder gar nicht automatisch ausgeblendet)? Leuchtrand
+/// und Popups gehören nur an eine vollständig sichtbare Leiste.
+pub fn fully_shown(h: HWND) -> bool {
+    SLIDES.with(|s| s.borrow().get(&(h as isize)).map(|sl| sl.shown >= 1.0)).unwrap_or(true)
+}
+
+/// Angedockte Lage einer Leiste in Bildschirmkoordinaten – auch wenn sie
+/// gerade ausgeblendet ist. Popups richten sich danach aus.
+pub unsafe fn docked_rect(h: HWND) -> RECT {
+    if let Some(full) = SLIDES.with(|s| s.borrow().get(&(h as isize)).map(|sl| sl.full)) {
+        return full;
+    }
+    let mut r: RECT = zeroed();
+    GetWindowRect(h, &mut r);
+    r
+}
+
+/// "Animationseffekte" in Windows eingeschaltet?
+fn animations_enabled() -> bool {
+    let mut on: BOOL = 1;
+    unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &mut on as *mut BOOL as *mut c_void, 0) };
+    on != 0
+}
+
+/// Ein Popup der Leiste ist offen (Start, Kalender, Schnelleinstellungen,
+/// Überlauf, Menü).
+unsafe fn popup_open() -> bool {
+    let start = crate::start::hwnd();
+    (!start.is_null() && IsWindowVisible(start) != 0) || crate::calendar::visible() || crate::quick::visible() || tray::overflow_visible() || menus::menu_open()
+}
+
+/// Gibt es gerade einen Grund, diese Leiste zu zeigen?
+unsafe fn wants_shown(hwnd: HWND) -> bool {
+    if IsWindowVisible(hwnd) == 0 {
+        return false;
+    }
+    // Maus auf dem sichtbaren Teil: dem Streifen bzw. der Leiste.
+    let mut pt = POINT { x: 0, y: 0 };
+    GetCursorPos(&mut pt);
+    let mut r: RECT = zeroed();
+    GetWindowRect(hwnd, &mut r);
+    let m = monitor_rect(hwnd, false);
+    let mut vis: RECT = zeroed();
+    if IntersectRect(&mut vis, &r, &m) != 0 && PtInRect(&vis, pt) != 0 {
+        return true;
+    }
+    // Popups öffnen sich an der zuletzt benutzten Leiste.
+    if hwnd == anchor() && popup_open() {
+        return true;
+    }
+    let me = hwnd == self::hwnd();
+    with(|s| {
+        // Ziehen, Tastaturfokus (Win+T), Vorschau dieser Leiste.
+        s.drag.is_some()
+            || (me && s.kb_focus.is_some())
+            || (s.hover_hwnd == hwnd && crate::preview::visible())
+            // Eine App blinkt (nur Fenster mit Button, wie beim Pulsieren).
+            || s.groups.iter().any(|g| g.windows.iter().any(|w| s.attention.contains(w)))
+    })
+    .unwrap_or(false)
+}
+
+/// Ein Schritt: Gründe prüfen, Ziel setzen, ein Stück gleiten.
+unsafe fn autohide_tick(hwnd: HWND) {
+    if !autohide_on() {
+        KillTimer(hwnd, TIMER_AUTOHIDE);
+        return;
+    }
+    let want = wants_shown(hwnd);
+    let animate = animations_enabled();
+    let was_full = fully_shown(hwnd);
+    let Some((moving, hiding)) = SLIDES.with(|s| {
+        let mut s = s.borrow_mut();
+        let sl = s.get_mut(&(hwnd as isize))?;
+        let now = Instant::now();
+        if want {
+            sl.last_want = now;
+            sl.show = true;
+        } else if now.duration_since(sl.last_want).as_millis() >= HIDE_DELAY_MS {
+            sl.show = false;
+        }
+        let target = if sl.show { 1.0 } else { 0.0 };
+        // Aus dem Ruhezustand heraus nicht gleich den ganzen Abfrage-Abstand aufholen.
+        let dt = if sl.moving { now.duration_since(sl.last_step).as_secs_f32().min(0.05) } else { FRAME_MS as f32 / 1000.0 };
+        sl.last_step = now;
+        let step = if animate { dt / SLIDE_S } else { 1.0 };
+        sl.shown = if sl.shown < target { (sl.shown + step).min(target) } else { (sl.shown - step).max(target) };
+        sl.moving = sl.shown != target;
+        Some((sl.moving, !sl.show))
+    }) else {
+        KillTimer(hwnd, TIMER_AUTOHIDE);
+        return;
+    };
+    if hiding && was_full {
+        crate::tooltip::hide();
+    }
+    apply_slide(hwnd);
+    if was_full != fully_shown(hwnd) {
+        crate::glow::sync();
+    }
+    SetTimer(hwnd, TIMER_AUTOHIDE, if moving { FRAME_MS } else { POLL_MS }, None);
+}
+
+/// Nach dem Umschalten: maximierte Fenster an den Arbeitsbereich anpassen –
+/// in beide Richtungen (ohne Reservierung dürfen sie bis an den Rand).
+unsafe fn refit_maximized(bar: HWND) {
+    use crate::display::Edge;
+    let edge = crate::display::edge();
+    let work = monitor_rect(bar, true);
+    let mut windows: Vec<HWND> = Vec::new();
+    EnumWindows(Some(enum_cb), &mut windows as *mut _ as LPARAM);
+    for h in windows {
+        if IsZoomed(h) == 0 || !same_monitor(h, bar) || (borderless(h) && covers_monitor(h)) {
+            continue;
+        }
+        let mut r: RECT = zeroed();
+        GetWindowRect(h, &mut r);
+        let border = if edge.vertical() { r.bottom - work.bottom } else { work.left - r.left }.max(0);
+        let mut fixed = r;
+        match edge {
+            Edge::Bottom => fixed.bottom = work.bottom + border,
+            Edge::Top => fixed.top = work.top - border,
+            Edge::Left => fixed.left = work.left - border,
+            Edge::Right => fixed.right = work.right + border,
+        }
+        if same_rect(&fixed, &r) {
+            continue;
+        }
+        SetWindowPos(h, null_mut(), fixed.left, fixed.top, fixed.right - fixed.left, fixed.bottom - fixed.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS);
+    }
 }
 
 /// Zweitleiste an die eingestellte Kante ihres Monitors legen.
@@ -2452,6 +2784,12 @@ fn fighting_explorer() -> bool {
 /// Systemen mit mehreren Bildschirmen), setzen wir den Arbeitsbereich dieses
 /// Monitors selbst.
 unsafe fn ensure_work_area(bar: HWND) {
+    // Automatisch ausblenden: Die Leiste beansprucht keinen Platz – was wir
+    // selbst abgezogen hatten, zurückgeben.
+    if autohide_on() {
+        release_work_area(bar);
+        return;
+    }
     if IsWindowVisible(bar) == 0 {
         return;
     }
@@ -2527,10 +2865,12 @@ unsafe fn relocate() {
 }
 
 /// Taskleisten-Einstellungen von Windows neu lesen und anwenden: Ausrichtung,
-/// Bildschirme und Position. Zieht die Leiste an eine andere Kante, legen sich
+/// Bildschirme, Position und automatisches Ausblenden. Zieht die Leiste an eine andere Kante, legen sich
 /// alle Leisten neu an (Platz, Arbeitsbereich, maximierte Fenster, Leuchtrand).
 unsafe fn apply_taskbar_settings() {
-    if crate::display::reload() {
+    let moved = crate::display::reload();
+    sync_autohide();
+    if moved {
         relocate();
     }
     // Sekunden an/aus: Uhr-Takt neu stellen.
@@ -3183,6 +3523,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_TIMER if wp == TIMER_AUTOHIDE => {
+            autohide_tick(hwnd);
+            0
+        }
+        WM_TIMER if wp == TIMER_REFIT => {
+            KillTimer(hwnd, TIMER_REFIT);
+            for b in all_bars() {
+                refit_maximized(b);
+            }
+            0
+        }
         WM_TIMER if wp == TIMER_REHIDE => {
             KillTimer(hwnd, TIMER_REHIDE);
             crate::shell::ensure_hidden();
@@ -3235,8 +3586,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             update_status(hwnd);
             tray::tick();
             crate::shell::ensure_hidden();
-            // Position in Windows geändert, ohne dass eine Meldung kam?
-            if crate::display::reload() {
+            // Position oder automatisches Ausblenden in Windows geändert, ohne
+            // dass eine Meldung kam?
+            let moved = crate::display::reload();
+            sync_autohide();
+            if moved {
                 relocate();
             }
             ensure_work_area(hwnd);
@@ -3294,6 +3648,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_MOUSEMOVE => {
+            // Maus auf dem Streifen einer ausgeblendeten Leiste: sofort einblenden.
+            if autohide_on() && !fully_shown(hwnd) {
+                autohide_tick(hwnd);
+            }
             let (x, y) = xy(lp);
             if drag_move(hwnd, x, y) {
                 return 0;
@@ -3535,6 +3893,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // Lag die Zweitleiste zuletzt auf dem Hauptbildschirm (Monitor abgesteckt),
             // braucht die Hauptleiste ihren Platz jetzt wieder selbst.
             ensure_work_area(self::hwnd());
+            SLIDES.with(|s| s.borrow_mut().remove(&(hwnd as isize)));
             if let Ok(mut v) = SECONDARY.lock() {
                 v.retain(|&h| h != hwnd as isize);
             }
@@ -3618,6 +3977,8 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
             icons: null_mut(),
         })
     });
+    // Vor dem Andocken: Mit "automatisch ausblenden" wird kein Platz reserviert.
+    AUTOHIDE.store(autohide_wanted(), Ordering::Relaxed);
     let mut abd = appbar_data(hwnd);
     SHAppBarMessage(ABM_NEW, &mut abd);
     set_pos(hwnd);
@@ -3815,5 +4176,44 @@ mod vertical_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod autohide_tests {
+    use super::*;
+    use crate::display::Edge;
+
+    /// Ausgeblendet bleibt an jeder Kante genau der Streifen auf dem Monitor,
+    /// und der sichtbare Teil des Fensters liegt genau dort.
+    #[test]
+    fn strip_stays_on_screen() {
+        let m = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        for edge in [Edge::Left, Edge::Top, Edge::Right, Edge::Bottom] {
+            let t = 48;
+            let full = edge_rect(m, edge, t);
+            assert!(same_rect(&slid_rect(full, edge, t), &full));
+            let vis = slide_thickness(t, 0.0);
+            assert_eq!(vis, STRIP);
+            let r = slid_rect(full, edge, vis);
+            let (w, h) = (full.right - full.left, full.bottom - full.top);
+            let p = visible_part(edge, w, h, vis);
+            let on_screen = RECT { left: r.left + p.left, top: r.top + p.top, right: r.left + p.right, bottom: r.top + p.bottom };
+            let mut cut: RECT = unsafe { zeroed() };
+            unsafe { IntersectRect(&mut cut, &r, &m) };
+            assert!(same_rect(&on_screen, &cut), "{edge:?}");
+            assert_eq!(if edge.vertical() { cut.right - cut.left } else { cut.bottom - cut.top }, STRIP);
+        }
+    }
+
+    #[test]
+    fn slide_is_monotonic() {
+        let mut last = 0;
+        for i in 0..=20 {
+            let v = slide_thickness(48, i as f32 / 20.0);
+            assert!(v >= last);
+            last = v;
+        }
+        assert_eq!(last, 48);
     }
 }
