@@ -981,6 +981,7 @@ unsafe fn bar_menu(hwnd: HWND) {
                     Item::Check(21, "Tux", s.start_logo == StartLogo::Tux),
                 ],
             ),
+            Item::Sub("Startmenü", vec![Item::Check(22, "Profilbild anzeigen", s.start_avatar)]),
             Item::Check(14, "Uhr mit Sekunden", s.clock_seconds),
             Item::Check(15, "Claude/Codex-Usage anzeigen", s.show_usage),
             Item::Check(5, "Tray-Icons einfarbig", s.mono_tray),
@@ -1006,6 +1007,7 @@ unsafe fn bar_menu(hwnd: HWND) {
         16 => crate::settings::update(|s| s.start_logo = StartLogo::Orb),
         17 => crate::settings::update(|s| s.start_logo = StartLogo::Windows),
         21 => crate::settings::update(|s| s.start_logo = StartLogo::Tux),
+        22 => crate::settings::update(|s| s.start_avatar = !s.start_avatar),
         15 => crate::settings::update(|s| {
             s.show_usage = !s.show_usage;
             // Beide Dienste abgewählt hieße: Anzeige bleibt trotzdem unsichtbar.

@@ -62,11 +62,13 @@ pub struct Settings {
     /// Präsentationsmodus (Streamen, Bildschirm teilen): keine persönlichen
     /// Daten – Name, zuletzt verwendete Dateien, Dateitreffer, Usage.
     pub presentation: bool,
+    /// Kontobild statt Anfangsbuchstabe im Startmenü.
+    pub start_avatar: bool,
 }
 
 // Usage-Anzeige standardmäßig aus: Sie liest lokale Logins und nutzt nicht
 // offiziell dokumentierte Schnittstellen – das soll man bewusst einschalten.
-const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: false, usage_claude: true, usage_codex: true, start_logo: StartLogo::Orb, presentation: false };
+const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: false, usage_claude: true, usage_codex: true, start_logo: StartLogo::Orb, presentation: false, start_avatar: true };
 
 static CURRENT: Mutex<Option<Settings>> = Mutex::new(None);
 
@@ -108,6 +110,7 @@ fn load() -> Settings {
                     // Frühere Ja/Nein-Einstellung (bis 0.2.2).
                     "windows_logo" if on => s.start_logo = StartLogo::Windows,
                     "presentation" => s.presentation = on,
+                    "start_avatar" => s.start_avatar = on,
                     _ => {}
                 }
             }
@@ -137,7 +140,7 @@ fn save(s: &Settings) {
     let _ = std::fs::create_dir_all(&dir);
     let b = |v: bool| if v { "1" } else { "0" };
     let text = format!(
-        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\nusage_claude={}\nusage_codex={}\nstart_logo={}\npresentation={}\n",
+        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\nusage_claude={}\nusage_codex={}\nstart_logo={}\npresentation={}\nstart_avatar={}\n",
         s.glow.key(),
         b(s.mono_tray),
         b(s.clock_seconds),
@@ -145,7 +148,8 @@ fn save(s: &Settings) {
         b(s.usage_claude),
         b(s.usage_codex),
         s.start_logo.key(),
-        b(s.presentation)
+        b(s.presentation),
+        b(s.start_avatar)
     );
     let _ = std::fs::write(dir.join("settings.txt"), text);
 }

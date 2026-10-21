@@ -65,6 +65,7 @@ Honest answer, based on what was measured and built – including where it is *n
 - Hides the Windows taskbar while running and restores it on exit; maximised windows and full-screen apps are handled
 - **Watchdog** – a small companion process restarts Lightbar if it crashes or stops responding, and brings back the Windows taskbar if that keeps failing, so you are never left without a taskbar
 - Start button: Lightbar orb, Windows logo or Tux (right-click → Startsymbol)
+- Your Windows account picture in the Start menu, with the initial as fallback (right-click → Startmenü → Profilbild anzeigen; hidden in presentation mode)
 
 ## Performance
 
