@@ -320,7 +320,7 @@ fn http_error(service: &str, status: u32) -> String {
     match status {
         401 => format!("{service}: Login abgelaufen – {service} einmal starten (HTTP 401)"),
         403 => format!("{service}: Login hat keine Berechtigung für die Usage-Abfrage (HTTP 403)"),
-        429 => format!("{service}: zu viele Abfragen, später erneut (HTTP 429)"),
+        429 => format!("{service}: vom Server gedrosselt (HTTP 429) – Lightbar fragt höchstens alle 10 Minuten und wartet jetzt länger"),
         _ => format!("{service}: HTTP {status}"),
     }
 }
@@ -452,13 +452,17 @@ fn apply(slot: &mut Slot, result: Result<Limits, Failure>, t: i64) {
 /// Fällige Dienste abfragen. `manual`: auf Klick, aber nicht öfter als
 /// einmal pro Minute und nie während einer 429-Pause.
 fn run_due(manual: bool) -> bool {
-    // Ausgeschaltet: keine Login-Dateien lesen, nichts abfragen.
-    if !crate::settings::get().show_usage {
+    // Ausgeschaltet: keine Login-Dateien lesen, nichts abfragen – auch nicht für
+    // einen einzeln abgeschalteten Dienst.
+    let settings = crate::settings::get();
+    if !settings.show_usage {
         return false;
     }
+    let enabled = [settings.usage_claude, settings.usage_codex];
     let t = now();
     let due: Vec<usize> = match SLOTS.lock() {
         Ok(s) => (0..2)
+            .filter(|&i| enabled[i])
             .filter(|&i| {
                 let sl = &s[i];
                 if manual {

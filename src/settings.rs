@@ -55,6 +55,9 @@ pub struct Settings {
     pub mono_tray: bool,
     pub clock_seconds: bool,
     pub show_usage: bool,
+    /// Je Dienst abschaltbar (z. B. Claude dauerhaft gedrosselt, Codex weiter zeigen).
+    pub usage_claude: bool,
+    pub usage_codex: bool,
     pub start_logo: StartLogo,
     /// Präsentationsmodus (Streamen, Bildschirm teilen): keine persönlichen
     /// Daten – Name, zuletzt verwendete Dateien, Dateitreffer, Usage.
@@ -63,7 +66,7 @@ pub struct Settings {
 
 // Usage-Anzeige standardmäßig aus: Sie liest lokale Logins und nutzt nicht
 // offiziell dokumentierte Schnittstellen – das soll man bewusst einschalten.
-const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: false, start_logo: StartLogo::Orb, presentation: false };
+const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: false, usage_claude: true, usage_codex: true, start_logo: StartLogo::Orb, presentation: false };
 
 static CURRENT: Mutex<Option<Settings>> = Mutex::new(None);
 
@@ -99,6 +102,8 @@ fn load() -> Settings {
                     "mono_tray" => s.mono_tray = on,
                     "clock_seconds" => s.clock_seconds = on,
                     "show_usage" => s.show_usage = on,
+                    "usage_claude" => s.usage_claude = on,
+                    "usage_codex" => s.usage_codex = on,
                     "start_logo" => s.start_logo = StartLogo::parse(v).unwrap_or(s.start_logo),
                     // Frühere Ja/Nein-Einstellung (bis 0.2.2).
                     "windows_logo" if on => s.start_logo = StartLogo::Windows,
@@ -132,11 +137,13 @@ fn save(s: &Settings) {
     let _ = std::fs::create_dir_all(&dir);
     let b = |v: bool| if v { "1" } else { "0" };
     let text = format!(
-        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\nstart_logo={}\npresentation={}\n",
+        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\nusage_claude={}\nusage_codex={}\nstart_logo={}\npresentation={}\n",
         s.glow.key(),
         b(s.mono_tray),
         b(s.clock_seconds),
         b(s.show_usage),
+        b(s.usage_claude),
+        b(s.usage_codex),
         s.start_logo.key(),
         b(s.presentation)
     );

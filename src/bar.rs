@@ -495,7 +495,7 @@ unsafe fn current_layout(hwnd: HWND) -> Option<(Layout, Vec<(usize, HICON)>)> {
         hidden_tray: tray::has_hidden(),
         battery,
         primary,
-        usage: settings.show_usage && !settings.presentation,
+        usage: settings.show_usage && !settings.presentation && (settings.usage_claude || settings.usage_codex),
         align_left: crate::display::align_left(),
     });
     if primary {
@@ -1006,7 +1006,14 @@ unsafe fn bar_menu(hwnd: HWND) {
         16 => crate::settings::update(|s| s.start_logo = StartLogo::Orb),
         17 => crate::settings::update(|s| s.start_logo = StartLogo::Windows),
         21 => crate::settings::update(|s| s.start_logo = StartLogo::Tux),
-        15 => crate::settings::update(|s| s.show_usage = !s.show_usage),
+        15 => crate::settings::update(|s| {
+            s.show_usage = !s.show_usage;
+            // Beide Dienste abgewählt hieße: Anzeige bleibt trotzdem unsichtbar.
+            if s.show_usage && !s.usage_claude && !s.usage_codex {
+                s.usage_claude = true;
+                s.usage_codex = true;
+            }
+        }),
         5 => crate::settings::update(|s| s.mono_tray = !s.mono_tray),
         18 => crate::settings::update(|s| s.presentation = !s.presentation),
         3 => {
@@ -1079,7 +1086,18 @@ unsafe fn tip_text(hit: Hit) -> String {
         }
         Hit::Usage => {
             let u = crate::usage::current().unwrap_or_default();
-            format!("{}\n\n{}\n\nKlicken zum Aktualisieren, Rechtsklick zum Anmelden", crate::usage::describe("Claude", &u.claude, u.claude_at), crate::usage::describe("Codex", &u.codex, u.codex_at))
+            let s = crate::settings::get();
+            let mut parts = Vec::new();
+            if s.usage_claude {
+                parts.push(crate::usage::describe("Claude", &u.claude, u.claude_at));
+            }
+            if s.usage_codex {
+                parts.push(crate::usage::describe("Codex", &u.codex, u.codex_at));
+            }
+            parts.push("Klicken zum Aktualisieren, Rechtsklick für Anmelden und Auswahl".into());
+            parts.join("
+
+")
         }
         Hit::None => String::new(),
     }
@@ -1277,6 +1295,7 @@ unsafe fn run_in_terminal(cmd: &str) {
 /// Rechtsklick auf die Usage-Anzeige: neu anmelden, wenn ein Login
 /// abgelaufen ist ("nicht verfügbar"), oder sofort aktualisieren.
 unsafe fn usage_menu(hwnd: HWND) {
+    let s = crate::settings::get();
     let id = menus::popup(
         hwnd,
         &[
@@ -1284,6 +1303,9 @@ unsafe fn usage_menu(hwnd: HWND) {
             Item::Sep,
             Item::Cmd(2, "Bei Claude anmelden …"),
             Item::Cmd(3, "Bei Codex anmelden …"),
+            Item::Sep,
+            Item::Check(5, "Claude anzeigen", s.usage_claude),
+            Item::Check(6, "Codex anzeigen", s.usage_codex),
             Item::Sep,
             Item::Cmd(4, "Usage-Anzeige ausblenden"),
         ],
@@ -1295,6 +1317,11 @@ unsafe fn usage_menu(hwnd: HWND) {
         4 => {
             crate::settings::update(|s| s.show_usage = false);
             InvalidateRect(hwnd, null(), 0);
+        }
+        5 | 6 => {
+            crate::settings::update(|s| if id == 5 { s.usage_claude = !s.usage_claude } else { s.usage_codex = !s.usage_codex });
+            // Frisch eingeschaltet: gleich abfragen.
+            refresh_usage(hwnd);
         }
         _ => {}
     }
@@ -1936,15 +1963,19 @@ unsafe fn draw_usage(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
         round(dc, r, mix(BG, HOVER, hover), px(dpi, 6));
     }
     let u = crate::usage::current().unwrap_or_default();
-    let mid = (r.top + r.bottom) / 2;
     let line = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
-    for (i, (name, res, paused)) in [("Claude", &u.claude, u.claude_paused_until), ("Codex", &u.codex, u.codex_paused_until)].into_iter().enumerate() {
-        let row = RECT {
-            left: r.left + px(dpi, 8),
-            right: r.right - px(dpi, 8),
-            top: if i == 0 { r.top + px(dpi, 1) } else { mid },
-            bottom: if i == 0 { mid } else { r.bottom - px(dpi, 1) },
-        };
+    // Nur eingeschaltete Dienste; zeilenweise auf die Höhe verteilt.
+    let s = crate::settings::get();
+    let rows: Vec<_> = [("Claude", &u.claude, u.claude_paused_until, s.usage_claude), ("Codex", &u.codex, u.codex_paused_until, s.usage_codex)]
+        .into_iter()
+        .filter(|r| r.3)
+        .collect();
+    let n = rows.len().max(1) as i32;
+    let inner = RECT { top: r.top + px(dpi, 1), bottom: r.bottom - px(dpi, 1), ..*r };
+    for (i, (name, res, paused, _)) in rows.into_iter().enumerate() {
+        let i = i as i32;
+        let h = inner.bottom - inner.top;
+        let row = RECT { left: r.left + px(dpi, 8), right: r.right - px(dpi, 8), top: inner.top + h * i / n, bottom: inner.top + h * (i + 1) / n };
         text(dc, name, &RECT { right: row.left + px(dpi, 46), ..row }, font, SUBTEXT, line);
         let rest = RECT { left: row.left + px(dpi, 48), ..row };
         match res {
@@ -1966,8 +1997,9 @@ unsafe fn draw_usage(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
                 };
                 text(dc, &label, &RECT { left: track.right + px(dpi, 8), ..rest }, font, TEXT, line);
             }
-            // Ohne Wert, aber in 429-Pause: sagen, bis wann – statt rätselhafter Punkte.
-            _ if paused > 0 => text(dc, &format!("pausiert bis {}", clock_of(paused)), &rest, font, DIM, line),
+            // Ohne Wert, aber vom Server gedrosselt (429): sagen, bis wann – damit es
+            // nicht wie ein Fehler von Lightbar aussieht. Details im Tooltip.
+            _ if paused > 0 => text(dc, &format!("gedrosselt bis {}", clock_of(paused)), &rest, font, DIM, line),
             Some(Err(_)) => text(dc, "nicht verfügbar", &rest, font, DIM, line),
             None => text(dc, "wird abgefragt …", &rest, font, DIM, line),
         }
