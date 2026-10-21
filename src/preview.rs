@@ -86,20 +86,31 @@ pub unsafe fn show(targets: &[HWND], icon: HICON, anchor: RECT, dpi: u32) {
     }
     release_thumbs();
 
-    // Passt nicht alles nebeneinander, werden die Miniaturen kleiner.
+    // Viele Fenster: erst kleinere Miniaturen, dann mehrere Reihen – und notfalls
+    // noch kleiner, damit nichts über den Bildschirmrand ragt.
     let pad = px(dpi, PAD);
     let title_h = px(dpi, TITLE_H);
     // Platz neben der Leiste auf ihrem Bildschirm (auch Zweitleisten, jede Kante).
-    let sw = crate::display::room_near(anchor, px(dpi, 8)).0;
-    let fit = ((sw - px(dpi, 16)) / targets.len() as i32 - 2 * pad).max(px(dpi, 80));
-    let max_w = px(dpi, MAX_W).min(fit);
-    let max_h = px(dpi, MAX_H) * max_w / px(dpi, MAX_W);
+    let (room_w, room_h) = crate::display::room_near(anchor, px(dpi, 8));
+    let n = targets.len() as i32;
+    let min_w = px(dpi, 80);
+    let cols = n.min(((room_w - px(dpi, 16)) / (min_w + 2 * pad)).max(1));
+    let rows = (n + cols - 1) / cols;
+    let fit = ((room_w - px(dpi, 16)) / cols - 2 * pad).max(min_w);
+    let mut max_w = px(dpi, MAX_W).min(fit);
+    let mut max_h = px(dpi, MAX_H) * max_w / px(dpi, MAX_W);
+    let chrome = pad + title_h + pad / 2 + pad;
+    let fit_h = ((room_h - px(dpi, 16)) / rows - chrome).max(px(dpi, 24));
+    if max_h > fit_h {
+        max_w = (max_w * fit_h / max_h).max(px(dpi, 32));
+        max_h = fit_h;
+    }
     let cell_w = max_w.max(px(dpi, MIN_W).min(fit)) + 2 * pad;
     let close = px(dpi, 28);
 
     let mut items = Vec::with_capacity(targets.len());
     let mut thumb_h_max = 0;
-    for (n, &target) in targets.iter().enumerate() {
+    for (k, &target) in targets.iter().enumerate() {
         let mut thumb: isize = 0;
         let registered = DwmRegisterThumbnail(h, target, &mut thumb) == 0;
         let mut src: SIZE = zeroed();
@@ -119,7 +130,7 @@ pub unsafe fn show(targets: &[HWND], icon: HICON, anchor: RECT, dpi: u32) {
             ((src.cx as f32 * scale) as i32, (src.cy as f32 * scale) as i32)
         };
         thumb_h_max = thumb_h_max.max(th);
-        let x0 = n as i32 * cell_w;
+        let x0 = (k as i32 % cols) * cell_w;
         let top = pad + title_h + pad / 2;
         items.push(Item {
             target,
@@ -131,15 +142,20 @@ pub unsafe fn show(targets: &[HWND], icon: HICON, anchor: RECT, dpi: u32) {
             placeholder,
         });
     }
-    let hgt = pad + title_h + pad / 2 + thumb_h_max + pad;
-    for item in &mut items {
-        item.cell.bottom = hgt;
-        // Unterschiedlich hohe Miniaturen unten bündig ausrichten.
-        let off = thumb_h_max - (item.thumb_rect.bottom - item.thumb_rect.top);
+    // Reihen gleich hoch; Miniaturen in ihrer Reihe unten bündig.
+    let row_h = pad + title_h + pad / 2 + thumb_h_max + pad;
+    for (k, item) in items.iter_mut().enumerate() {
+        let y0 = (k as i32 / cols) * row_h;
+        item.cell.top = y0;
+        item.cell.bottom = y0 + row_h;
+        let off = y0 + thumb_h_max - (item.thumb_rect.bottom - item.thumb_rect.top);
         item.thumb_rect.top += off;
         item.thumb_rect.bottom += off;
+        item.close_rect.top += y0;
+        item.close_rect.bottom += y0;
     }
-    let w = cell_w * items.len() as i32;
+    let w = cell_w * cols;
+    let hgt = row_h * rows;
 
     with(|s| {
         if s.dpi != dpi {
@@ -225,10 +241,10 @@ unsafe fn paint(hwnd: HWND) {
             for item in &s.items {
                 let hovering = inside(&item.cell, s.mouse.0, s.mouse.1);
                 if hovering && s.items.len() > 1 {
-                    let c = RECT { left: item.cell.left + 2, top: 2, right: item.cell.right - 2, bottom: item.cell.bottom - 2 };
+                    let c = RECT { left: item.cell.left + 2, top: item.cell.top + 2, right: item.cell.right - 2, bottom: item.cell.bottom - 2 };
                     round(dc, &c, rgb(58, 58, 58), px(d, 6));
                 }
-                let row = RECT { left: item.cell.left + pad, top: pad, right: item.cell.right - pad, bottom: pad + px(d, TITLE_H) };
+                let row = RECT { left: item.cell.left + pad, top: item.cell.top + pad, right: item.cell.right - pad, bottom: item.cell.top + pad + px(d, TITLE_H) };
                 let is = px(d, 16);
                 DrawIconEx(dc, row.left + px(d, 4), row.top + (row.bottom - row.top - is) / 2, s.icon, is, is, 0, null_mut(), DI_NORMAL);
                 let text_right = if hovering { item.close_rect.left - px(d, 4) } else { row.right };
