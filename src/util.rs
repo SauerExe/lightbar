@@ -407,3 +407,12 @@ pub unsafe fn set_clipboard_text(owner: HWND, s: &str) {
     }
     CloseClipboard();
 }
+
+/// Rechteck in Client-Koordinaten von `hwnd` → Bildschirmkoordinaten.
+pub unsafe fn rect_to_screen(hwnd: HWND, r: RECT) -> RECT {
+    let mut a = POINT { x: r.left, y: r.top };
+    let mut b = POINT { x: r.right, y: r.bottom };
+    ClientToScreen(hwnd, &mut a);
+    ClientToScreen(hwnd, &mut b);
+    RECT { left: a.x, top: a.y, right: b.x, bottom: b.y }
+}

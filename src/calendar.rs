@@ -258,7 +258,9 @@ pub unsafe fn toggle() {
     let mut br: RECT = zeroed();
     GetWindowRect(bar, &mut br);
     let (w, hh) = (px(dpi, W), px(dpi, H));
-    crate::anim::pop_in(h, br.right - w - px(dpi, 12), br.top - px(dpi, 12) - hh, w, hh, px(dpi, 18));
+    // Am Ende der Leiste (rechts bzw. bei einer seitlichen Leiste unten).
+    let (x, y) = crate::display::place_near(br, w, hh, px(dpi, 12), crate::display::Along::End);
+    crate::anim::pop_in(h, x, y, w, hh, crate::display::pop_offset(px(dpi, 18)));
     force_foreground(h);
     InvalidateRect(h, null(), 0);
 }

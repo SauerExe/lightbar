@@ -57,6 +57,8 @@ struct State {
     /// Linker Rand und Breite aller Monitore zusammen: Farbverlauf und Komet
     /// laufen als ein Band von links nach rechts über alle Leisten.
     span: (i32, i32),
+    /// Leiste oben: Leuchten unterhalb, nach unten ausstrahlend.
+    flip: bool,
     hover_x: Option<i32>,
     /// Geglättete Hover-Position und -Stärke, damit das Glühen mitgleitet.
     hover_pos: f32,
@@ -148,7 +150,11 @@ unsafe fn ensure_buffer(sf: &mut Surface, w: i32, h: i32) {
 /// An alle sichtbaren Leisten anlegen bzw. ausblenden (Vollbild, abgeschaltet).
 pub unsafe fn sync() {
     let Some((inst, mut old)) = with(|s| (s.inst, std::mem::take(&mut s.surfaces))) else { return };
-    let bars: Vec<HWND> = if crate::settings::get().glow != GlowStyle::Off {
+    // Seitliche Leisten bekommen (noch) keinen Leuchtrand: das Band müsste
+    // gedreht gerendert werden.
+    let edge = crate::display::edge();
+    let flip = edge == crate::display::Edge::Top;
+    let bars: Vec<HWND> = if crate::settings::get().glow != GlowStyle::Off && !edge.vertical() {
         crate::bar::all_bars().into_iter().filter(|&b| !b.is_null() && IsWindowVisible(b) != 0).collect()
     } else {
         Vec::new()
@@ -174,7 +180,7 @@ pub unsafe fn sync() {
         };
         ensure_buffer(&mut sf, w, h);
         sf.x = br.left;
-        sf.y = br.top - glow_h;
+        sf.y = if flip { br.bottom - px(dpi, LINE_H) } else { br.top - glow_h };
         SetWindowPos(sf.hwnd, HWND_TOPMOST, sf.x, sf.y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         surfaces.push(sf);
     }
@@ -187,6 +193,7 @@ pub unsafe fn sync() {
         s.surfaces = surfaces;
         s.dpi = dpi;
         s.span = span;
+        s.flip = flip;
     });
     // Ein Takt für alle Fenster, am ersten Leuchtfenster.
     let prev = TIMER_OWNER.with(|t| t.replace(first));
@@ -267,6 +274,7 @@ unsafe fn frame() {
         let d = s.dpi;
         let scale = d as f32 / 96.0;
         let (span_l, span_w) = (s.span.0 as f32, s.span.1 as f32);
+        let flip = s.flip;
 
         // Hover-Glühen gleitet der Maus hinterher und blendet weich ein/aus
         // (alles in Bildschirmkoordinaten).
@@ -331,7 +339,9 @@ unsafe fn frame() {
                 for y in 0..h {
                     // Unten die Linie, darüber weiches Ausstrahlen (y = 0 ist der obere Rand).
                     let a = if y >= glow { line_alpha } else { (i * fade[y as usize]).min(1.0) };
-                    let idx = ((y * w + x) * 4) as usize;
+                    // Oben: gespiegelt (Linie an der Leiste oben, Ausstrahlen nach unten).
+                    let row = if flip { h - 1 - y } else { y };
+                    let idx = ((row * w + x) * 4) as usize;
                     // Vormultipliziertes BGRA für UpdateLayeredWindow.
                     pixels[idx] = (b * a) as u8;
                     pixels[idx + 1] = (g * a) as u8;
@@ -386,6 +396,7 @@ pub unsafe fn create(inst: HINSTANCE) {
             dc,
             surfaces: Vec::new(),
             span: (0, 1),
+            flip: false,
             hover_x: None,
             hover_pos: 0.0,
             hover_amt: 0.0,

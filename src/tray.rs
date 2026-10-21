@@ -589,9 +589,7 @@ unsafe extern "system" fn overflow_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 o.cells.iter().find(|c| c.1 == index).map(|c| (c.0, index, o.dpi))
             });
             if let Some((r, index, dpi)) = hit {
-                let mut pt = POINT { x: (r.left + r.right) / 2, y: 0 };
-                ClientToScreen(hwnd, &mut pt);
-                crate::tooltip::show(&tip(index), pt.x, pt.y, dpi);
+                crate::tooltip::show(&tip(index), rect_to_screen(hwnd, r), dpi);
             }
             0
         }
@@ -673,8 +671,8 @@ pub unsafe fn create_overflow(inst: HINSTANCE) {
     HWND_OVERFLOW.store(hwnd, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Überlauf über dem Pfeil (Bildschirmkoordinaten der Pfeilmitte / Leistenoberkante) öffnen/schließen.
-pub unsafe fn toggle_overflow(center_x: i32, bar_top: i32, dpi: u32) {
+/// Überlauf neben dem Pfeil (`anchor`, Bildschirmkoordinaten) öffnen/schließen.
+pub unsafe fn toggle_overflow(anchor: RECT, dpi: u32) {
     use crate::util::*;
     let hwnd = HWND_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed);
     if hwnd.is_null() {
@@ -689,7 +687,8 @@ pub unsafe fn toggle_overflow(center_x: i32, bar_top: i32, dpi: u32) {
     let rows = n.div_ceil(COLS) as i32;
     OVERFLOW.with(|o| o.borrow_mut().dpi = dpi);
     let (w, h) = (cols * px(dpi, CELL) + px(dpi, 16), rows * px(dpi, CELL) + px(dpi, 16));
-    crate::anim::pop_in(hwnd, center_x - w / 2, bar_top - h - px(dpi, 8), w, h, px(dpi, 12));
+    let (x, y) = crate::display::place_near(anchor, w, h, px(dpi, 8), crate::display::Along::Center);
+    crate::anim::pop_in(hwnd, x, y, w, h, crate::display::pop_offset(px(dpi, 12)));
     MOUSE_WAS_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
     SetTimer(hwnd, TIMER_OUTSIDE, 50, None);
     InvalidateRect(hwnd, std::ptr::null(), 0);

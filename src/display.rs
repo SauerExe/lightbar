@@ -45,17 +45,126 @@ static ALIGN: AtomicU8 = AtomicU8::new(0);
 /// Fehlt der Wert, gilt der Windows-11-Standard (mittig). Zwischengespeichert,
 /// weil das Layout bei jeder Mausbewegung berechnet wird; `reload` liest neu.
 pub fn align_left() -> bool {
-    match ALIGN.load(Ordering::Relaxed) {
-        0 => reload(),
-        a => a == 2,
+    if ALIGN.load(Ordering::Relaxed) == 0 {
+        reload();
+    }
+    ALIGN.load(Ordering::Relaxed) == 2
+}
+
+/// Bildschirmkante der Taskleiste.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edge {
+    Left,
+    Top,
+    Right,
+    Bottom,
+}
+
+impl Edge {
+    /// Links oder rechts: Die Leiste ist eine Spalte.
+    pub fn vertical(self) -> bool {
+        matches!(self, Edge::Left | Edge::Right)
+    }
+    /// Wert für APPBARDATA::uEdge (ABE_LEFT … ABE_BOTTOM).
+    pub fn abe(self) -> u32 {
+        self as u32
+    }
+    fn from(v: u32) -> Option<Edge> {
+        [Edge::Left, Edge::Top, Edge::Right, Edge::Bottom].get(v as usize).copied()
     }
 }
 
-/// Nach WM_SETTINGCHANGE: Ausrichtung neu lesen. Gibt den neuen Wert zurück.
+/// 0 = noch nicht gelesen, sonst Kante + 1.
+static EDGE: AtomicU8 = AtomicU8::new(0);
+
+/// Position der Taskleiste aus den Windows-Einstellungen ("Taskleistenposition
+/// auf dem Bildschirm", `TaskbarLocation` – 0 links, 1 oben, 2 rechts,
+/// 3 unten). Ältere Windows-Versionen speichern sie nur in `StuckRects3`
+/// (Byte 12, gleiche Werte); fehlt beides: unten.
+pub fn edge() -> Edge {
+    if EDGE.load(Ordering::Relaxed) == 0 {
+        reload();
+    }
+    Edge::from(EDGE.load(Ordering::Relaxed) as u32 - 1).unwrap_or(Edge::Bottom)
+}
+
+fn read_edge() -> Edge {
+    if let Some(e) = reg_dword("TaskbarLocation").and_then(Edge::from) {
+        return e;
+    }
+    unsafe {
+        let mut buf = [0u8; 64];
+        let mut size = buf.len() as u32;
+        let key = w16("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StuckRects3");
+        let ok = RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), w16("Settings").as_ptr(), RRF_RT_REG_BINARY, null_mut(), buf.as_mut_ptr() as *mut _, &mut size);
+        if ok == ERROR_SUCCESS && size > 12 {
+            if let Some(e) = Edge::from(buf[12] as u32) {
+                return e;
+            }
+        }
+    }
+    Edge::Bottom
+}
+
+/// Nach WM_SETTINGCHANGE: Ausrichtung und Position neu lesen. `true`, wenn
+/// sich die Position geändert hat (dann müssen die Leisten umziehen).
 pub fn reload() -> bool {
     let left = reg_dword("TaskbarAl") == Some(0);
     ALIGN.store(if left { 2 } else { 1 }, Ordering::Relaxed);
-    left
+    let edge = read_edge() as u8 + 1;
+    EDGE.swap(edge, Ordering::Relaxed) != edge
+}
+
+/// Wo ein Popup entlang der Leiste sitzt: am Anfang (links bzw. oben), in der
+/// Mitte oder am Ende (rechts bzw. unten) des Ankers.
+#[derive(Clone, Copy)]
+pub enum Along {
+    Start,
+    Center,
+    End,
+}
+
+/// Popup der Größe `w` × `h` neben `anchor` (Leiste oder ein Element darauf,
+/// Bildschirmkoordinaten) platzieren – auf der Seite der Leiste, die zum
+/// Bildschirm zeigt: über einer unteren Leiste, unter einer oberen, neben einer
+/// seitlichen. Bleibt auf dem Bildschirm des Ankers.
+pub unsafe fn place_near(anchor: RECT, w: i32, h: i32, gap: i32, along: Along) -> (i32, i32) {
+    let m = crate::util::work_area_at((anchor.left + anchor.right) / 2, (anchor.top + anchor.bottom) / 2);
+    let pos = |lo: i32, hi: i32, size: i32| match along {
+        Along::Start => lo + gap,
+        Along::Center => (lo + hi - size) / 2,
+        Along::End => hi - gap - size,
+    };
+    let clamp = |v: i32, lo: i32, hi: i32, size: i32| v.clamp(lo + gap.min(8), (hi - gap.min(8) - size).max(lo));
+    let (x, y) = match edge() {
+        Edge::Bottom => (pos(anchor.left, anchor.right, w), anchor.top - gap - h),
+        Edge::Top => (pos(anchor.left, anchor.right, w), anchor.bottom + gap),
+        Edge::Left => (anchor.right + gap, pos(anchor.top, anchor.bottom, h)),
+        Edge::Right => (anchor.left - gap - w, pos(anchor.top, anchor.bottom, h)),
+    };
+    (clamp(x, m.left, m.right, w), clamp(y, m.top, m.bottom, h))
+}
+
+/// Platz für ein Popup neben `anchor` auf dessen Bildschirm: (Breite, Höhe).
+pub unsafe fn room_near(anchor: RECT, gap: i32) -> (i32, i32) {
+    let m = crate::util::work_area_at((anchor.left + anchor.right) / 2, (anchor.top + anchor.bottom) / 2);
+    let (w, h) = (m.right - m.left - 2 * gap, m.bottom - m.top - 2 * gap);
+    match edge() {
+        Edge::Bottom => (w, anchor.top - m.top - 2 * gap),
+        Edge::Top => (w, m.bottom - anchor.bottom - 2 * gap),
+        Edge::Left => (m.right - anchor.right - 2 * gap, h),
+        Edge::Right => (anchor.left - m.left - 2 * gap, h),
+    }
+}
+
+/// Einblend-Versatz für Popups: von der Leiste weg gleiten (unten: von unten
+/// hoch, oben: von oben herab). Seitlich nur einblenden.
+pub fn pop_offset(base: i32) -> i32 {
+    match edge() {
+        Edge::Bottom => base,
+        Edge::Top => -base,
+        _ => 0,
+    }
 }
 
 /// Windows-Einstellung "Taskleiste auf allen Bildschirmen anzeigen".

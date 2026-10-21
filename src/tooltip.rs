@@ -61,8 +61,9 @@ pub unsafe fn create(inst: HINSTANCE) {
     HWND_TIP.store(hwnd, Ordering::Relaxed);
 }
 
-/// Tooltip mittig über `center_x` mit Unterkante knapp über `top_y` zeigen.
-pub unsafe fn show(s: &str, center_x: i32, top_y: i32, dpi: u32) {
+/// Tooltip neben `anchor` (Bildschirmkoordinaten) zeigen: über einem Element
+/// einer unteren Leiste, unter einem einer oberen, neben einem einer seitlichen.
+pub unsafe fn show(s: &str, anchor: RECT, dpi: u32) {
     let hwnd = HWND_TIP.load(Ordering::Relaxed);
     if hwnd.is_null() || s.is_empty() {
         return;
@@ -88,14 +89,11 @@ pub unsafe fn show(s: &str, center_x: i32, top_y: i32, dpi: u32) {
     SelectObject(dc, of);
     ReleaseDC(null_mut(), dc);
     let (tw, th) = (r.right + px(dpi, 20), r.bottom + px(dpi, 12));
-    let mut x = center_x - tw / 2;
-    let m = work_area_at(center_x, top_y - 1);
-    x = x.clamp(m.left + px(dpi, 4), (m.right - tw - px(dpi, 4)).max(m.left));
-    let y = top_y - th - px(dpi, 8);
+    let (x, y) = crate::display::place_near(anchor, tw, th, px(dpi, 8), crate::display::Along::Center);
     if IsWindowVisible(hwnd) != 0 {
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, tw, th, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     } else {
-        crate::anim::pop_in(hwnd, x, y, tw, th, px(dpi, 6));
+        crate::anim::pop_in(hwnd, x, y, tw, th, crate::display::pop_offset(px(dpi, 6)));
     }
     InvalidateRect(hwnd, null(), 0);
 }

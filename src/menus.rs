@@ -61,16 +61,36 @@ pub unsafe fn popup(owner: HWND, items: &[Item]) -> usize {
     let menu = build(items);
     let mut pt: POINT = zeroed();
     GetCursorPos(&mut pt);
-    // Menüs unserer Leisten (Haupt- oder Zweitleiste) öffnen über der Leiste.
+    // Menüs unserer Leisten (Haupt- oder Zweitleiste) öffnen auf der Seite der
+    // Leiste, die zum Bildschirm zeigt – wie bei Windows.
+    let mut align = TPM_BOTTOMALIGN;
     if crate::bar::is_bar(owner) {
+        use crate::display::Edge;
         let mut r: RECT = zeroed();
         GetWindowRect(owner, &mut r);
-        pt.y = r.top;
+        align = match crate::display::edge() {
+            Edge::Bottom => {
+                pt.y = r.top;
+                TPM_BOTTOMALIGN
+            }
+            Edge::Top => {
+                pt.y = r.bottom;
+                TPM_TOPALIGN
+            }
+            Edge::Left => {
+                pt.x = r.right;
+                TPM_LEFTALIGN | TPM_TOPALIGN
+            }
+            Edge::Right => {
+                pt.x = r.left;
+                TPM_RIGHTALIGN | TPM_TOPALIGN
+            }
+        };
     }
     // Ohne Vordergrund schließt das Menü bei Klick daneben nicht.
     force_foreground(owner);
     MENU_OPEN.store(true, Ordering::Relaxed);
-    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, owner, null());
+    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | align, pt.x, pt.y, 0, owner, null());
     MENU_OPEN.store(false, Ordering::Relaxed);
     PostMessageW(owner, WM_NULL, 0, 0);
     DestroyMenu(menu);

@@ -72,8 +72,8 @@ pub fn visible() -> bool {
     unsafe { !h.is_null() && IsWindowVisible(h) != 0 }
 }
 
-/// Vorschau für die Fenster `targets` zeigen; `center_x`/`bar_top` in Bildschirmkoordinaten.
-pub unsafe fn show(targets: &[HWND], icon: HICON, center_x: i32, bar_top: i32, dpi: u32) {
+/// Vorschau für die Fenster `targets` neben `anchor` (Button, Bildschirmkoordinaten).
+pub unsafe fn show(targets: &[HWND], icon: HICON, anchor: RECT, dpi: u32) {
     let h = hwnd();
     let targets: Vec<HWND> = targets.iter().copied().filter(|&t| IsWindow(t) != 0).collect();
     if h.is_null() || targets.is_empty() {
@@ -89,9 +89,8 @@ pub unsafe fn show(targets: &[HWND], icon: HICON, center_x: i32, bar_top: i32, d
     // Passt nicht alles nebeneinander, werden die Miniaturen kleiner.
     let pad = px(dpi, PAD);
     let title_h = px(dpi, TITLE_H);
-    // Bildschirm der Leiste, über der die Vorschau aufgeht (auch Zweitleisten).
-    let m = work_area_at(center_x, bar_top - 1);
-    let sw = m.right - m.left;
+    // Platz neben der Leiste auf ihrem Bildschirm (auch Zweitleisten, jede Kante).
+    let sw = crate::display::room_near(anchor, px(dpi, 8)).0;
     let fit = ((sw - px(dpi, 16)) / targets.len() as i32 - 2 * pad).max(px(dpi, 80));
     let max_w = px(dpi, MAX_W).min(fit);
     let max_h = px(dpi, MAX_H) * max_w / px(dpi, MAX_W);
@@ -154,13 +153,12 @@ pub unsafe fn show(targets: &[HWND], icon: HICON, center_x: i32, bar_top: i32, d
         s.items = items;
     });
 
-    let x = (center_x - w / 2).clamp(m.left + px(dpi, 4), (m.right - w - px(dpi, 4)).max(m.left));
-    let y = bar_top - hgt - px(dpi, 8);
-    // Beim Wechsel zwischen Buttons nur verschieben, sonst hochgleiten.
+    let (x, y) = crate::display::place_near(anchor, w, hgt, px(dpi, 8), crate::display::Along::Center);
+    // Beim Wechsel zwischen Buttons nur verschieben, sonst einblenden.
     if visible() {
         SetWindowPos(h, HWND_TOPMOST, x, y, w, hgt, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     } else {
-        crate::anim::pop_in(h, x, y, w, hgt, px(dpi, 12));
+        crate::anim::pop_in(h, x, y, w, hgt, crate::display::pop_offset(px(dpi, 12)));
     }
 
     with(|s| {
