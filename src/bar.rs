@@ -3457,6 +3457,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if ex.is_null() {
                 return 0;
             }
+            if let Some(r) = forward_appbar(ex, wp, lp) {
+                return r;
+            }
             let mut result: usize = 0;
             SendMessageTimeoutW(ex, WM_COPYDATA, wp, lp, SMTO_ABORTIFHUNG, 3000, &mut result);
             result as LRESULT
@@ -4248,4 +4251,76 @@ mod autohide_tests {
         }
         assert_eq!(last, 48);
     }
+}
+
+// ------------------------------------------------- AppBar-Weiterleitung
+
+/// APPBARDATA, wie die Shell es zwischen Prozessen transportiert (hWnd 32 Bit,
+/// lParam 64 Bit).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AppBarData32 {
+    cb_size: u32,
+    hwnd: u32,
+    callback: u32,
+    edge: u32,
+    rc: RECT,
+    lparam: i64,
+}
+
+/// APPBARMSGDATAV3: Inhalt des WM_COPYDATA (dwData = 0) an Shell_TrayWnd.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AppBarMsg {
+    abd: AppBarData32,
+    message: u32,
+    _pad: u32,
+    shared: u64,
+    pid: u32,
+    _pad2: u32,
+}
+
+const _: () = assert!(size_of::<AppBarData32>() == 0x28 && size_of::<AppBarMsg>() == 0x40);
+
+/// AppBar-Nachrichten mit Ergebnisblock (QUERYPOS, SETPOS, GETTASKBARPOS) an
+/// Explorer weiterreichen. Weil Lightbar das erste Shell_TrayWnd ist, legt
+/// shell32 den Block für Lightbars Prozess an – bei eigenen Aufrufen sogar nur
+/// als Heap-Zeiger. Explorer kann ihn nicht öffnen und verwirft SETPOS still;
+/// dann zieht er keine AppBar vom Arbeitsbereich ab. Also den Block für
+/// Explorer neu anlegen und das Ergebnis zurückkopieren (wie ManagedShell).
+unsafe fn forward_appbar(ex: HWND, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
+    let cds = &*(lp as *const COPYDATASTRUCT);
+    if cds.dwData != 0 || cds.cbData as usize != size_of::<AppBarMsg>() || cds.lpData.is_null() {
+        return None;
+    }
+    let mut m: AppBarMsg = std::ptr::read_unaligned(cds.lpData as *const AppBarMsg);
+    if !matches!(m.message, ABM_QUERYPOS | ABM_SETPOS | ABM_GETTASKBARPOS) || m.shared == 0 {
+        return None;
+    }
+    let mut ex_pid = 0u32;
+    GetWindowThreadProcessId(ex, &mut ex_pid);
+    let old = SHLockShared(m.shared as HANDLE, m.pid) as *mut AppBarData32;
+    if old.is_null() {
+        return Some(0);
+    }
+    let new = SHAllocShared(old as *const c_void, size_of::<AppBarData32>() as u32, ex_pid);
+    if new.is_null() {
+        SHUnlockShared(old as *const c_void);
+        return Some(0);
+    }
+    m.shared = new as u64;
+    m.pid = ex_pid;
+    let fwd = COPYDATASTRUCT { dwData: 0, cbData: size_of::<AppBarMsg>() as u32, lpData: &mut m as *mut _ as *mut c_void };
+    let mut result = 0usize;
+    SendMessageTimeoutW(ex, WM_COPYDATA, wp, &fwd as *const _ as LPARAM, SMTO_ABORTIFHUNG, 3000, &mut result);
+    // QUERYPOS/SETPOS: Explorer passt das Rechteck ggf. an.
+    let back = SHLockShared(new, ex_pid) as *const AppBarData32;
+    if !back.is_null() {
+        *old = *back;
+        SHUnlockShared(back as *const c_void);
+    }
+    SHUnlockShared(old as *const c_void);
+    SHFreeShared(new, ex_pid);
+    Some(result as LRESULT)
 }
