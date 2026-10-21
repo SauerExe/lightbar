@@ -3271,6 +3271,38 @@ unsafe fn paint(hwnd: HWND) {
                 let cx = (r.left + r.right) / 2;
                 let cy = (r.top + r.bottom) / 2 - px(dpi, 2);
                 DrawIconEx(dc, cx - size / 2, cy - size / 2, *icon, size, size, 0, null_mut(), DI_NORMAL);
+                // Was die App über ITaskbarList3 meldet: Zähler-Symbol unten
+                // rechts am Icon, Fortschritt als Balken darunter.
+                let (overlay, progress) = crate::taskband::badge(windows);
+                if !overlay.is_null() {
+                    let os = px(dpi, 16);
+                    DrawIconEx(dc, cx + size / 2 - os + px(dpi, 4), cy + size / 2 - os + px(dpi, 4), overlay, os, os, 0, null_mut(), DI_NORMAL);
+                }
+                if let Some(p) = progress {
+                    use crate::taskband::{PROGRESS_MAX, TBPF_ERROR, TBPF_INDETERMINATE, TBPF_PAUSED};
+                    let track = RECT { left: r.left + px(dpi, 8), top: r.bottom - px(dpi, 8), right: r.right - px(dpi, 8), bottom: r.bottom - px(dpi, 5) };
+                    let tw = track.right - track.left;
+                    let h = track.bottom - track.top;
+                    round(dc, &track, rgb(70, 70, 70), h);
+                    let color = if p.state & TBPF_ERROR != 0 {
+                        rgb(232, 17, 35)
+                    } else if p.state & TBPF_PAUSED != 0 {
+                        rgb(255, 185, 0)
+                    } else {
+                        rgb(6, 176, 37)
+                    };
+                    let bar = if p.state & TBPF_INDETERMINATE != 0 {
+                        // Wanderndes Stück für "unbestimmt".
+                        let seg = tw * 3 / 10;
+                        let x = ((t * 0.8).fract() * (tw + seg) as f32) as i32 - seg;
+                        RECT { left: track.left + x.max(0), right: track.left + (x + seg).min(tw), ..track }
+                    } else {
+                        RECT { right: track.left + (tw as i64 * p.value as i64 / PROGRESS_MAX as i64) as i32, ..track }
+                    };
+                    if bar.right > bar.left {
+                        round(dc, &bar, color, h);
+                    }
+                }
             }
             let iw = anim.ind.get(id).copied().unwrap_or(0.0).round() as i32;
             if iw >= 1 {
