@@ -85,6 +85,9 @@ enum Hit {
     Task(usize),
     Tray(usize),
     Chevron,
+    /// Suche und Aufgabenansicht (wie in Windows eingeschaltet).
+    Search,
+    TaskView,
     /// "…": Apps, für die in der Leiste kein Platz mehr ist.
     More,
     Status,
@@ -284,6 +287,12 @@ struct Layout {
     show_usage: bool,
     taskmgr: RECT,
     start: RECT,
+    /// Suche (leer, wenn in Windows ausgeschaltet) und wie: 1 Symbol, 2 Suchfeld,
+    /// 3 Symbol mit Beschriftung.
+    search: RECT,
+    search_mode: u32,
+    /// Aufgabenansicht (leer, wenn ausgeschaltet).
+    taskview: RECT,
     /// Kann kürzer sein als die Gruppenliste, wenn nicht alle Buttons passen.
     tasks: Vec<RECT>,
     tray: Vec<RECT>,
@@ -293,6 +302,23 @@ struct Layout {
     status: RECT,
     clock: RECT,
     desktop: RECT,
+}
+
+/// Maße der Leiste (logische Pixel): normal oder mit kleineren Schaltflächen
+/// (Windows-Einstellung "Kleinere Taskleistenschaltflächen anzeigen").
+struct Metrics {
+    bar_h: i32,
+    btn_w: i32,
+    btn_h: i32,
+    icon: i32,
+}
+
+const fn metrics(small: bool) -> Metrics {
+    if small {
+        Metrics { bar_h: 40, btn_w: 36, btn_h: 32, icon: 20 }
+    } else {
+        Metrics { bar_h: BAR_H, btn_w: BTN_W, btn_h: BTN_H, icon: ICON }
+    }
 }
 
 struct LayoutInput {
@@ -313,6 +339,11 @@ struct LayoutInput {
     primary: bool,
     usage: bool,
     align_left: bool,
+    /// Kleinere Schaltflächen (Windows-Einstellung).
+    small: bool,
+    /// Suche: 0 aus, 1 Symbol, 2 Suchfeld, 3 Symbol mit Beschriftung.
+    search: u32,
+    task_view: bool,
 }
 
 /// Kleinste Buttonbreite, bevor Buttons wegfallen (Symbol 24 px + Rand).
@@ -328,9 +359,10 @@ fn layout(i: &LayoutInput) -> Layout {
     }
     let (w, dpi) = (i.width, i.dpi);
     let gap = px(dpi, BTN_GAP);
-    let h = px(dpi, BAR_H);
-    let top = (h - px(dpi, BTN_H)) / 2;
-    let bottom = top + px(dpi, BTN_H);
+    let m = metrics(i.small);
+    let h = px(dpi, m.bar_h);
+    let top = (h - px(dpi, m.btn_h)) / 2;
+    let bottom = top + px(dpi, m.btn_h);
     let empty = RECT { left: 0, top, right: 0, bottom };
 
     // Rechte Seite von außen nach innen.
@@ -359,16 +391,38 @@ fn layout(i: &LayoutInput) -> Layout {
     };
 
     let count = i.n_tasks as i32 + 1;
-    let need = |bw: i32| count * bw + (count - 1) * gap;
+    // Suche und Aufgabenansicht hinter Start, wie in Windows eingeschaltet
+    // (Suchfeld breit, Symbol mit Beschriftung mittel, sonst wie ein Button).
+    let search_w = |mode: u32, bw: i32| match mode {
+        0 => 0,
+        1 => bw,
+        2 => px(dpi, 160),
+        _ => px(dpi, 104),
+    };
+    let extra = |mode: u32, tv: bool, bw: i32| {
+        let s = search_w(mode, bw);
+        (if s > 0 { s + gap } else { 0 }) + if tv { bw + gap } else { 0 }
+    };
+    let need = |mode: u32, tv: bool, bw: i32| count * bw + (count - 1) * gap + extra(mode, tv, bw);
     let room = |usage: bool, shown: usize| right_start(shown) - left_end(usage) - 2 * gap;
-    let (mut usage, mut shown, mut bw) = (i.primary && i.usage, n_tray, px(dpi, BTN_W));
-    while need(bw) > room(usage, shown) {
+    let (mut usage, mut shown, mut bw, mut search, mut task_view) = (i.primary && i.usage, n_tray, px(dpi, m.btn_w), i.search, i.task_view);
+    let min_bw = px(dpi, BTN_MIN_W);
+    // Ausweichen in dieser Reihenfolge; Suche und Aufgabenansicht fallen erst
+    // weg, wenn selbst die schmalsten Buttons nicht passen (Apps gehen vor).
+    while need(search, task_view, bw) > room(usage, shown) {
         if shown > 0 {
             shown -= 1;
         } else if usage {
             usage = false;
+        } else if search >= 2 {
+            search = 1; // Suchfeld wird zum Symbol.
+        } else if bw > min_bw {
+            bw = ((room(usage, shown) - extra(search, task_view, bw) + gap) / count - gap).clamp(min_bw, bw - 1);
+        } else if task_view {
+            task_view = false;
+        } else if search > 0 {
+            search = 0;
         } else {
-            bw = ((room(usage, shown) + gap) / count - gap).max(px(dpi, BTN_MIN_W));
             break;
         }
     }
@@ -377,20 +431,23 @@ fn layout(i: &LayoutInput) -> Layout {
     // nie über die Elemente links und rechts hinaus.
     let lo = left_end(usage) + gap;
     let hi = right_start(shown) - gap;
-    let fit = (((hi - lo + gap) / (bw + gap)).max(1) as usize).min(count as usize);
-    let total = need(bw).min(fit as i32 * (bw + gap) - gap);
+    let fixed = extra(search, task_view, bw);
+    let fit = (((hi - lo - fixed + gap) / (bw + gap)).max(1) as usize).min(count as usize);
+    let total = (count * bw + (count - 1) * gap).min(fit as i32 * (bw + gap) - gap) + fixed;
     let mut x = if i.align_left { lo } else { ((w - total) / 2).clamp(lo, (hi - total).max(lo)) };
-    let mut next = || {
-        let r = RECT { left: x, top, right: x + bw, bottom };
-        x += bw + gap;
+    let mut next = |width: i32| {
+        let r = RECT { left: x, top, right: x + width, bottom };
+        x += width + gap;
         r
     };
-    let start = next();
+    let start = next(bw);
+    let search_r = if search > 0 { next(search_w(search, bw)) } else { empty };
+    let taskview = if task_view { next(bw) } else { empty };
     // Passen nicht alle, wird der letzte Platz zum "…"-Knopf für den Rest.
     let overflow = fit - 1 < i.n_tasks && fit >= 2;
     let n_shown = if overflow { fit - 2 } else { (fit - 1).min(i.n_tasks) };
-    let tasks = (0..n_shown).map(|_| next()).collect();
-    let more = overflow.then(|| next());
+    let tasks = (0..n_shown).map(|_| next(bw)).collect();
+    let more = overflow.then(|| next(bw));
 
     let tray_l = tray_r - shown as i32 * tw;
     let tray = (0..shown as i32).map(|n| RECT { left: tray_l + n * tw, top, right: tray_l + (n + 1) * tw, bottom }).collect();
@@ -403,7 +460,7 @@ fn layout(i: &LayoutInput) -> Layout {
     } else {
         empty
     };
-    Layout { usage: usage_r, show_usage: usage, taskmgr, start, tasks, tray, chevron, more, status, clock, desktop }
+    Layout { usage: usage_r, show_usage: usage, taskmgr, start, search: search_r, search_mode: search, taskview, tasks, tray, chevron, more, status, clock, desktop }
 }
 
 /// Aufteilung einer senkrechten Leiste (links oder rechts): oben der
@@ -432,23 +489,40 @@ fn layout_vertical(i: &LayoutInput) -> Layout {
     let tray_top = |shown: usize| status.top - px(dpi, 4) - tray_rows(shown) * cell;
 
     let top_end = if i.primary { px(dpi, 8) + px(dpi, TASKMGR_W) } else { 0 };
-    let count = i.n_tasks as i32 + 1;
-    let need = |bh: i32| count * bh + (count - 1) * gap;
+    // Start, dann Suche (als Symbol) und Aufgabenansicht, wenn eingeschaltet.
+    // Bleibt für die Apps nicht einmal der "…"-Knopf, fallen erst die
+    // Aufgabenansicht, dann die Suche weg (Apps gehen vor).
+    let need = |count: i32, bh: i32| count * bh + (count - 1) * gap;
     let room = |shown: usize| tray_top(shown) - top_end - 2 * gap;
-    let (mut shown, mut bh) = (n_tray, px(dpi, BTN_H));
-    while need(bh) > room(shown) {
-        if shown > 0 {
-            shown -= 1;
-        } else {
-            bh = ((room(shown) + gap) / count - gap).max(px(dpi, BTN_MIN_W));
-            break;
+    let (mut srch, mut tv) = (i.search > 0, i.task_view);
+    let (shown, bh, fit, fixed) = loop {
+        let fixed = srch as i32 + tv as i32;
+        let count = i.n_tasks as i32 + 1 + fixed;
+        let (mut shown, mut bh) = (n_tray, px(dpi, metrics(i.small).btn_h));
+        while need(count, bh) > room(shown) {
+            if shown > 0 {
+                shown -= 1;
+            } else {
+                bh = ((room(shown) + gap) / count - gap).max(px(dpi, BTN_MIN_W));
+                break;
+            }
         }
-    }
+        let fit = (((tray_top(shown) - gap - (top_end + gap) + gap) / (bh + gap)).max(1) as usize).min(count as usize);
+        if i.n_tasks > 0 && fit < 2 + fixed as usize && (tv || srch) {
+            if tv {
+                tv = false;
+            } else {
+                srch = false;
+            }
+            continue;
+        }
+        break (shown, bh, fit, fixed);
+    };
 
     let lo = top_end + gap;
     let hi = tray_top(shown) - gap;
-    let fit = (((hi - lo + gap) / (bh + gap)).max(1) as usize).min(count as usize);
-    let total = need(bh).min(fit as i32 * (bh + gap) - gap);
+    let count = i.n_tasks as i32 + 1 + fixed;
+    let total = need(count, bh).min(fit as i32 * (bh + gap) - gap);
     let mut y = if i.align_left { lo } else { ((len - total) / 2).clamp(lo, (hi - total).max(lo)) };
     let mut next = || {
         let r = row(y, bh);
@@ -456,8 +530,12 @@ fn layout_vertical(i: &LayoutInput) -> Layout {
         r
     };
     let start = next();
-    let overflow = fit - 1 < i.n_tasks && fit >= 2;
-    let n_shown = if overflow { fit - 2 } else { (fit - 1).min(i.n_tasks) };
+    let search = if srch { next() } else { empty };
+    let taskview = if tv { next() } else { empty };
+    // Plätze für Apps nach Start, Suche und Aufgabenansicht.
+    let avail = fit.saturating_sub(1 + fixed as usize);
+    let overflow = avail < i.n_tasks && avail >= 1;
+    let n_shown = if overflow { avail - 1 } else { avail.min(i.n_tasks) };
     let tasks = (0..n_shown).map(|_| next()).collect();
     let more = overflow.then(|| next());
 
@@ -472,7 +550,7 @@ fn layout_vertical(i: &LayoutInput) -> Layout {
     let first = chevron.is_some() as i32;
     let tray = (0..shown as i32).map(|n| at(first + n)).collect();
     let taskmgr = if i.primary { row(px(dpi, 8), px(dpi, TASKMGR_W)) } else { empty };
-    Layout { usage: empty, show_usage: false, taskmgr, start, tasks, tray, chevron, more, status, clock, desktop }
+    Layout { usage: empty, show_usage: false, taskmgr, start, search, search_mode: srch as u32, taskview, tasks, tray, chevron, more, status, clock, desktop }
 }
 
 /// Layout einer Leiste und die Tray-Icons, die darin Platz haben. Tray-Icons,
@@ -497,6 +575,11 @@ unsafe fn current_layout(hwnd: HWND) -> Option<(Layout, Vec<(usize, HICON)>)> {
         primary,
         usage: settings.show_usage && !settings.presentation && (settings.usage_claude || settings.usage_codex),
         align_left: crate::display::align_left(),
+        small: crate::display::small_buttons(),
+        // Suche und Aufgabenansicht nur auf der Hauptleiste (wie bei Windows
+        // zeigen Zweitleisten nur Start und Apps).
+        search: if primary { crate::display::search_mode() } else { 0 },
+        task_view: primary && crate::display::task_view_button(),
     });
     if primary {
         tray::set_shown(l.tray.len());
@@ -509,6 +592,12 @@ unsafe fn hit_at(hwnd: HWND, x: i32, y: i32) -> Hit {
     let Some((l, tray)) = current_layout(hwnd) else { return Hit::None };
     if inside(&l.start, x, y) {
         return Hit::Start;
+    }
+    if inside(&l.search, x, y) {
+        return Hit::Search;
+    }
+    if inside(&l.taskview, x, y) {
+        return Hit::TaskView;
     }
     if let Some(i) = l.tasks.iter().position(|r| inside(r, x, y)) {
         return Hit::Task(i);
@@ -528,7 +617,8 @@ unsafe fn hit_at(hwnd: HWND, x: i32, y: i32) -> Hit {
     if inside(&l.clock, x, y) {
         return Hit::Clock;
     }
-    if inside(&l.desktop, x, y) {
+    // "Ecke ganz rechts für den Desktop" in Windows abgeschaltet: keine Wirkung.
+    if crate::display::desktop_corner() && inside(&l.desktop, x, y) {
         return Hit::Desktop;
     }
     if inside(&l.taskmgr, x, y) {
@@ -1026,7 +1116,7 @@ unsafe fn bar_menu(hwnd: HWND) {
                 ],
             ),
             Item::Sub("Startmenü", vec![Item::Check(22, "Profilbild anzeigen", s.start_avatar)]),
-            Item::Check(14, "Uhr mit Sekunden", s.clock_seconds),
+            Item::Check(14, "Uhr mit Sekunden", clock_seconds()),
             Item::Check(15, "Claude/Codex-Usage anzeigen", s.show_usage),
             Item::Check(5, "Tray-Icons einfarbig", s.mono_tray),
             Item::Check(18, "Präsentationsmodus", s.presentation),
@@ -1044,7 +1134,10 @@ unsafe fn bar_menu(hwnd: HWND) {
         12 => crate::glow::set_style(GlowStyle::Neon),
         13 => crate::glow::set_style(GlowStyle::Off),
         14 => {
-            crate::settings::update(|s| s.clock_seconds = !s.clock_seconds);
+            // Gleiche Einstellung wie in Windows (Personalisierung → Taskleiste).
+            let on = !clock_seconds();
+            crate::settings::update(|s| s.clock_seconds = on);
+            crate::display::set_clock_seconds(on);
             // Der Uhr-Takt läuft an der Hauptleiste, auch wenn das Menü auf einer Zweitleiste kam.
             schedule_clock(self::hwnd());
         }
@@ -1104,6 +1197,8 @@ unsafe fn tip_text(hit: Hit) -> String {
         Hit::Tray(i) => tray::tip(i),
         Hit::Chevron => "Ausgeblendete Symbole anzeigen".into(),
         Hit::More => "Weitere Apps".into(),
+        Hit::Search => "Suchen".into(),
+        Hit::TaskView => "Aufgabenansicht".into(),
         Hit::Status => {
             let Some(s) = with(|s| s.status.clone()).flatten() else { return String::new() };
             let net = match &s.net {
@@ -1157,6 +1252,8 @@ unsafe fn rect_of(hwnd: HWND, hit: Hit) -> Option<RECT> {
         Hit::Tray(i) => tray.iter().position(|t| t.0 == i).map(|p| l.tray[p]),
         Hit::Chevron => l.chevron,
         Hit::More => l.more,
+        Hit::Search => Some(l.search),
+        Hit::TaskView => Some(l.taskview),
         Hit::Status => Some(l.status),
         Hit::Clock => Some(l.clock),
         Hit::Desktop => Some(l.desktop),
@@ -1260,12 +1357,17 @@ fn dump_profile() {
     }
 }
 
+/// Uhr mit Sekunden: wie in Windows eingestellt, sonst Lightbars eigene Einstellung.
+fn clock_seconds() -> bool {
+    crate::display::clock_seconds().unwrap_or_else(|| crate::settings::get().clock_seconds)
+}
+
 /// Uhr-Zeitgeber auf den nächsten Sekunden- bzw. Minutenwechsel stellen.
 unsafe fn schedule_clock(hwnd: HWND) {
     let mut st: SYSTEMTIME = zeroed();
     GetLocalTime(&mut st);
     let ms = st.wMilliseconds as u32;
-    let due = if crate::settings::get().clock_seconds { 1000 - ms } else { (60 - st.wSecond as u32) * 1000 - ms };
+    let due = if clock_seconds() { 1000 - ms } else { (60 - st.wSecond as u32) * 1000 - ms };
     SetTimer(hwnd, TIMER_TICK, due.max(20), None);
 }
 
@@ -1495,6 +1597,12 @@ pub fn ui_elements() -> Vec<UiElement> {
         }
         push(Hit::TaskMgr, "taskmgr".into(), tip_text(Hit::TaskMgr).replace('\n', ", "), "Task-Manager öffnen", l.taskmgr);
         push(Hit::Start, "start".into(), "Start".into(), "Startmenü öffnen", l.start);
+        if l.search.right > l.search.left {
+            push(Hit::Search, "search".into(), "Suchen".into(), "Apps, Einstellungen und Dateien suchen", l.search);
+        }
+        if l.taskview.right > l.taskview.left {
+            push(Hit::TaskView, "taskview".into(), "Aufgabenansicht".into(), "Fenster und Desktops anzeigen", l.taskview);
+        }
         for (i, g) in groups.iter().enumerate() {
             let Some(&r) = l.tasks.get(i) else { continue };
             let state = match g.windows.len() {
@@ -1518,7 +1626,9 @@ pub fn ui_elements() -> Vec<UiElement> {
         }
         push(Hit::Status, "status".into(), tip_text(Hit::Status).replace('\n', ", "), "Schnelleinstellungen öffnen", l.status);
         push(Hit::Clock, "clock".into(), tip_text(Hit::Clock), "Kalender öffnen", l.clock);
-        push(Hit::Desktop, "desktop".into(), "Desktop anzeigen".into(), "Alle Fenster minimieren", l.desktop);
+        if crate::display::desktop_corner() {
+            push(Hit::Desktop, "desktop".into(), "Desktop anzeigen".into(), "Alle Fenster minimieren", l.desktop);
+        }
         out
     }
 }
@@ -1623,6 +1733,8 @@ fn hit_id(hit: Hit, groups: &[Group]) -> Option<String> {
         Hit::Tray(i) => format!("t:{i}"),
         Hit::Chevron => "chevron".into(),
         Hit::More => "more".into(),
+        Hit::Search => "search".into(),
+        Hit::TaskView => "taskview".into(),
         Hit::Status => "status".into(),
         Hit::Clock => "clock".into(),
         Hit::Usage => "usage".into(),
@@ -2135,7 +2247,7 @@ fn thickness(dpi: u32) -> i32 {
     if crate::display::edge().vertical() {
         px(dpi, BAR_W_V)
     } else {
-        px(dpi, BAR_H)
+        px(dpi, metrics(crate::display::small_buttons()).bar_h)
     }
 }
 
@@ -2315,6 +2427,8 @@ unsafe fn apply_taskbar_settings() {
     if crate::display::reload() {
         relocate();
     }
+    // Sekunden an/aus: Uhr-Takt neu stellen.
+    schedule_clock(self::hwnd());
     sync_monitors();
     for b in all_bars() {
         InvalidateRect(b, null(), 0);
@@ -2555,7 +2669,7 @@ unsafe fn draw_clock(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
     let narrow = r.right - r.left < px(dpi, CLOCK_W);
     let flags = if narrow { DT_CENTER } else { DT_RIGHT } | DT_SINGLELINE;
     let cr = if narrow { *r } else { RECT { right: r.right - px(dpi, 10), ..*r } };
-    let time = if crate::settings::get().clock_seconds {
+    let time = if clock_seconds() {
         format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
     } else {
         format!("{:02}:{:02}", st.wHour, st.wMinute)
@@ -2647,8 +2761,32 @@ unsafe fn paint(hwnd: HWND) {
         hover_bg(dc, &l.start, hv("start"));
         draw_logo(dc, &l.start, dpi);
 
+        // Suche (Symbol, Suchfeld oder Symbol mit Beschriftung) und Aufgabenansicht.
+        if l.search.right > l.search.left {
+            let r = l.search;
+            let line = DT_VCENTER | DT_SINGLELINE;
+            if l.search_mode == 2 {
+                let field = RECT { top: r.top + px(dpi, 4), bottom: r.bottom - px(dpi, 4), ..r };
+                round(dc, &field, mix(rgb(45, 45, 45), HOVER, hv("search")), (field.bottom - field.top) / 2);
+                text(dc, "\u{E721}", &RECT { left: field.left + px(dpi, 12), right: field.left + px(dpi, 32), ..field }, icons, DIM, DT_CENTER | line);
+                text(dc, "Suchen", &RECT { left: field.left + px(dpi, 38), ..field }, font, DIM, DT_LEFT | line | DT_END_ELLIPSIS);
+            } else {
+                hover_bg(dc, &r, hv("search"));
+                if l.search_mode == 3 {
+                    text(dc, "\u{E721}", &RECT { left: r.left + px(dpi, 8), right: r.left + px(dpi, 30), ..r }, icons, TEXT, DT_CENTER | line);
+                    text(dc, "Suchen", &RECT { left: r.left + px(dpi, 34), ..r }, font, TEXT, DT_LEFT | line | DT_END_ELLIPSIS);
+                } else {
+                    text(dc, "\u{E721}", &r, icons, TEXT, DT_CENTER | line);
+                }
+            }
+        }
+        if l.taskview.right > l.taskview.left {
+            hover_bg(dc, &l.taskview, hv("taskview"));
+            text(dc, "\u{E7C4}", &l.taskview, icons, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
         let fg = GetForegroundWindow();
-        let is = px(dpi, ICON);
+        let is = px(dpi, metrics(crate::display::small_buttons()).icon);
         for (i, (id, windows, icon, attention)) in groups.iter().enumerate() {
             let Some(base) = l.tasks.get(i) else { continue };
             // Weich nachrutschende Position.
@@ -2761,7 +2899,7 @@ unsafe fn paint(hwnd: HWND) {
         }
 
         // "Desktop anzeigen": dünne Kante ganz rechts, blendet ein.
-        let k = hv("desktop");
+        let k = if crate::display::desktop_corner() { hv("desktop") } else { 0.0 };
         if k > 0.01 {
             let line = RECT { left: l.desktop.left + px(dpi, 3), top: l.desktop.top + px(dpi, 12), right: l.desktop.left + px(dpi, 4), bottom: l.desktop.bottom - px(dpi, 12) };
             fill(dc, &line, mix(BG, DIM, k));
@@ -2790,7 +2928,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // HSHELL_FLASH (0x8006): Fenster will Aufmerksamkeit; Aktivierung beendet das.
         let target = lp as HWND;
         match wp as u32 {
-            0x8006 => {
+            // "Blinken von Apps" in Windows abgeschaltet: nicht pulsieren.
+            0x8006 if crate::display::flashing() => {
                 with(|s| if !s.attention.contains(&target) { s.attention.push(target) });
             }
             // 0x8004 = HSHELL_RUDEAPPACTIVATED (fehlt in windows-sys)
@@ -3161,6 +3300,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                 }
                 Hit::More => more_menu(hwnd),
+                Hit::Search => crate::start::toggle(true),
+                Hit::TaskView => send_keys(&[(VK_LWIN, false), (VK_TAB, false), (VK_TAB, true), (VK_LWIN, true)]),
                 Hit::None => {}
             }
             InvalidateRect(hwnd, null(), 0);
@@ -3229,7 +3370,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Hit::Status => status_menu(hwnd),
                 Hit::Clock => clock_menu(hwnd),
                 Hit::Usage => usage_menu(hwnd),
-                Hit::Desktop | Hit::TaskMgr | Hit::None => bar_menu(hwnd),
+                Hit::Desktop | Hit::TaskMgr | Hit::Search | Hit::TaskView | Hit::None => bar_menu(hwnd),
             }
             InvalidateRect(hwnd, null(), 0);
             0
@@ -3403,8 +3544,9 @@ mod tests {
             for dpi in [96, 120, 144, 168, 192] {
                 for n_tasks in [0, 3, 8, 15, 25, 40] {
                     for n_tray in [0, 4, 12] {
+                        let small = (n_tasks + n_tray + dpi as usize) % 2 == 1;
                         for (primary, usage, align_left, hidden_tray) in [(true, true, false, true), (true, false, true, false), (true, true, true, false), (false, false, false, false), (false, false, true, false)] {
-                            let i = LayoutInput { width, vertical: false, length: px(dpi, BAR_H), dpi, n_tasks, n_tray, hidden_tray, battery: true, primary, usage, align_left };
+                            let i = LayoutInput { width, vertical: false, length: px(dpi, BAR_H), dpi, n_tasks, n_tray, hidden_tray, battery: true, primary, usage, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0 };
                             let l = layout(&i);
                             let ctx = format!("w={width} dpi={dpi} tasks={n_tasks} tray={n_tray} primary={primary} usage={usage} left={align_left}");
                             let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr)];
@@ -3469,8 +3611,9 @@ mod vertical_tests {
                 let width = px(dpi, BAR_W_V);
                 for n_tasks in [0, 5, 12, 25, 40] {
                     for n_tray in [0, 3, 10] {
+                        let small = (n_tasks + n_tray + dpi as usize) % 2 == 1;
                         for (primary, align_left, hidden_tray) in [(true, false, true), (true, true, false), (false, false, false)] {
-                            let i = LayoutInput { width, vertical: true, length, dpi, n_tasks, n_tray, hidden_tray, battery: true, primary, usage: true, align_left };
+                            let i = LayoutInput { width, vertical: true, length, dpi, n_tasks, n_tray, hidden_tray, battery: true, primary, usage: true, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0 };
                             let l = layout(&i);
                             let ctx = format!("len={length} dpi={dpi} tasks={n_tasks} tray={n_tray} primary={primary} top={align_left}");
                             let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr), ("desktop", l.desktop)];

@@ -9,7 +9,7 @@
 
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::*;
@@ -106,13 +106,114 @@ fn read_edge() -> Edge {
     Edge::Bottom
 }
 
-/// Nach WM_SETTINGCHANGE: Ausrichtung und Position neu lesen. `true`, wenn
-/// sich die Position geändert hat (dann müssen die Leisten umziehen).
+/// Nach WM_SETTINGCHANGE: Ausrichtung, Position und die übrigen
+/// Taskleisten-Einstellungen neu lesen. `true`, wenn sich die Position oder die
+/// Schaltflächengröße geändert hat (dann müssen die Leisten neu angelegt werden).
 pub fn reload() -> bool {
     let left = reg_dword("TaskbarAl") == Some(0);
     ALIGN.store(if left { 2 } else { 1 }, Ordering::Relaxed);
     let edge = read_edge() as u8 + 1;
-    EDGE.swap(edge, Ordering::Relaxed) != edge
+    let moved = EDGE.swap(edge, Ordering::Relaxed) != edge;
+    let flags = read_flags();
+    let old = FLAGS.swap(flags, Ordering::Relaxed);
+    moved || (old & SMALL) != (flags & SMALL)
+}
+
+// ------------------------------------- Weitere Taskleisten-Einstellungen
+
+/// Gelesen bei `reload`; Bits wie unten, 0 = noch nicht gelesen.
+static FLAGS: AtomicU32 = AtomicU32::new(0);
+const READ: u32 = 1;
+const SMALL: u32 = 1 << 1;
+const SECONDS_SET: u32 = 1 << 2;
+const SECONDS: u32 = 1 << 3;
+const DESKTOP_CORNER: u32 = 1 << 4;
+const FLASHING: u32 = 1 << 5;
+const TASK_VIEW: u32 = 1 << 6;
+const SEARCH_SHIFT: u32 = 8;
+
+fn read_flags() -> u32 {
+    let mut f = READ;
+    // "Kleinere Taskleistenschaltflächen anzeigen".
+    if reg_dword("TaskbarSmallIcons") == Some(1) {
+        f |= SMALL;
+    }
+    // "Sekunden in der Uhr im Infobereich anzeigen".
+    if let Some(v) = reg_dword("ShowSecondsInSystemClock") {
+        f |= SECONDS_SET | if v != 0 { SECONDS } else { 0 };
+    }
+    // "Ecke ganz rechts auswählen, um den Desktop anzuzeigen" (Standard an).
+    if reg_dword("TaskbarSd") != Some(0) {
+        f |= DESKTOP_CORNER;
+    }
+    // "Blinken von Apps in der Taskleiste anzeigen" (Standard an).
+    if reg_dword("TaskbarFlashing") != Some(0) {
+        f |= FLASHING;
+    }
+    // Taskleistenelemente: Aufgabenansicht (Standard an) und Suche
+    // (0 aus, 1 Symbol, 2 Suchfeld, 3 Symbol mit Beschriftung; Standard Symbol).
+    if reg_dword("ShowTaskViewButton") != Some(0) {
+        f |= TASK_VIEW;
+    }
+    let search = reg_dword_at("Software\\Microsoft\\Windows\\CurrentVersion\\Search", "SearchboxTaskbarMode").unwrap_or(1).min(3);
+    f | (search << SEARCH_SHIFT)
+}
+
+fn flags() -> u32 {
+    if FLAGS.load(Ordering::Relaxed) == 0 {
+        reload();
+    }
+    FLAGS.load(Ordering::Relaxed)
+}
+
+/// Kleinere Taskleistenschaltflächen.
+pub fn small_buttons() -> bool {
+    flags() & SMALL != 0
+}
+
+/// Sekunden in der Uhr – wenn in Windows eingestellt, sonst `None`.
+pub fn clock_seconds() -> Option<bool> {
+    let f = flags();
+    (f & SECONDS_SET != 0).then_some(f & SECONDS != 0)
+}
+
+/// Sekunden in der Uhr in Windows einstellen (Lightbars Menüpunkt schreibt
+/// dieselbe Einstellung, damit beide nicht auseinanderlaufen).
+pub fn set_clock_seconds(on: bool) {
+    unsafe {
+        let v: u32 = on as u32;
+        RegSetKeyValueW(HKEY_CURRENT_USER, w16(ADVANCED).as_ptr(), w16("ShowSecondsInSystemClock").as_ptr(), REG_DWORD, &v as *const u32 as *const _, 4);
+    }
+    reload();
+}
+
+/// Ecke ganz rechts zeigt den Desktop.
+pub fn desktop_corner() -> bool {
+    flags() & DESKTOP_CORNER != 0
+}
+
+/// Apps dürfen blinken (Aufmerksamkeit).
+pub fn flashing() -> bool {
+    flags() & FLASHING != 0
+}
+
+/// Schaltfläche "Aufgabenansicht" anzeigen.
+pub fn task_view_button() -> bool {
+    flags() & TASK_VIEW != 0
+}
+
+/// Suche in der Taskleiste: 0 aus, 1 Symbol, 2 Suchfeld, 3 Symbol mit Beschriftung.
+pub fn search_mode() -> u32 {
+    (flags() >> SEARCH_SHIFT) & 3
+}
+
+fn reg_dword_at(key: &str, name: &str) -> Option<u32> {
+    unsafe {
+        let mut value = 0u32;
+        let mut size = size_of::<u32>() as u32;
+        let ok = RegGetValueW(HKEY_CURRENT_USER, w16(key).as_ptr(), w16(name).as_ptr(), RRF_RT_REG_DWORD, null_mut(), &mut value as *mut u32 as *mut _, &mut size);
+        (ok == ERROR_SUCCESS).then_some(value)
+    }
 }
 
 /// Wo ein Popup entlang der Leiste sitzt: am Anfang (links bzw. oben), in der
