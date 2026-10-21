@@ -1117,6 +1117,8 @@ unsafe fn bar_menu(hwnd: HWND) {
             ),
             Item::Sub("Startmenü", vec![Item::Check(22, "Profilbild anzeigen", s.start_avatar)]),
             Item::Check(14, "Uhr mit Sekunden", clock_seconds()),
+            Item::Check(23, "Suche anzeigen", crate::display::search_mode() > 0),
+            Item::Check(24, "Aufgabenansicht anzeigen", crate::display::task_view_button()),
             Item::Check(15, "Claude/Codex-Usage anzeigen", s.show_usage),
             Item::Check(5, "Tray-Icons einfarbig", s.mono_tray),
             Item::Check(18, "Präsentationsmodus", s.presentation),
@@ -1145,6 +1147,9 @@ unsafe fn bar_menu(hwnd: HWND) {
         17 => crate::settings::update(|s| s.start_logo = StartLogo::Windows),
         21 => crate::settings::update(|s| s.start_logo = StartLogo::Tux),
         22 => crate::settings::update(|s| s.start_avatar = !s.start_avatar),
+        // Schreiben dieselben Windows-Einstellungen (Personalisierung → Taskleiste).
+        23 => crate::display::set_search(crate::display::search_mode() == 0),
+        24 => crate::display::set_task_view(!crate::display::task_view_button()),
         15 => crate::settings::update(|s| {
             s.show_usage = !s.show_usage;
             // Beide Dienste abgewählt hieße: Anzeige bleibt trotzdem unsichtbar.

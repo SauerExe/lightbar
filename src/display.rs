@@ -187,6 +187,25 @@ pub fn set_clock_seconds(on: bool) {
     reload();
 }
 
+/// Suche in der Taskleiste ein- (als Suchfeld) oder ausschalten – dieselbe
+/// Windows-Einstellung wie unter Personalisierung → Taskleiste.
+pub fn set_search(on: bool) {
+    let v: u32 = if on { 2 } else { 0 };
+    unsafe {
+        RegSetKeyValueW(HKEY_CURRENT_USER, w16("Software\\Microsoft\\Windows\\CurrentVersion\\Search").as_ptr(), w16("SearchboxTaskbarMode").as_ptr(), REG_DWORD, &v as *const u32 as *const _, 4);
+    }
+    reload();
+}
+
+/// Schaltfläche "Aufgabenansicht" ein- oder ausschalten (Windows-Einstellung).
+pub fn set_task_view(on: bool) {
+    let v: u32 = on as u32;
+    unsafe {
+        RegSetKeyValueW(HKEY_CURRENT_USER, w16(ADVANCED).as_ptr(), w16("ShowTaskViewButton").as_ptr(), REG_DWORD, &v as *const u32 as *const _, 4);
+    }
+    reload();
+}
+
 /// Ecke ganz rechts zeigt den Desktop.
 pub fn desktop_corner() -> bool {
     flags() & DESKTOP_CORNER != 0
