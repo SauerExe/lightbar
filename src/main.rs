@@ -11,6 +11,7 @@ mod bar;
 mod calendar;
 mod display;
 mod glow;
+mod jumplist;
 mod keyhook;
 mod menus;
 mod preview;
@@ -81,7 +82,19 @@ fn main() {
             let id = std::env::args().nth(2).unwrap_or_default();
             let n = apps::jump_list(&id, 8).len();
             if let Some(dir) = util::data_dir() {
-                let _ = std::fs::write(dir.join("jumplist-test.txt"), format!("{id}: {n} Einträge\n"));
+                // Eigene Kategorien und Aufgaben: Titel und Ziel (nur lokal, zum Prüfen).
+                let cats = jumplist::load(&[id.clone()]);
+                let mut text = format!("{id}: {n} zuletzt/häufig, Datei {}
+", jumplist::app_id_hash(&id));
+                for c in &cats {
+                    text += &format!("[{}]
+", if c.name.is_empty() { "Aufgaben" } else { &c.name });
+                    for e in &c.entries {
+                        text += &format!("  {} -> {} {}
+", if e.title.is_empty() { "----" } else { &e.title }, e.target, e.args);
+                    }
+                }
+                let _ = std::fs::write(dir.join("jumplist-test.txt"), text);
             }
             return;
         }

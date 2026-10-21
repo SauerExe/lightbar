@@ -790,6 +790,31 @@ unsafe fn launch(g: &Group) {
 /// Sprungliste ("Zuletzt verwendet") einer Gruppe: über ihre AppUserModelID
 /// oder – bei Desktop-Apps ohne eigene – über die ID im App-Katalog.
 /// Im Präsentationsmodus leer (Dateinamen sind privat).
+/// Eine Sprunglisten-Kategorie ins Menü: Überschrift, Einträge (IDs ab 200 in
+/// der Reihenfolge von `labels`), Trennlinien.
+fn push_jump<'a>(items: &mut Vec<Item<'a>>, c: &crate::jumplist::Category, title: &'a str, labels: &'a [String], n: &mut usize) {
+    items.push(Item::Label(title));
+    for e in &c.entries {
+        if e.title.is_empty() {
+            items.push(Item::Sep);
+        } else {
+            items.push(Item::Cmd(200 + *n, &labels[*n]));
+        }
+        *n += 1;
+    }
+    items.push(Item::Sep);
+}
+
+/// Kennungen, unter denen Windows die Sprunglisten einer App ablegt: ihre
+/// AppUserModelID oder – ohne eine – die Startmenü-Kennung bzw. der Pfad der exe.
+fn app_ids_of(g: &Group) -> Vec<String> {
+    if let Some(id) = g.key.strip_prefix("aumid:") {
+        return vec![id.to_string()];
+    }
+    let exe = g.exe.clone();
+    [exe.as_deref().and_then(crate::start::app_id_for_exe), exe].into_iter().flatten().collect()
+}
+
 fn jump_list_of(g: &Group) -> Vec<(String, String)> {
     if crate::settings::get().presentation {
         return Vec::new();
@@ -882,13 +907,27 @@ unsafe fn task_menu(hwnd: HWND, g: Group) {
     let pinned = pin.is_some();
     let recent = jump_list_of(&g);
     let recent_labels: Vec<String> = recent.iter().map(|(n, _)| shorten(n, 48)).collect();
+    // App-eigene Einträge wie bei Windows: eigene Kategorien oben, Aufgaben
+    // ("Neues Fenster" …) unten. Im Präsentationsmodus nur die Aufgaben –
+    // eigene Kategorien enthalten oft Persönliches ("Zuletzt geschlossen").
+    let presenting = crate::settings::get().presentation;
+    let custom: Vec<crate::jumplist::Category> = crate::jumplist::load(&app_ids_of(&g)).into_iter().filter(|c| !presenting || c.name.is_empty()).collect();
+    let entries: Vec<&crate::jumplist::Entry> = custom.iter().flat_map(|c| c.entries.iter()).collect();
+    let entry_labels: Vec<String> = entries.iter().map(|e| shorten(&e.title, 48)).collect();
     let mut items = Vec::new();
+    let mut n = 0;
+    for c in custom.iter().filter(|c| !c.name.is_empty()) {
+        push_jump(&mut items, c, &c.name, &entry_labels, &mut n);
+    }
     if !recent.is_empty() {
         items.push(Item::Label("Zuletzt verwendet"));
         for (i, label) in recent_labels.iter().enumerate() {
             items.push(Item::Cmd(100 + i, label));
         }
         items.push(Item::Sep);
+    }
+    for c in custom.iter().filter(|c| c.name.is_empty()) {
+        push_jump(&mut items, c, "Aufgaben", &entry_labels, &mut n);
     }
     if !title.is_empty() && title != name {
         items.push(Item::Label(&title));
@@ -915,6 +954,11 @@ unsafe fn task_menu(hwnd: HWND, g: Group) {
         id @ 100..=199 => {
             if let Some((_, path)) = recent.get(id - 100) {
                 shell_open(path, "", SW_SHOWNORMAL);
+            }
+        }
+        id @ 200..=999 => {
+            if let Some(e) = entries.get(id - 200) {
+                crate::jumplist::launch(e);
             }
         }
         3 => {
