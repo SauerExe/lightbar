@@ -5,6 +5,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod ai;
 mod anim;
 mod apps;
 mod bar;
@@ -19,6 +20,7 @@ mod quick;
 mod settings;
 mod shell;
 mod start;
+mod taskband;
 mod status;
 mod tooltip;
 mod tray;
@@ -98,6 +100,41 @@ fn main() {
             }
             return;
         }
+        // KI einrichten: --ai-setup <url> <key> [model] (Schlüssel landet nur in ai.txt).
+        if std::env::args().nth(1).as_deref() == Some("--ai-setup") {
+            let a: Vec<String> = std::env::args().skip(2).collect();
+            if a.len() >= 2 {
+                ai::setup(&a[0], &a[1], a.get(2).map(|s| s.as_str()));
+            }
+            return;
+        }
+        // Diagnose: eine Frage stellen, Antwort nach %APPDATA%\Lightbar\ai-test.txt.
+        if std::env::args().nth(1).as_deref() == Some("--ai-test") {
+            let q = std::env::args().nth(2).unwrap_or_else(|| "Sag kurz Hallo.".into());
+            let (tx, rx) = std::sync::mpsc::channel();
+            ai::ask(q, move || {
+                let _ = tx.send(());
+            });
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < std::time::Duration::from_secs(180) {
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+                if ai::current().is_some_and(|a| a.done) {
+                    break;
+                }
+            }
+            let text = match ai::current() {
+                Some(a) => format!("nach {} ms, fertig={}, fehler={:?}\n{}", t0.elapsed().as_millis(), a.done, a.error, a.text),
+                None => "nicht eingerichtet".into(),
+            };
+            if let Some(dir) = util::data_dir() {
+                let _ = std::fs::write(dir.join("ai-test.txt"), text);
+            }
+            return;
+        }
+        if std::env::args().nth(1).as_deref() == Some("--taskbarlist-test") {
+            taskband::self_test();
+            return;
+        }
         // Diagnose: Welches Shell_TrayWnd findet eine App (FindWindow)?
         if std::env::args().nth(1).as_deref() == Some("--findwindow-test") {
             let h = FindWindowW(util::w16("Shell_TrayWnd").as_ptr(), null());
@@ -146,6 +183,7 @@ fn main() {
             shell::restore();
             return;
         }
+        taskband::create(inst, bar::hwnd());
         start::create(inst);
         quick::create(inst);
         tooltip::create(inst);

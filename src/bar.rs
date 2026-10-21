@@ -829,6 +829,10 @@ unsafe fn refresh(hwnd: HWND, refetch: Option<HWND>) {
             DestroyIcon(g.icon);
         }
     }
+    // Neue Fenster begrüßen ("TaskbarButtonCreated"), damit Apps Fortschritt und
+    // Zähler-Symbole melden; Meldungen geschlossener Fenster vergessen.
+    let all: Vec<HWND> = groups.iter().flat_map(|g| g.windows.iter().copied()).collect();
+    crate::taskband::announce(&all);
     let changed = groups.iter().map(|g| (g.key.clone(), g.windows.clone(), g.icon as usize)).ne(before);
     with(|s| {
         s.groups = groups;

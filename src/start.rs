@@ -27,6 +27,8 @@ use crate::util::*;
 pub const WM_TOGGLE: u32 = WM_APP + 10;
 const WM_RELOAD: u32 = WM_APP + 11;
 const WM_FILES: u32 = WM_APP + 12;
+/// Neues Stück einer KI-Antwort.
+const WM_AI: u32 = WM_APP + 13;
 const TIMER_FILES: usize = 4;
 
 /// Ergebnis der letzten Index-Suche: (Generation, Anfrage, Treffer).
@@ -54,6 +56,8 @@ enum Target {
     App(usize),
     Path(String),
     Uri(String),
+    /// Frage an die KI (siehe `ai`).
+    Ask(String),
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +67,7 @@ enum Glyph {
     Web,
     Search,
     File,
+    Ai,
 }
 
 #[derive(Clone)]
@@ -88,12 +93,15 @@ enum Act {
     ShowHome,
     Power,
     Account,
+    CopyAnswer,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Home,
     All,
+    /// Antwort der KI.
+    Answer,
 }
 
 #[derive(Clone, Copy)]
@@ -151,6 +159,8 @@ struct State {
     scroll: i32,
     max_scroll: i32,
     list_h: i32,
+    /// KI-Antwort scrollt beim Streamen mit.
+    follow: bool,
     mouse: (i32, i32),
     tracking: bool,
     hits: Vec<(RECT, Act)>,
@@ -374,6 +384,18 @@ fn search(st: &State) -> Vec<Row> {
     }
 
     let raw = st.query.trim();
+    // "?" am Anfang fragt direkt die KI – dann steht die Frage ganz oben.
+    if crate::ai::enabled() {
+        let question = raw.trim_start_matches('?').trim();
+        if !question.is_empty() {
+            let e = Entry { title: format!("„{question}“ fragen"), kind: "KI", sub: String::new(), target: Target::Ask(question.to_string()), glyph: Glyph::Ai };
+            if raw.starts_with('?') {
+                rows.insert(0, Row::Item(e));
+            } else {
+                rows.push(Row::Item(e));
+            }
+        }
+    }
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     rows.push(Row::Item(Entry {
         title: format!("„{raw}“ in Dateien suchen"),
@@ -409,7 +431,7 @@ unsafe fn icon_bitmap(st: &mut State, t: &Target, size: i32) -> HBITMAP {
     let key = match t {
         Target::App(i) => format!("a{size}:{}", st.apps[*i].id),
         Target::Path(p) => format!("p{size}:{p}"),
-        Target::Uri(_) => return null_mut(),
+        Target::Uri(_) | Target::Ask(_) => return null_mut(),
     };
     if let Some(&b) = st.icons.get(&key) {
         return b;
@@ -417,7 +439,7 @@ unsafe fn icon_bitmap(st: &mut State, t: &Target, size: i32) -> HBITMAP {
     let b = match t {
         Target::App(i) => apps::app_icon(&st.apps[*i], size),
         Target::Path(p) => apps::path_icon(p, size),
-        Target::Uri(_) => null_mut(),
+        Target::Uri(_) | Target::Ask(_) => null_mut(),
     };
     st.icons.insert(key, b);
     b
@@ -435,6 +457,7 @@ unsafe fn draw_icon(st: &mut State, dc: HDC, f: &Fonts, e: &Entry, x: i32, y: i3
         Glyph::Search => "\u{E721}",
         Glyph::File => "\u{E8A5}",
         Glyph::App => "\u{E71D}",
+        Glyph::Ai => "\u{E8BD}",
     };
     let font = if size > 24 { f.icons_big } else { f.icons };
     let r = RECT { left: x, top: y, right: x + size, bottom: y + size };
@@ -596,7 +619,8 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     let tx = field.left + px(d, 46);
     let tr = RECT { left: tx, right: field.right - px(d, 16), ..field };
     if st.query.is_empty() {
-        text(dc, "Nach Apps, Einstellungen und Dateien suchen", &tr, f.normal, DIM, LINE);
+        let hint = if crate::ai::enabled() { "Suchen – mit ? am Anfang die KI fragen" } else { "Nach Apps, Einstellungen und Dateien suchen" };
+        text(dc, hint, &tr, f.normal, DIM, LINE);
     } else {
         if st.select_all {
             // Markierung wie in einem Textfeld hinter dem Text.
@@ -616,6 +640,8 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
         let sel = Some(st.sel);
         draw_list(st, dc, &f, &rows, area, sel);
         st.results = rows;
+    } else if st.view == View::Answer {
+        draw_answer(st, dc, &f, w, body_top, body_bottom - px(d, 8));
     } else if st.view == View::All {
         text(dc, "Alle Apps", &RECT { left: px(d, PAD + 12), top: body_top, right: w / 2, bottom: body_top + px(d, 28) }, f.bold, TEXT, LINE);
         pill(st, dc, &f, "Zurück", "\u{E76B}", true, w - px(d, PAD), body_top, Act::ShowHome);
@@ -745,6 +771,10 @@ unsafe fn open(t: Target) {
         _ => None,
     })
     .flatten();
+    if let Target::Ask(q) = t {
+        ask(q);
+        return;
+    }
     hide();
     match t {
         Target::App(_) => {
@@ -754,6 +784,74 @@ unsafe fn open(t: Target) {
         }
         Target::Path(p) => shell_open(&p, "", SW_SHOWNORMAL),
         Target::Uri(u) => shell_open(&u, "", SW_SHOWNORMAL),
+        Target::Ask(_) => {}
+    }
+}
+
+/// Frage stellen; die Antwort erscheint im Startmenü, Stück für Stück.
+unsafe fn ask(question: String) {
+    with(|st| {
+        st.query.clear();
+        st.select_all = false;
+        st.results.clear();
+        st.view = View::Answer;
+        st.sel = 0;
+        st.scroll = 0;
+        st.follow = true;
+    });
+    let h = hwnd() as usize;
+    crate::ai::ask(question, move || {
+        PostMessageW(h as HWND, WM_AI, 0, 0);
+    });
+    InvalidateRect(hwnd(), null(), 0);
+}
+
+/// Antwort der KI: Frage als Überschrift, darunter der Text (umbrochen,
+/// scrollbar; folgt beim Streamen dem Ende, bis man selbst scrollt).
+unsafe fn draw_answer(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bottom: i32) {
+    let d = st.dpi;
+    let Some(a) = crate::ai::current() else {
+        st.view = View::Home;
+        return;
+    };
+    let head = RECT { left: px(d, PAD + 12), top, right: w - px(d, PAD + 120), bottom: top + px(d, 28) };
+    text(dc, &a.question, &head, f.bold, TEXT, LINE);
+    pill(st, dc, f, "Zurück", "\u{E76B}", true, w - px(d, PAD), top, Act::ShowHome);
+    let copy = a.done && a.error.is_none() && !a.text.is_empty();
+    let area = RECT { left: px(d, PAD + 12), top: top + px(d, 44), right: w - px(d, PAD + 12), bottom: bottom - if copy { px(d, 40) } else { 0 } };
+    let body = if let Some(e) = &a.error {
+        format!("{}\n\n{e}", a.text)
+    } else if a.thinking {
+        "denkt nach …".to_string()
+    } else if a.done {
+        a.text.clone()
+    } else {
+        format!("{} ▍", a.text)
+    };
+    let body = body.trim().to_string();
+    // Höhe messen, dann mit Versatz in den Bereich zeichnen.
+    let wbody = w16(&body);
+    let of = SelectObject(dc, f.normal);
+    let mut calc = RECT { bottom: area.top, ..area };
+    DrawTextW(dc, wbody.as_ptr(), -1, &mut calc, DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+    SelectObject(dc, of);
+    let height = calc.bottom - calc.top;
+    let view_h = area.bottom - area.top;
+    st.max_scroll = (height - view_h).max(0);
+    st.list_h = view_h;
+    if st.follow {
+        st.scroll = st.max_scroll;
+    }
+    st.scroll = st.scroll.clamp(0, st.max_scroll);
+    let rgn = CreateRectRgn(area.left, area.top, area.right, area.bottom);
+    SelectClipRgn(dc, rgn);
+    let r = RECT { top: area.top - st.scroll, bottom: area.top - st.scroll + height + px(d, 4), ..area };
+    let color = if a.thinking { SUBTEXT } else { TEXT };
+    text(dc, &body, &r, f.normal, color, DT_LEFT | DT_WORDBREAK);
+    SelectClipRgn(dc, null_mut());
+    DeleteObject(rgn);
+    if copy {
+        pill(st, dc, f, "Kopieren", "\u{E8C8}", true, w - px(d, PAD), bottom - px(d, 32), Act::CopyAnswer);
     }
 }
 
@@ -945,6 +1043,9 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
                 if st.query.is_empty() && st.view == View::Home {
                     close = true;
                 } else {
+                    if st.query.is_empty() && st.view == View::Answer {
+                        crate::ai::cancel();
+                    }
                     st.query.clear();
                     st.view = View::Home;
                     st.scroll = 0;
@@ -1025,6 +1126,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             apply_file_results(hwnd, wp as u64);
             0
         }
+        WM_AI => {
+            if with(|st| st.view == View::Answer).unwrap_or(false) {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
         WM_RELOAD => {
             let apps = apps::enumerate();
             with(|st| {
@@ -1063,6 +1170,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let delta = ((wp >> 16) & 0xffff) as i16 as i32;
             with(|st| {
                 st.scroll = (st.scroll - delta * px(st.dpi, ROW_H * 3) / 120).clamp(0, st.max_scroll);
+                st.follow = st.scroll >= st.max_scroll;
             });
             InvalidateRect(hwnd, null(), 0);
             0
@@ -1079,6 +1187,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 Some(Act::ShowHome) => {
                     with(|st| {
+                        if st.view == View::Answer {
+                            crate::ai::cancel();
+                        }
                         st.view = View::Home;
                         st.scroll = 0;
                     });
@@ -1091,6 +1202,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Some(Act::Account) => {
                     if menus::account_menu(hwnd) {
                         hide();
+                    }
+                }
+                Some(Act::CopyAnswer) => {
+                    if let Some(a) = crate::ai::current() {
+                        set_clipboard_text(hwnd, a.text.trim());
                     }
                 }
                 None => {}
@@ -1187,6 +1303,7 @@ pub unsafe fn create(inst: HINSTANCE) {
         scroll: 0,
         max_scroll: 0,
         list_h: 0,
+        follow: true,
         mouse: (-1, -1),
         tracking: false,
         hits: Vec::new(),
