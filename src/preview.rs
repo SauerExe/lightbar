@@ -107,11 +107,11 @@ pub unsafe fn show(targets: &[HWND], icon: HICON, center_x: i32, bar_top: i32, d
         if registered {
             DwmQueryThumbnailSourceSize(thumb, &mut src);
         }
-        // Auch minimierte Fenster haben oft noch ein vollwertiges Bild bei DWM –
-        // dann zeigen wir es. Nur ohne Bild (verborgene Fenster, Größe 0) oder
-        // bei einem minimierten Fenster, von dem DWM nur den kleinen
-        // Titelleisten-Stummel kennt, kommt das App-Symbol.
-        let stub = IsIconic(target) != 0 && src.cx <= px(96, 260) && src.cy <= px(96, 140);
+        // Minimierte Fenster: DWM hält ein verkleinertes Standbild bereit (z. B.
+        // 200 × 93 bei einem 1872 × 872-Fenster, gleiches Seitenverhältnis) – das
+        // zeigt auch Windows. Nur wenn gar kein Bild da ist (Größe 0, verborgene
+        // Fenster) oder nur eine flache Titelleiste, kommt das App-Symbol.
+        let stub = IsIconic(target) != 0 && src.cy < 40;
         let placeholder = !registered || src.cx <= 0 || src.cy <= 0 || stub;
         let (tw, th) = if placeholder {
             (max_w, max_h * 2 / 3)
