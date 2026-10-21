@@ -63,6 +63,8 @@ Honest answer, based on what was measured and built – including where it is *n
 - **Multiple monitors** – taskbars on other displays show Start, apps and the clock, like Windows; choose per display which ones get a taskbar and whether new displays get one (right-click → Bildschirme); flyouts open on the display you clicked; full-screen apps hide only the taskbar on their display
 - **Small and portrait screens** – when space runs out, tray icons move into the overflow, the usage display hides, buttons get narrower, and remaining apps go behind a "…" button instead of overlapping
 - Hides the Windows taskbar while running and restores it on exit; maximised windows and full-screen apps are handled
+- **Watchdog** – a small companion process restarts Lightbar if it crashes or stops responding, and brings back the Windows taskbar if that keeps failing, so you are never left without a taskbar
+- Start button: Lightbar orb, Windows logo or Tux (right-click → Startsymbol)
 
 ## Performance
 
@@ -107,7 +109,7 @@ target\release\lightbar.exe --install
 | `lightbar.exe --usage-test` | query usage once, write the result to `%APPDATA%\Lightbar\usage-test.txt` |
 | `lightbar.exe --search-test <term>` | run an index search, write the result to `%APPDATA%\Lightbar\search-test.txt` |
 
-Settings (right-click the taskbar) are stored in `%APPDATA%\Lightbar\settings.txt`.
+Settings (right-click the taskbar) are stored in `%APPDATA%\Lightbar\settings.txt`. Starts, exits, watchdog restarts and work-area corrections are logged to `%APPDATA%\Lightbar\lightbar.log` (no personal data). To quit Lightbar for good, use right-click → "Lightbar beenden" or `--uninstall`; killing the process makes the watchdog restart it.
 
 ## Notes
 
@@ -118,7 +120,7 @@ Settings (right-click the taskbar) are stored in `%APPDATA%\Lightbar\settings.tx
 
 ## Known limitations
 
-- Multi-monitor support is new and not yet tested on real multi-display hardware; secondary taskbars use the primary display's scaling. If Explorer does not reserve a taskbar's space (reported on multi-monitor setups), Lightbar sets that display's work area itself
+- Multi-monitor support is new and only lightly tested on real multi-display hardware. If Explorer does not reserve a taskbar's space (reported on multi-monitor setups), Lightbar sets that display's work area itself
 - Jump lists show recent/frequent items only (no app-defined tasks); notification centre and widgets are Windows' own
 - Touch and pen work through Windows' mouse emulation (tap = click, press-and-hold = right-click); untested on real touch hardware
 - German UI

@@ -24,6 +24,7 @@ mod tray;
 mod uia;
 mod usage;
 mod util;
+mod watchdog;
 
 use std::mem::zeroed;
 use std::ptr::{null, null_mut};
@@ -83,6 +84,13 @@ fn main() {
             usage::self_test();
             return;
         }
+        // Wächter für eine laufende Instanz (siehe `watchdog`).
+        if std::env::args().nth(1).as_deref() == Some("--watchdog") {
+            if let Some(pid) = std::env::args().nth(2).and_then(|p| p.parse().ok()) {
+                watchdog::run(pid);
+            }
+            return;
+        }
         // --install / --uninstall / --restore
         if shell::handle_args() {
             return;
@@ -92,11 +100,15 @@ fn main() {
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
+        let t0 = std::time::Instant::now();
+        shell::wait_for_explorer(std::time::Duration::from_secs(30));
+        util::log(&format!("Start {} (auf Explorer gewartet: {} ms)", env!("CARGO_PKG_VERSION"), t0.elapsed().as_millis()));
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         dark_menus();
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let inst = GetModuleHandleW(null());
         if bar::create(inst).is_null() {
+            util::log("Leiste konnte nicht angelegt werden – Ende");
             return;
         }
         start::create(inst);
@@ -108,6 +120,8 @@ fn main() {
         tray::create_overflow(inst);
         keyhook::spawn();
         shell::takeover();
+        bar::schedule_rehide();
+        watchdog::spawn();
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {

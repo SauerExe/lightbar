@@ -44,6 +44,17 @@ unsafe fn is_ours(h: HWND) -> bool {
     process_exe(h).is_some_and(|e| e.ends_with("lightbar.exe") || e.ends_with("rtaskbar.exe"))
 }
 
+/// Beim Start nach der Anmeldung kann Lightbar vor Explorer da sein. Ohne
+/// Explorers Taskleiste laufen AppBar-Anmeldung und Übernahme ins Leere, und
+/// Explorer zeigt seine Leiste später über unserer. Also kurz warten, bis
+/// sie existiert – höchstens `max`, danach (z. B. ohne Explorer) trotzdem los.
+pub unsafe fn wait_for_explorer(max: std::time::Duration) {
+    let start = std::time::Instant::now();
+    while explorer_bars().is_empty() && start.elapsed() < max {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 /// Explorers Leisten: Haupt-Taskleiste (nicht unsere) und Zweitmonitor-Leisten.
 unsafe fn explorer_bars() -> Vec<HWND> {
     let mut out = Vec::new();
@@ -77,13 +88,20 @@ unsafe fn appbar_state(set: Option<u32>) -> u32 {
     }
 }
 
-/// Windows-Taskleiste ausblenden. Merkt sich den Originalzustand nur, wenn
-/// nicht schon einer gemerkt ist (sonst würde nach einem Absturz der
-/// Ausblende-Zustand als "Original" gespeichert).
+/// Windows-Taskleiste ausblenden. Der Originalzustand wird nur beim ersten
+/// Mal gemerkt und die Datei danach nie überschrieben (erst `--uninstall`
+/// entfernt sie): Liest ein späterer Start den Zustand neu, kann er unseren
+/// eigenen "automatisch ausblenden" als Original erwischen – dann bliebe die
+/// Windows-Leiste ohne Lightbar dauerhaft versteckt.
 pub unsafe fn takeover() {
     if let Some(f) = state_file() {
         if !f.exists() {
-            let original = appbar_state(None);
+            let mut original = appbar_state(None);
+            // Explorers Leiste ist schon versteckt: Das war Lightbar (ein früherer
+            // Lauf ohne gemerkten Zustand). Dann ist "nicht ausblenden" das Original.
+            if original & ABS_AUTOHIDE != 0 && explorer_bars().iter().any(|&h| IsWindowVisible(h) == 0) {
+                original = ABS_ALWAYSONTOP;
+            }
             if let Some(dir) = f.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
@@ -92,7 +110,7 @@ pub unsafe fn takeover() {
     }
     appbar_state(Some(ABS_AUTOHIDE));
     for h in explorer_bars() {
-        ShowWindow(h, SW_HIDE);
+        ShowWindowAsync(h, SW_HIDE);
     }
     ACTIVE.store(true, Ordering::Relaxed);
 }
@@ -105,7 +123,7 @@ pub unsafe fn ensure_hidden() {
     }
     for h in explorer_bars() {
         if IsWindowVisible(h) != 0 {
-            ShowWindow(h, SW_HIDE);
+            ShowWindowAsync(h, SW_HIDE);
         }
     }
 }
@@ -119,11 +137,8 @@ pub unsafe fn restore() {
     if let Some(state) = original {
         appbar_state(Some(state));
     }
-    if let Some(f) = state_file() {
-        let _ = std::fs::remove_file(f);
-    }
     for h in explorer_bars() {
-        ShowWindow(h, SW_SHOWNA);
+        ShowWindowAsync(h, SW_SHOWNA);
     }
 }
 
@@ -284,6 +299,10 @@ pub unsafe fn handle_args() -> bool {
             set_logon_task(None);
             set_run_named(LEGACY_RUN_NAME, None);
             restore();
+            // Erst jetzt: Der gemerkte Originalzustand wird nicht mehr gebraucht.
+            if let Some(f) = state_file() {
+                let _ = std::fs::remove_file(f);
+            }
             true
         }
         "--restore" => {

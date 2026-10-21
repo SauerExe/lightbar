@@ -81,6 +81,40 @@ pub fn data_dir() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
+/// Eine Zeile ins Protokoll `%APPDATA%\Lightbar\lightbar.log` (mit Zeit und
+/// Prozess-ID). Für Ereignisse, die man im Nachhinein verstehen will: Start,
+/// Ende, Neustarts, Korrekturen. Wächst die Datei über 256 KB, bleibt die
+/// jüngere Hälfte. Keine persönlichen Daten hineinschreiben.
+pub fn log(msg: &str) {
+    use std::io::Write;
+    let Some(dir) = data_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("lightbar.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 256 * 1024) {
+        // Byteweise am nächsten Zeilenende schneiden (nie mitten in einem Umlaut).
+        if let Ok(bytes) = std::fs::read(&path) {
+            let half = bytes.len() / 2;
+            let cut = bytes[half..].iter().position(|&b| b == b'\n').map_or(half, |n| half + n + 1);
+            let _ = std::fs::write(&path, &bytes[cut..]);
+        }
+    }
+    let mut t: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
+    let line = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} [{}] {msg}\n",
+        t.wYear,
+        t.wMonth,
+        t.wDay,
+        t.wHour,
+        t.wMinute,
+        t.wSecond,
+        std::process::id()
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 pub fn w16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
