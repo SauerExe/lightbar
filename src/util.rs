@@ -147,7 +147,9 @@ pub unsafe fn send_keys(keys: &[(VIRTUAL_KEY, bool)]) {
                 ki: KEYBDINPUT {
                     wVk: vk,
                     wScan: 0,
-                    dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
+                    // Win-Tasten sind "erweiterte" Tasten; ohne das Kennzeichen erkennt
+                    // Windows simulierte Kürzel wie Win+Tab nicht zuverlässig.
+                    dwFlags: (if up { KEYEVENTF_KEYUP } else { 0 }) | if matches!(vk, VK_LWIN | VK_RWIN) { KEYEVENTF_EXTENDEDKEY } else { 0 },
                     time: 0,
                     dwExtraInfo: 0,
                 },

@@ -3358,8 +3358,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 Hit::More => more_menu(hwnd),
                 Hit::Search => crate::start::toggle(true),
-                // Direkt über die Shell statt simuliertem Win+Tab (kam nicht an).
-                Hit::TaskView => shell_open("explorer.exe", "shell:::{3080F90E-D7AD-11D9-BD98-0000947B0257}", SW_SHOWNORMAL),
+                // Win+Tab, wie die Aufgabenansicht-Taste von Windows.
+                Hit::TaskView => send_keys(&[(VK_LWIN, false), (VK_TAB, false), (VK_TAB, true), (VK_LWIN, true)]),
                 Hit::None => {}
             }
             InvalidateRect(hwnd, null(), 0);
