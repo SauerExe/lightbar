@@ -274,10 +274,11 @@ pub unsafe fn handle_args() -> bool {
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
             let path = target.to_string_lossy().into_owned();
-            set_run(Some(&format!("\"{path}\"")));
+            let run = set_run(Some(&format!("\"{path}\"")));
             // Run-Schlüssel bleibt als Rückfallebene; doppelt gestartet beendet
             // sich die zweite Instanz sofort (Mutex).
-            set_logon_task(Some(&path));
+            let task = set_logon_task(Some(&path));
+            crate::util::log(&format!("Installiert (Run-Eintrag: {run}, Aufgabe: {task}, im Paket-Container: {})", in_package()));
             // Umzug vom früheren Namen: alten Autostart und Programmordner entfernen.
             set_run_named(LEGACY_RUN_NAME, None);
             if let Ok(local) = std::env::var("LOCALAPPDATA") {
@@ -311,4 +312,76 @@ pub unsafe fn handle_args() -> bool {
         }
         _ => false,
     }
+}
+
+// ------------------------------------------------------ Paket-Container
+
+/// Läuft dieser Prozess mit Paket-Identität (MSIX-Container)?
+///
+/// Das passiert, wenn Lightbar aus einer paketierten App heraus gestartet
+/// wird, z. B. aus deren Terminal. Windows leitet dann Schreibzugriffe auf
+/// `%APPDATA%`, `%LOCALAPPDATA%` und HKCU in eine private Kopie des Pakets um:
+/// Einstellungen, Protokoll und sogar der Autostart-Eintrag landen dort, wo
+/// sie außer diesem Container niemand sieht (Explorer hat den Run-Eintrag so
+/// nie zu Gesicht bekommen), und gelesen werden womöglich veraltete Werte.
+unsafe fn in_package() -> bool {
+    use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+    const APPMODEL_ERROR_NO_PACKAGE: u32 = 15700;
+    let mut len = 0u32;
+    GetCurrentPackageFullName(&mut len, null_mut()) != APPMODEL_ERROR_NO_PACKAGE
+}
+
+/// Im Container: sich selbst mit denselben Argumenten außerhalb neu starten
+/// (dokumentierte Ausnahme `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_OVERRIDE`).
+/// `true` = neu gestartet, dieser Prozess soll enden. Befehle (`--install`
+/// usw.) wartet er noch ab, damit sie wie gewohnt fertig sind, wenn er endet.
+pub unsafe fn escape_package() -> bool {
+    use windows_sys::Win32::System::Threading::*;
+    use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_OVERRIDE;
+    // Schutz gegen eine Schleife, falls das Ausbrechen nicht greift.
+    const MARKER: &str = "LIGHTBAR_OUTSIDE_PACKAGE";
+    if !in_package() || std::env::var_os(MARKER).is_some() {
+        return false;
+    }
+    std::env::set_var(MARKER, "1");
+    let mut size = 0usize;
+    InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
+    let mut buf = vec![0u8; size];
+    let list = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+    if InitializeProcThreadAttributeList(list, 1, 0, &mut size) == 0 {
+        return false;
+    }
+    let mut policy: u32 = PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_OVERRIDE;
+    let ok = UpdateProcThreadAttribute(
+        list,
+        0,
+        PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY as usize,
+        &mut policy as *mut u32 as *const _,
+        size_of::<u32>(),
+        null_mut(),
+        null(),
+    ) != 0;
+    let mut started = false;
+    let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+    if ok {
+        let mut si: STARTUPINFOEXW = std::mem::zeroed();
+        si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        si.lpAttributeList = list;
+        // CreateProcessW darf die Befehlszeile verändern: eigene Kopie.
+        let cmd = windows_sys::Win32::System::Environment::GetCommandLineW();
+        let len = (0..).take_while(|&i| *cmd.add(i) != 0).count();
+        let mut line: Vec<u16> = std::slice::from_raw_parts(cmd, len).to_vec();
+        line.push(0);
+        started = CreateProcessW(null(), line.as_mut_ptr(), null(), null(), 0, EXTENDED_STARTUPINFO_PRESENT, null(), null(), &si.StartupInfo, &mut pi) != 0;
+    }
+    DeleteProcThreadAttributeList(list);
+    if !started {
+        return false;
+    }
+    if std::env::args().nth(1).is_some_and(|a| a.starts_with("--")) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    true
 }

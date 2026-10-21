@@ -56,6 +56,11 @@ unsafe fn dark_menus() {
 
 fn main() {
     unsafe {
+        // Aus einem Paket-Container (z. B. Terminal einer paketierten App) heraus
+        // gestartet: außerhalb neu starten, sonst landen Daten im Container.
+        if shell::escape_package() {
+            return;
+        }
         // Diagnose: Index-Suche ohne Oberfläche, Ergebnis nach %APPDATA%\Lightbar\search-test.txt.
         if std::env::args().nth(1).as_deref() == Some("--search-test") {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);

@@ -117,6 +117,7 @@ Settings (right-click the taskbar) are stored in `%APPDATA%\Lightbar\settings.tx
 - **Usage display:** reads the local logins of Claude Code (`~/.claude/.credentials.json`) and Codex (`~/.codex/auth.json`) and calls their *undocumented* usage endpoints. Tokens are never stored, logged or sent anywhere else. These endpoints may change at any time, and using them may not be covered by the providers' terms – which is why the feature is off by default.
 - **Proxy:** the usage requests use `HTTPS_PROXY` / `https_proxy` if set (respecting `NO_PROXY`; credentials in the URL like `http://user:pass@proxy:3128` are supported), otherwise the WinHTTP proxy (`netsh winhttp set proxy`), otherwise Windows' proxy settings (including PAC/WPAD).
 - Explorer keeps running (desktop, file windows); only its taskbar is hidden.
+- **Started from a packaged app** (e.g. the terminal of an MSIX app such as the Claude desktop app): Windows would redirect Lightbar's settings, log and registry writes into that app's private container. Lightbar detects this and relaunches itself outside the container. Writing the Run key from there still lands in the container, so in that case only the scheduled task provides autostart.
 
 ## Known limitations
 

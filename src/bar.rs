@@ -929,6 +929,7 @@ unsafe fn bar_menu(hwnd: HWND) {
         5 => crate::settings::update(|s| s.mono_tray = !s.mono_tray),
         18 => crate::settings::update(|s| s.presentation = !s.presentation),
         3 => {
+            crate::util::log("Beenden über das Menü");
             DestroyWindow(hwnd);
             return;
         }
@@ -2864,6 +2865,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_ENDSESSION if hwnd == self::hwnd() && wp != 0 => {
             crate::util::log("Sitzung endet – Windows-Taskleiste wiederhergestellt");
             crate::shell::restore();
+            0
+        }
+        // Von außen geschlossen (z. B. --install, Installer, Restart Manager):
+        // festhalten, damit sich ein unerwartetes Ende nachvollziehen lässt.
+        WM_CLOSE if hwnd == self::hwnd() => {
+            crate::util::log("WM_CLOSE von außen erhalten");
+            DestroyWindow(hwnd);
             0
         }
         WM_DESTROY if hwnd != self::hwnd() => {
