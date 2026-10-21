@@ -95,6 +95,13 @@ const HIDDEN_PROP: &str = "LightbarHidden";
 unsafe fn hide_explorer_bar(h: HWND) {
     SetPropW(h, w16(HIDDEN_PROP).as_ptr(), 1 as HANDLE);
     ShowWindowAsync(h, SW_HIDE);
+    // Ganz nach hinten: Apps finden die Taskleiste per FindWindow("Shell_TrayWnd"),
+    // und das liefert das oberste Fenster dieser Klasse. Liegt Explorers
+    // versteckte Leiste über unserer, gehen Tray-Symbole und ITaskbarList-Aufrufe
+    // (Fortschritt, Zähler) an Explorer statt an uns.
+    let flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS;
+    SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+    SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, flags);
 }
 
 /// Windows-Taskleiste ausblenden. Der Originalzustand wird nur beim ersten
@@ -140,8 +147,12 @@ pub unsafe fn ensure_hidden() {
     if !ACTIVE.load(Ordering::Relaxed) {
         return;
     }
+    // Auch versteckt kann Explorer seine Leiste wieder nach vorne holen – dann
+    // fände FindWindow sie statt unserer.
+    let first = FindWindowW(w16("Shell_TrayWnd").as_ptr(), null());
+    let explorer_first = !first.is_null() && !is_ours(first);
     for h in explorer_bars() {
-        if IsWindowVisible(h) != 0 {
+        if IsWindowVisible(h) != 0 || explorer_first {
             hide_explorer_bar(h);
         }
     }

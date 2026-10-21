@@ -1972,6 +1972,8 @@ unsafe fn covers_monitor(h: HWND) -> bool {
 /// unter die Leiste oder lassen nach einem Umzug der Leiste eine Lücke.
 /// Windows passt sie nicht von selbst an – also auf den Arbeitsbereich setzen.
 pub unsafe fn fit_maximized(bar: HWND) {
+    use crate::display::Edge;
+    let edge = crate::display::edge();
     let work = monitor_rect(bar, true);
     let mut windows: Vec<HWND> = Vec::new();
     EnumWindows(Some(enum_cb), &mut windows as *mut _ as LPARAM);
@@ -1982,17 +1984,22 @@ pub unsafe fn fit_maximized(bar: HWND) {
         }
         let mut r: RECT = zeroed();
         GetWindowRect(h, &mut r);
-        // Maximierte Fenster stehen ringsum um ihre Rahmenbreite über. An den
-        // Seiten ohne Leiste stimmt der Überstand; an der Seite einer neuen
-        // (oder an eine andere Kante gezogenen) Leiste ist er größer bzw.
-        // negativ – also der kleinste nicht-negative Überstand.
-        let overhang = [work.left - r.left, work.top - r.top, r.right - work.right, r.bottom - work.bottom];
-        let border = overhang.iter().copied().filter(|&o| o >= 0).min().unwrap_or(0);
-        let target = RECT { left: work.left - border, top: work.top - border, right: work.right + border, bottom: work.bottom + border };
-        let off = (r.left - target.left).abs().max((r.top - target.top).abs()).max((r.right - target.right).abs()).max((r.bottom - target.bottom).abs());
-        if off > 1 {
-            SetWindowPos(h, null_mut(), target.left, target.top, target.right - target.left, target.bottom - target.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS);
+        // Rahmenbreite an einer Seite ablesen, die keine Leiste und keine eigene
+        // Titelleiste hat (Chrome/Electron stehen oben nicht über): waagerechte
+        // Leiste → links, senkrechte → unten.
+        let border = if edge.vertical() { r.bottom - work.bottom } else { work.left - r.left }.max(0);
+        // Nur die Seite zur Leiste, und nur wenn das Fenster wirklich darunter
+        // ragt. Danach ist der Zustand stabil – wer anders maximiert, wird nicht
+        // immer wieder umgesetzt (das ließ Fenster springen).
+        let mut fixed = r;
+        match edge {
+            Edge::Bottom if r.bottom > work.bottom + border + 1 => fixed.bottom = work.bottom + border,
+            Edge::Top if r.top < work.top - border - 1 => fixed.top = work.top - border,
+            Edge::Left if r.left < work.left - border - 1 => fixed.left = work.left - border,
+            Edge::Right if r.right > work.right + border + 1 => fixed.right = work.right + border,
+            _ => continue,
         }
+        SetWindowPos(h, null_mut(), fixed.left, fixed.top, fixed.right - fixed.left, fixed.bottom - fixed.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS);
     }
 }
 
@@ -2251,6 +2258,22 @@ fn thickness(dpi: u32) -> i32 {
     }
 }
 
+/// Liegt die Leiste schon an ihrer Kante, über die ganze Breite bzw. Höhe und
+/// in der richtigen Dicke?
+unsafe fn docked_correctly(hwnd: HWND) -> bool {
+    use crate::display::Edge;
+    let t = thickness(bar_dpi(hwnd));
+    let m = monitor_rect(hwnd, false);
+    let mut r: RECT = zeroed();
+    GetWindowRect(hwnd, &mut r);
+    match crate::display::edge() {
+        Edge::Bottom => r.bottom == m.bottom && r.bottom - r.top == t && r.left == m.left && r.right == m.right,
+        Edge::Top => r.top == m.top && r.bottom - r.top == t && r.left == m.left && r.right == m.right,
+        Edge::Left => r.left == m.left && r.right - r.left == t && r.top == m.top && r.bottom == m.bottom,
+        Edge::Right => r.right == m.right && r.right - r.left == t && r.top == m.top && r.bottom == m.bottom,
+    }
+}
+
 /// Leiste an die eingestellte Kante ihres Monitors legen und dort Platz
 /// reservieren (AppBar), dann den Arbeitsbereich absichern.
 unsafe fn dock(hwnd: HWND, dpi: u32) {
@@ -2346,6 +2369,29 @@ fn remember_set(mon: isize, value: Option<(crate::display::Edge, i32)>) {
     }
 }
 
+/// Zählt Korrekturen des Arbeitsbereichs; mehr als 3 in 10 s heißt, Explorer
+/// hält dagegen – dann 5 Minuten keine Korrekturen. `true` = jetzt nicht setzen.
+fn fighting_explorer() -> bool {
+    static STATE: std::sync::Mutex<(u64, u32, u64)> = std::sync::Mutex::new((0, 0, 0));
+    let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    let Ok(mut s) = STATE.lock() else { return false };
+    let (start, count, paused_until) = &mut *s;
+    if now < *paused_until {
+        return true;
+    }
+    if now.saturating_sub(*start) > 10_000 {
+        *start = now;
+        *count = 0;
+    }
+    *count += 1;
+    if *count > 3 {
+        *paused_until = now + 300_000;
+        crate::util::log("Explorer setzt den Arbeitsbereich immer wieder zurück – Lightbar korrigiert 5 Minuten lang nicht");
+        return true;
+    }
+    false
+}
+
 /// Die Leiste muss ihren Platz auch wirklich vom Arbeitsbereich abziehen,
 /// sonst legen sich maximierte Fenster darunter. Normalerweise erledigt das
 /// Explorer über die AppBar-Anmeldung; hat er es nicht getan (gemeldet auf
@@ -2369,6 +2415,12 @@ unsafe fn ensure_work_area(bar: HWND) {
     let too_big = beyond(side, inner, edge);
     let ours_too_small = side != inner && !too_big && set_by_us(mon) == Some((edge, side));
     if too_big || ours_too_small {
+        // Notbremse: Setzt Explorer den Bereich immer wieder zurück, entsteht ein
+        // Hin und Her (Fenster springen, der Bildschirm flackert). Dann lieber
+        // 5 Minuten stillhalten.
+        if fighting_explorer() {
+            return;
+        }
         set_work_side(&mut work, edge, inner);
         set_work_area(work);
         remember_set(mon, Some((edge, inner)));
@@ -3377,7 +3429,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APPBAR => {
             match wp as u32 {
-                ABN_POSCHANGED => set_pos(hwnd),
+                // Nur neu anmelden, wenn die Leiste wirklich falsch liegt: Jede Anmeldung
+                // löst bei Explorer wieder ABN_POSCHANGED aus (Rückkopplung).
+                ABN_POSCHANGED if !docked_correctly(hwnd) => set_pos(hwnd),
+                ABN_POSCHANGED => {}
                 // Der Vollbild-Merker gehört der Hauptleiste; Zweitleisten prüfen sich selbst.
                 ABN_FULLSCREENAPP if hwnd == self::hwnd() => update_fullscreen(hwnd),
                 ABN_FULLSCREENAPP => tick_secondaries(),

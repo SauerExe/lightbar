@@ -98,6 +98,14 @@ fn main() {
             }
             return;
         }
+        // Diagnose: Welches Shell_TrayWnd findet eine App (FindWindow)?
+        if std::env::args().nth(1).as_deref() == Some("--findwindow-test") {
+            let h = FindWindowW(util::w16("Shell_TrayWnd").as_ptr(), null());
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, &mut pid);
+            util::log(&format!("FindWindow(Shell_TrayWnd) = {h:?}, Prozess {pid} (Lightbar: {})", pid != 0 && std::process::id() != pid && h == FindWindowW(util::w16("Shell_TrayWnd").as_ptr(), null())));
+            return;
+        }
         if std::env::args().nth(1).as_deref() == Some("--usage-test") {
             usage::self_test();
             return;
