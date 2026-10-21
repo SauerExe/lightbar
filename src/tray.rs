@@ -438,12 +438,23 @@ pub unsafe fn announce() {
 // ------------------------------------------------------------ Einfarbig
 
 thread_local! {
-    /// Weiße Silhouetten der Tray-Icons, je (Quell-Icon, Größe).
+    /// Silhouetten der Tray-Icons in der Akzentfarbe, je (Quell-Icon, Größe).
     static MONO: RefCell<Vec<(HICON, i32, HICON)>> = const { RefCell::new(Vec::new()) };
+    /// Akzentfarbe, in der die gemerkten Silhouetten gefärbt sind.
+    static MONO_COLOR: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
 }
 
-/// Icon als weiße Silhouette (Alpha bleibt, Farbe wird Weiß), gecacht.
+/// Icon als Silhouette in der Akzentfarbe (Alpha bleibt), gecacht. Ändert sich
+/// die Akzentfarbe, werden alle neu gefärbt.
 pub unsafe fn mono(icon: HICON, size: i32) -> HICON {
+    let color = crate::util::accent();
+    if MONO_COLOR.with(|c| c.replace(color)) != color {
+        MONO.with(|c| {
+            for e in c.borrow_mut().drain(..) {
+                DestroyIcon(e.2);
+            }
+        });
+    }
     if let Some(m) = MONO.with(|c| c.borrow().iter().find(|e| e.0 == icon && e.1 == size).map(|e| e.2)) {
         return m;
     }
@@ -467,6 +478,8 @@ pub unsafe fn mono(icon: HICON, size: i32) -> HICON {
 }
 
 unsafe fn make_mono(icon: HICON, size: i32) -> Option<HICON> {
+    let c = crate::util::accent();
+    let bgr = (((c >> 16) & 0xff) as u8, ((c >> 8) & 0xff) as u8, (c & 0xff) as u8);
     use windows_sys::Win32::Graphics::Gdi::*;
     let mut bi: BITMAPINFO = zeroed();
     bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
@@ -510,10 +523,10 @@ unsafe fn make_mono(icon: HICON, size: i32) -> Option<HICON> {
         } else {
             a
         };
-        // Icon-Bitmaps tragen ungemultipliziertes Alpha: Farbe bleibt voll Weiß.
-        p[0] = 255;
-        p[1] = 255;
-        p[2] = 255;
+        // Icon-Bitmaps tragen ungemultipliziertes Alpha: Farbe bleibt voll (BGR).
+        p[0] = bgr.0;
+        p[1] = bgr.1;
+        p[2] = bgr.2;
         p[3] = a;
     }
     SelectObject(dc, old);

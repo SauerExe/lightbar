@@ -1122,7 +1122,7 @@ unsafe fn bar_menu(hwnd: HWND) {
             Item::Check(23, "Suche anzeigen", crate::display::search_mode() > 0),
             Item::Check(24, "Aufgabenansicht anzeigen", crate::display::task_view_button()),
             Item::Check(15, "Claude/Codex-Usage anzeigen", s.show_usage),
-            Item::Check(5, "Tray-Icons einfarbig", s.mono_tray),
+            Item::Check(5, "Tray-Icons in Akzentfarbe", s.mono_tray),
             Item::Check(18, "Präsentationsmodus", s.presentation),
             Item::Sub("Bildschirme", screens),
             Item::Sep,

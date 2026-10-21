@@ -31,7 +31,7 @@ Honest answer, based on what was measured and built – including where it is *n
 - Task Manager button with a live CPU meter
 - Mouse wheel over the speaker icon changes the volume; over an app it cycles through its windows
 - ISO week numbers in the calendar
-- Monochrome tray icons for a calm look
+- Tray icons in the accent colour for a calm look
 - Optional animated glow edge
 
 **4. You're in control**
@@ -52,7 +52,7 @@ Honest answer, based on what was measured and built – including where it is *n
 - **Start menu** – all apps including Store apps, pinned apps, recently used files, search across apps, settings and files (Windows Search index), web search fallback, power and account menus
 - **Keyboard** – Win opens the Start menu; Win+S search, Win+X power-user menu, Win+A quick settings, Win+T moves keyboard focus into the taskbar (arrow keys, Enter, context-menu key, Esc)
 - **Screen readers** – UI Automation provider: the taskbar is exposed as a toolbar whose buttons have names, descriptions and can be invoked (Narrator, NVDA)
-- **System tray** – takes over the notification-area icons, overflow flyout that respects Windows' "show icon" settings, optional monochrome icons
+- **System tray** – takes over the notification-area icons, overflow flyout that respects Windows' "show icon" settings, optional icons in the accent colour
 - **Quick settings** – Wi-Fi and Bluetooth toggles, project, volume slider, battery
 - **Calendar flyout** with ISO week numbers
 - **Task Manager button** with a live CPU meter
