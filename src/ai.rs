@@ -82,19 +82,64 @@ pub struct Answer {
 }
 
 static CURRENT: Mutex<Option<(u64, Answer)>> = Mutex::new(None);
+/// Frühere Runden des Chats, älteste zuerst. Sperr-Reihenfolge: erst
+/// `CURRENT`, dann `PAST`.
+static PAST: Mutex<Vec<Answer>> = Mutex::new(Vec::new());
 static GEN: AtomicU64 = AtomicU64::new(0);
+
+/// So viel Verlauf geht höchstens mit (Zeichen), damit lange Chats nicht
+/// das Kontextfenster sprengen. Die jüngsten Runden haben Vorrang.
+const HISTORY_CHARS: usize = 24_000;
 
 /// Aktuelle Antwort (falls eine läuft oder fertig ist).
 pub fn current() -> Option<Answer> {
     CURRENT.lock().ok()?.as_ref().map(|(_, a)| a.clone())
 }
 
-/// Laufende Antwort verwerfen (der Thread hört beim nächsten Stück auf).
+/// Alle Runden des Chats zum Anzeigen: frühere und die aktuelle.
+pub fn turns() -> Vec<Answer> {
+    let Ok(c) = CURRENT.lock() else { return Vec::new() };
+    let mut all = PAST.lock().map(|p| p.clone()).unwrap_or_default();
+    all.extend(c.as_ref().map(|(_, a)| a.clone()));
+    all
+}
+
+/// Laufende Antwort abbrechen und den Chat verwerfen (der Thread hört beim
+/// nächsten Stück auf).
 pub fn cancel() {
     GEN.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut c) = CURRENT.lock() {
         *c = None;
+        if let Ok(mut p) = PAST.lock() {
+            p.clear();
+        }
     }
+}
+
+/// Nachrichten für den Server: frühere Runden (nur mit Antwort) und die neue
+/// Frage, ältere Runden fallen weg, wenn es zu lang wird.
+pub fn history(past: &[Answer], question: &str) -> Vec<serde_json::Value> {
+    let mut budget = HISTORY_CHARS.saturating_sub(question.len());
+    let mut keep = Vec::new();
+    for a in past.iter().rev() {
+        let text = a.text.trim();
+        if text.is_empty() {
+            continue; // Fehlgeschlagen oder abgebrochen, bevor etwas kam.
+        }
+        let cost = a.question.len() + text.len();
+        if cost > budget {
+            break;
+        }
+        budget -= cost;
+        keep.push(a);
+    }
+    let mut msgs = Vec::new();
+    for a in keep.into_iter().rev() {
+        msgs.push(serde_json::json!({ "role": "user", "content": a.question }));
+        msgs.push(serde_json::json!({ "role": "assistant", "content": a.text.trim() }));
+    }
+    msgs.push(serde_json::json!({ "role": "user", "content": question }));
+    msgs
 }
 
 fn update(gen: u64, f: impl FnOnce(&mut Answer)) -> bool {
@@ -108,17 +153,31 @@ fn update(gen: u64, f: impl FnOnce(&mut Answer)) -> bool {
     }
 }
 
-/// Frage stellen. `notify` wird bei jedem neuen Stück aufgerufen (aus dem
+/// Frage stellen – als Folgefrage im laufenden Chat (mit dem Verlauf).
+/// Läuft noch eine Antwort, wird sie mit dem bisherigen Stand abgeschlossen.
+/// `notify` wird bei jedem neuen Stück aufgerufen (aus dem
 /// Hintergrund-Thread – also nur eine Nachricht posten).
 pub fn ask(question: String, notify: impl Fn() + Send + 'static) {
     let Some(cfg) = config() else { return };
     let gen = GEN.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut messages = Vec::new();
     if let Ok(mut c) = CURRENT.lock() {
+        if let Ok(mut past) = PAST.lock() {
+            if let Some((_, mut prev)) = c.take() {
+                if !prev.done && prev.error.is_none() && prev.text.trim().is_empty() {
+                    prev.error = Some("Abgebrochen".into());
+                }
+                prev.done = true;
+                prev.thinking = false;
+                past.push(prev);
+            }
+            messages = history(&past, &question);
+        }
         *c = Some((gen, Answer { question: question.clone(), thinking: true, ..Default::default() }));
     }
     notify();
     std::thread::spawn(move || {
-        let result = unsafe { stream(&cfg, &question, gen, &notify) };
+        let result = unsafe { stream(&cfg, &messages, gen, &notify) };
         update(gen, |a| {
             a.done = true;
             a.thinking = false;
@@ -147,7 +206,7 @@ impl Drop for Handle {
 }
 
 /// POST mit Streaming-Antwort (Server-Sent Events) lesen.
-unsafe fn stream(cfg: &Config, question: &str, gen: u64, notify: &dyn Fn()) -> Result<(), String> {
+unsafe fn stream(cfg: &Config, messages: &[serde_json::Value], gen: u64, notify: &dyn Fn()) -> Result<(), String> {
     let (secure, rest) = match cfg.url.split_once("://") {
         Some(("http", r)) => (false, r),
         Some((_, r)) => (true, r),
@@ -159,13 +218,11 @@ unsafe fn stream(cfg: &Config, question: &str, gen: u64, notify: &dyn Fn()) -> R
         None => (hostport, if secure { 443 } else { 80 }),
     };
     let path = format!("/{}{}v1/chat/completions", prefix, if prefix.is_empty() || prefix.ends_with('/') { "" } else { "/" });
+    let system = serde_json::json!({ "role": "system", "content": format!("Du bist ein Assistent in der Windows-Taskleiste. Antworte knapp und hilfreich, in der Sprache der Frage. Markdown (Listen, **fett**, `Code`, Codeblöcke) wird dargestellt. Heute ist der {}.", today()) });
     let body = serde_json::json!({
         "model": cfg.model,
         "stream": true,
-        "messages": [
-            { "role": "system", "content": format!("Du bist ein Assistent in der Windows-Taskleiste. Antworte knapp und hilfreich, in der Sprache der Frage. Heute ist der {}.", today()) },
-            { "role": "user", "content": question },
-        ],
+        "messages": std::iter::once(system).chain(messages.iter().cloned()).collect::<Vec<_>>(),
     })
     .to_string();
 
@@ -245,4 +302,37 @@ unsafe fn stream(cfg: &Config, question: &str, gen: u64, notify: &dyn Fn()) -> R
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn(q: &str, a: &str) -> Answer {
+        Answer { question: q.into(), text: a.into(), done: true, ..Default::default() }
+    }
+
+    #[test]
+    fn history_alternates_and_skips_empty_answers() {
+        let past = [turn("eins", "A1 "), turn("kaputt", ""), turn("zwei", "A2")];
+        let m = history(&past, "drei");
+        let pairs: Vec<(&str, &str)> = m.iter().map(|v| (v["role"].as_str().unwrap(), v["content"].as_str().unwrap())).collect();
+        assert_eq!(pairs, vec![("user", "eins"), ("assistant", "A1"), ("user", "zwei"), ("assistant", "A2"), ("user", "drei")]);
+    }
+
+    #[test]
+    fn history_drops_oldest_when_too_long() {
+        let long = "x".repeat(HISTORY_CHARS / 2);
+        let past = [turn("alt", &long), turn("mitte", &long), turn("neu", "kurz")];
+        let m = history(&past, "frage");
+        let users: Vec<&str> = m.iter().filter(|v| v["role"] == "user").map(|v| v["content"].as_str().unwrap()).collect();
+        assert_eq!(users, vec!["mitte", "neu", "frage"]);
+    }
+}
+
+/// Für Bild-Tests: Chat-Zustand direkt setzen.
+#[cfg(test)]
+pub fn set_for_test(past: Vec<Answer>, current: Option<Answer>) {
+    *CURRENT.lock().unwrap() = current.map(|a| (u64::MAX, a));
+    *PAST.lock().unwrap() = past;
 }

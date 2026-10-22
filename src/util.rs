@@ -190,6 +190,26 @@ pub unsafe fn icon_font(dpi: u32, size: i32) -> HFONT {
     font_face(dpi, size, FW_NORMAL, "Segoe Fluent Icons")
 }
 
+/// Feste Breite für Code: Cascadia Mono, sonst Consolas, sonst Courier New.
+pub unsafe fn mono_font(dpi: u32, size: i32) -> HFONT {
+    for face in ["Cascadia Mono", "Consolas"] {
+        let f = font_face(dpi, size, FW_NORMAL, face);
+        // GDI liefert für unbekannte Namen stillschweigend eine Ersatzschrift.
+        let dc = CreateCompatibleDC(null_mut());
+        let old = SelectObject(dc, f);
+        let mut buf = [0u16; 64];
+        let n = GetTextFaceW(dc, buf.len() as i32, buf.as_mut_ptr()).max(0) as usize;
+        SelectObject(dc, old);
+        DeleteDC(dc);
+        let got = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+        if got.trim_end_matches('\0').eq_ignore_ascii_case(face) {
+            return f;
+        }
+        DeleteObject(f);
+    }
+    font_face(dpi, size, FW_NORMAL, "Courier New")
+}
+
 unsafe fn font_face(dpi: u32, size: i32, weight: u32, face: &str) -> HFONT {
     CreateFontW(
         -px(dpi, size),

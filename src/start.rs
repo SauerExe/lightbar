@@ -11,7 +11,7 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
@@ -30,6 +30,10 @@ const WM_FILES: u32 = WM_APP + 12;
 /// Neues Stück einer KI-Antwort.
 const WM_AI: u32 = WM_APP + 13;
 const TIMER_FILES: usize = 4;
+/// Blendet das „Kopiert“ nach dem Kopieren wieder aus.
+const TIMER_COPIED: usize = 5;
+/// So lange bleibt ein Chat nach dem Ausblenden erhalten.
+const CHAT_KEEP: Duration = Duration::from_secs(10 * 60);
 
 /// Ergebnis der letzten Index-Suche: (Generation, Anfrage, Treffer).
 static FILE_RESULTS: std::sync::Mutex<Option<(u64, String, Vec<(String, String)>)>> = std::sync::Mutex::new(None);
@@ -93,7 +97,14 @@ enum Act {
     ShowHome,
     Power,
     Account,
-    CopyAnswer,
+    /// Text in die Zwischenablage (Antwort oder Codeblock).
+    CopyText(String),
+    /// http(s)-Link aus einer Antwort öffnen.
+    OpenLink(String),
+    /// Chat verwerfen und neu anfangen.
+    NewChat,
+    /// Zum Ende der Antwort springen und ihr wieder folgen.
+    ScrollEnd,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -109,6 +120,10 @@ struct Fonts {
     normal: HFONT,
     small: HFONT,
     bold: HFONT,
+    /// Fett in Textgröße (`**…**` im Chat).
+    strong: HFONT,
+    /// Code im Chat.
+    mono: HFONT,
     icons: HFONT,
     icons_small: HFONT,
     icons_big: HFONT,
@@ -120,13 +135,15 @@ impl Fonts {
             normal: make_font(dpi, 13, FW_NORMAL),
             small: make_font(dpi, 12, FW_NORMAL),
             bold: make_font(dpi, 14, FW_SEMIBOLD),
+            strong: make_font(dpi, 13, FW_SEMIBOLD),
+            mono: mono_font(dpi, 12),
             icons: icon_font(dpi, 16),
             icons_small: icon_font(dpi, 10),
             icons_big: icon_font(dpi, 24),
         }
     }
     unsafe fn delete(&self) {
-        for f in [self.normal, self.small, self.bold, self.icons, self.icons_small, self.icons_big] {
+        for f in [self.normal, self.small, self.bold, self.strong, self.mono, self.icons, self.icons_small, self.icons_big] {
             DeleteObject(f);
         }
     }
@@ -161,6 +178,14 @@ struct State {
     list_h: i32,
     /// KI-Antwort scrollt beim Streamen mit.
     follow: bool,
+    /// Eingabe für Folgefragen im Chat (statt `query`).
+    input: String,
+    /// Zuletzt ausgeblendet – ein Chat bleibt eine Weile erhalten.
+    hidden_at: Option<Instant>,
+    /// Gesetzter Chat zu (Inhalt+Breite als Hash), damit Scrollen nicht neu misst.
+    chat_layout: Option<(u64, crate::chat::Layout)>,
+    /// Zuletzt kopierter Text (Hash) für das kurze „Kopiert“.
+    copied: Option<(u64, Instant)>,
     mouse: (i32, i32),
     tracking: bool,
     hits: Vec<(RECT, Act)>,
@@ -466,8 +491,8 @@ unsafe fn draw_icon(st: &mut State, dc: HDC, f: &Fonts, e: &Entry, x: i32, y: i3
 
 const LINE: u32 = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
 
-/// Kleiner Pill-Button rechtsbündig an `right`.
-unsafe fn pill(st: &mut State, dc: HDC, f: &Fonts, label: &str, glyph: &str, glyph_left: bool, right: i32, top: i32, act: Act) {
+/// Kleiner Pill-Button rechtsbündig an `right`; gibt seine linke Kante zurück.
+unsafe fn pill(st: &mut State, dc: HDC, f: &Fonts, label: &str, glyph: &str, glyph_left: bool, right: i32, top: i32, act: Act) -> i32 {
     let d = st.dpi;
     let tw = text_width(dc, label, f.small);
     let r = RECT { left: right - tw - px(d, 40), top, right, bottom: top + px(d, 28) };
@@ -481,6 +506,7 @@ unsafe fn pill(st: &mut State, dc: HDC, f: &Fonts, label: &str, glyph: &str, gly
         text(dc, glyph, &RECT { right: r.right - px(d, 10), ..r }, f.icons_small, TEXT, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
     st.hits.push((r, act));
+    r.left
 }
 
 unsafe fn draw_list(st: &mut State, dc: HDC, f: &Fonts, rows: &[Row], area: RECT, sel: Option<usize>) {
@@ -615,21 +641,33 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     outline(dc, &field, BORDER, px(d, 36));
     // Win11 markiert das fokussierte Feld mit einer Akzentlinie unten.
     fill(dc, &RECT { left: field.left + px(d, 18), top: field.bottom - px(d, 2), right: field.right - px(d, 18), bottom: field.bottom }, accent());
-    text(dc, "\u{E721}", &RECT { left: field.left + px(d, 16), ..field }, f.icons, SUBTEXT, LINE);
+    // Im Chat ist das Feld die Eingabe für Folgefragen.
+    let chat = chat_input(st);
+    let glyph = if chat { "\u{E8BD}" } else { "\u{E721}" };
+    text(dc, glyph, &RECT { left: field.left + px(d, 16), ..field }, f.icons, SUBTEXT, LINE);
     let tx = field.left + px(d, 46);
     let tr = RECT { left: tx, right: field.right - px(d, 16), ..field };
-    if st.query.is_empty() {
-        let hint = if crate::ai::enabled() { "Suchen – mit ? am Anfang die KI fragen" } else { "Nach Apps, Einstellungen und Dateien suchen" };
+    let shown = if chat { st.input.clone() } else { st.query.clone() };
+    if shown.is_empty() {
+        let hint = if chat {
+            if crate::ai::current().is_some() { "Nachfragen …" } else { "Frag etwas …" }
+        } else if crate::ai::enabled() {
+            "Suchen – mit ? am Anfang die KI fragen"
+        } else {
+            "Nach Apps, Einstellungen und Dateien suchen"
+        };
         text(dc, hint, &tr, f.normal, DIM, LINE);
     } else {
         if st.select_all {
             // Markierung wie in einem Textfeld hinter dem Text.
-            let sw = text_width(dc, &st.query, f.normal).min(tr.right - tx);
+            let sw = text_width(dc, &shown, f.normal).min(tr.right - tx);
             fill(dc, &RECT { left: tx - px(d, 1), top: field.top + px(d, 9), right: tx + sw + px(d, 1), bottom: field.bottom - px(d, 9) }, mix(FIELD, accent(), 0.55));
         }
-        text(dc, &st.query, &tr, f.normal, TEXT, LINE);
+        // Lange Folgefragen: das Ende bleibt sichtbar (dort wird getippt).
+        let flags = if chat && text_width(dc, &shown, f.normal) > tr.right - tx { DT_RIGHT | DT_VCENTER | DT_SINGLELINE } else { LINE };
+        text(dc, &shown, &tr, f.normal, TEXT, flags);
     }
-    let cx = (tx + text_width(dc, &st.query, f.normal)).min(tr.right);
+    let cx = (tx + text_width(dc, &shown, f.normal)).min(tr.right);
     fill(dc, &RECT { left: cx, top: field.top + px(d, 10), right: cx + px(d, 1).max(1), bottom: field.bottom - px(d, 10) }, TEXT);
 
     let body_top = px(d, 80);
@@ -733,9 +771,18 @@ unsafe fn show() {
         st.query.clear();
         st.select_all = false;
         st.results.clear();
-        st.view = View::Home;
         st.sel = 0;
-        st.scroll = 0;
+        // Kurz weg gewesen: zurück in den Chat, sonst neu auf der Startseite.
+        let keep_chat = st.view == View::Answer && st.hidden_at.is_some_and(|t| t.elapsed() < CHAT_KEEP);
+        if !keep_chat {
+            if st.view == View::Answer {
+                crate::ai::cancel();
+            }
+            st.view = View::Home;
+            st.scroll = 0;
+            st.input.clear();
+            st.chat_layout = None;
+        }
     });
     // Angedockte Lage – beim automatischen Ausblenden kann die Leiste gerade weggeschoben sein.
     let br = crate::bar::docked_rect(bar);
@@ -757,6 +804,7 @@ unsafe fn hide() {
     let h = hwnd();
     if IsWindowVisible(h) != 0 {
         ShowWindow(h, SW_HIDE);
+        with(|st| st.hidden_at = Some(Instant::now()));
         // Datei-Icons (Suche, Empfohlen) freigeben – sonst wüchse der Cache mit
         // jeder je angezeigten Datei. App-Icons bleiben (begrenzt, oft gebraucht).
         with(|st| purge_icons(st, false));
@@ -772,6 +820,8 @@ unsafe fn open(t: Target) {
     })
     .flatten();
     if let Target::Ask(q) = t {
+        // Aus der Suche heraus beginnt immer ein neuer Chat.
+        crate::ai::cancel();
         ask(q);
         return;
     }
@@ -788,15 +838,16 @@ unsafe fn open(t: Target) {
     }
 }
 
-/// Frage stellen; die Antwort erscheint im Startmenü, Stück für Stück.
+/// Frage stellen – neu oder als Folgefrage im laufenden Chat; die Antwort
+/// erscheint im Startmenü, Stück für Stück.
 unsafe fn ask(question: String) {
     with(|st| {
         st.query.clear();
+        st.input.clear();
         st.select_all = false;
         st.results.clear();
         st.view = View::Answer;
         st.sel = 0;
-        st.scroll = 0;
         st.follow = true;
     });
     let h = hwnd() as usize;
@@ -806,53 +857,254 @@ unsafe fn ask(question: String) {
     InvalidateRect(hwnd(), null(), 0);
 }
 
-/// Antwort der KI: Frage als Überschrift, darunter der Text (umbrochen,
-/// scrollbar; folgt beim Streamen dem Ende, bis man selbst scrollt).
-unsafe fn draw_answer(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bottom: i32) {
-    let d = st.dpi;
-    let Some(a) = crate::ai::current() else {
-        st.view = View::Home;
-        return;
-    };
-    let head = RECT { left: px(d, PAD + 12), top, right: w - px(d, PAD + 120), bottom: top + px(d, 28) };
-    text(dc, &a.question, &head, f.bold, TEXT, LINE);
-    pill(st, dc, f, "Zurück", "\u{E76B}", true, w - px(d, PAD), top, Act::ShowHome);
-    let copy = a.done && a.error.is_none() && !a.text.is_empty();
-    let area = RECT { left: px(d, PAD + 12), top: top + px(d, 44), right: w - px(d, PAD + 12), bottom: bottom - if copy { px(d, 40) } else { 0 } };
-    let body = if let Some(e) = &a.error {
-        format!("{}\n\n{e}", a.text)
-    } else if a.thinking {
-        "denkt nach …".to_string()
-    } else if a.done {
-        a.text.clone()
+/// Tippen geht im Chat in die Eingabe für Folgefragen, sonst in die Suche.
+fn chat_input(st: &State) -> bool {
+    st.view == View::Answer && st.query.is_empty()
+}
+
+/// Das gerade bearbeitete Eingabefeld (Suche oder Folgefrage).
+fn field(st: &mut State) -> &mut String {
+    if chat_input(st) {
+        &mut st.input
     } else {
-        format!("{} ▍", a.text)
-    };
-    let body = body.trim().to_string();
-    // Höhe messen, dann mit Versatz in den Bereich zeichnen.
-    let wbody = w16(&body);
-    let of = SelectObject(dc, f.normal);
-    let mut calc = RECT { bottom: area.top, ..area };
-    DrawTextW(dc, wbody.as_ptr(), -1, &mut calc, DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
-    SelectObject(dc, of);
-    let height = calc.bottom - calc.top;
+        &mut st.query
+    }
+}
+
+/// Neuen Chat beginnen: alter Verlauf weg, leere Eingabe.
+fn new_chat(st: &mut State) {
+    crate::ai::cancel();
+    st.view = View::Answer;
+    st.input.clear();
+    st.select_all = false;
+    st.scroll = 0;
+    st.follow = true;
+    st.chat_layout = None;
+}
+
+fn hash_of(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Zwischenschritte einer Antwort (Werkzeugaufrufe). Sobald `ai::Answer`
+/// ein Feld `steps` hat, hier `&a.steps` zurückgeben.
+fn steps(_a: &crate::ai::Answer) -> &[String] {
+    &[]
+}
+
+/// Textmaße über GDI für das Chat-Layout (`chat::Measure`).
+struct GdiMeasure {
+    dc: HDC,
+    fonts: [HFONT; 5],
+    /// (Zeilenhöhe, Oberlänge) je Schrift.
+    metrics: [(i32, i32); 5],
+    old: HFONT,
+    cur: std::cell::Cell<usize>,
+}
+
+impl GdiMeasure {
+    unsafe fn new(dc: HDC, f: &Fonts, dpi: u32) -> Self {
+        let fonts = [f.normal, f.strong, f.bold, f.mono, f.small];
+        let old = SelectObject(dc, fonts[0]);
+        // Etwas Durchschuss zwischen den Zeilen, gleichmäßig verteilt.
+        let lead = px(dpi, 4);
+        let mut metrics = [(0, 0); 5];
+        for (i, &font) in fonts.iter().enumerate() {
+            SelectObject(dc, font);
+            let mut tm: TEXTMETRICW = std::mem::zeroed();
+            GetTextMetricsW(dc, &mut tm);
+            metrics[i] = (tm.tmHeight + lead, tm.tmAscent + lead / 2);
+        }
+        SelectObject(dc, fonts[0]);
+        GdiMeasure { dc, fonts, metrics, old, cur: std::cell::Cell::new(0) }
+    }
+
+    fn index(font: crate::chat::Font) -> usize {
+        use crate::chat::Font;
+        match font {
+            Font::Normal => 0,
+            Font::Bold => 1,
+            Font::Heading => 2,
+            Font::Mono => 3,
+            Font::Small => 4,
+        }
+    }
+}
+
+impl crate::chat::Measure for GdiMeasure {
+    fn width(&self, font: crate::chat::Font, s: &str) -> i32 {
+        let i = Self::index(font);
+        let w: Vec<u16> = s.encode_utf16().collect();
+        let mut size = SIZE { cx: 0, cy: 0 };
+        unsafe {
+            if self.cur.replace(i) != i {
+                SelectObject(self.dc, self.fonts[i]);
+            }
+            GetTextExtentPoint32W(self.dc, w.as_ptr(), w.len() as i32, &mut size);
+        }
+        size.cx
+    }
+    fn height(&self, font: crate::chat::Font) -> i32 {
+        self.metrics[Self::index(font)].0
+    }
+    fn ascent(&self, font: crate::chat::Font) -> i32 {
+        self.metrics[Self::index(font)].1
+    }
+}
+
+impl Drop for GdiMeasure {
+    fn drop(&mut self) {
+        unsafe { SelectObject(self.dc, self.old) };
+    }
+}
+
+/// Schnittmenge zweier Rechtecke (leer, wenn sie sich nicht berühren).
+fn clip(r: &RECT, area: &RECT) -> RECT {
+    RECT { left: r.left.max(area.left), top: r.top.max(area.top), right: r.right.min(area.right), bottom: r.bottom.min(area.bottom) }
+}
+
+/// Der Chat: eigene Fragen rechts als Blasen, Antworten links mit leichtem
+/// Markdown. Scrollbar; folgt beim Streamen dem Ende, bis man selbst scrollt.
+unsafe fn draw_answer(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bottom: i32) {
+    use crate::chat::{Ink, Item};
+    let d = st.dpi;
+    let answers = crate::ai::turns();
+    let head = RECT { left: px(d, PAD + 12), top, right: w / 2, bottom: top + px(d, 28) };
+    text(dc, "KI-Chat", &head, f.bold, TEXT, LINE);
+    let left = pill(st, dc, f, "Zurück", "\u{E76B}", true, w - px(d, PAD), top, Act::ShowHome);
+    if !answers.is_empty() {
+        pill(st, dc, f, "Neuer Chat", "\u{E710}", true, left - px(d, 8), top, Act::NewChat);
+    }
+    let area = RECT { left: px(d, PAD + 12), top: top + px(d, 44), right: w - px(d, PAD + 12), bottom };
     let view_h = area.bottom - area.top;
-    st.max_scroll = (height - view_h).max(0);
     st.list_h = view_h;
+    if answers.is_empty() {
+        st.max_scroll = 0;
+        st.scroll = 0;
+        let r = RECT { bottom: area.top + px(d, 60), ..area };
+        text(dc, "Stell oben im Feld eine Frage – Folgefragen kennen den bisherigen Verlauf.", &r, f.normal, SUBTEXT, DT_CENTER | DT_WORDBREAK);
+        return;
+    }
+
+    // Setzen nur, wenn sich Inhalt oder Breite geändert haben.
+    let width = area.right - area.left;
+    let mut key = format!("{width}:{d}");
+    for a in &answers {
+        key.push_str(&format!("\u{1}{}\u{1}{}\u{1}{}{}{}\u{1}{}", a.question, a.text, a.thinking, a.done, a.error.as_deref().unwrap_or(""), steps(a).join("\u{2}")));
+    }
+    let key = hash_of(&key);
+    let layout = match st.chat_layout.take() {
+        Some((k, l)) if k == key => l,
+        _ => {
+            let m = GdiMeasure::new(dc, f, d);
+            let turns: Vec<crate::chat::Turn> = answers
+                .iter()
+                .map(|a| crate::chat::Turn { question: &a.question, steps: steps(a), text: &a.text, thinking: a.thinking, done: a.done, error: a.error.as_deref() })
+                .collect();
+            crate::chat::layout(&m, &turns, width, d)
+        }
+    };
+    let lead = px(d, 4);
+
+    st.max_scroll = (layout.height + px(d, 8) - view_h).max(0);
     if st.follow {
         st.scroll = st.max_scroll;
     }
     st.scroll = st.scroll.clamp(0, st.max_scroll);
-    let rgn = CreateRectRgn(area.left, area.top, area.right, area.bottom);
-    SelectClipRgn(dc, rgn);
-    let r = RECT { top: area.top - st.scroll, bottom: area.top - st.scroll + height + px(d, 4), ..area };
-    let color = if a.thinking { SUBTEXT } else { TEXT };
-    text(dc, &body, &r, f.normal, color, DT_LEFT | DT_WORDBREAK);
-    SelectClipRgn(dc, null_mut());
-    DeleteObject(rgn);
-    if copy {
-        pill(st, dc, f, "Kopieren", "\u{E8C8}", true, w - px(d, PAD), bottom - px(d, 32), Act::CopyAnswer);
+    let (ox, oy) = (area.left, area.top - st.scroll);
+    let now = Instant::now();
+    let copied = st.copied.filter(|(_, t)| now.duration_since(*t) < Duration::from_millis(1500)).map(|(h, _)| h);
+
+    let saved = SaveDC(dc);
+    IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
+    let panel = mix(BG, TEXT, 0.07);
+    for item in &layout.items {
+        let at = |r: &RECT| RECT { left: r.left + ox, top: r.top + oy, right: r.right + ox, bottom: r.bottom + oy };
+        let r = match item {
+            Item::Run(run) => at(&run.rect),
+            Item::Bubble(r) | Item::CodePanel(r) | Item::Rule(r) | Item::Copy { rect: r, .. } | Item::Marker { rect: r, .. } => at(r),
+        };
+        if r.bottom < area.top || r.top > area.bottom {
+            continue;
+        }
+        match item {
+            Item::Bubble(_) => round(dc, &r, mix(BG, accent(), 0.28), px(d, 16)),
+            Item::CodePanel(_) => {
+                round(dc, &r, panel, px(d, 8));
+                outline(dc, &r, BORDER, px(d, 8));
+            }
+            Item::Rule(_) => fill(dc, &r, if r.bottom - r.top > 1 { mix(BG, TEXT, 0.3) } else { BORDER }),
+            Item::Marker { text: t, .. } => text(dc, t, &r, f.normal, SUBTEXT, DT_RIGHT | DT_VCENTER | DT_SINGLELINE),
+            Item::Run(run) => {
+                let m_font = match run.font {
+                    crate::chat::Font::Normal => f.normal,
+                    crate::chat::Font::Bold => f.strong,
+                    crate::chat::Font::Heading => f.bold,
+                    crate::chat::Font::Mono => f.mono,
+                    crate::chat::Font::Small => f.small,
+                };
+                if run.code {
+                    let bg = RECT { left: r.left - px(d, 4), top: r.top + lead / 2 - px(d, 1), right: r.right + px(d, 4), bottom: r.bottom - lead / 2 + px(d, 1) };
+                    round(dc, &bg, mix(BG, TEXT, 0.12), px(d, 4));
+                }
+                let color = match &run.ink {
+                    Ink::Text => TEXT,
+                    Ink::Sub => SUBTEXT,
+                    Ink::Error => rgb(255, 153, 164),
+                    Ink::Link(_) => accent(),
+                };
+                text(dc, &run.text, &r, m_font, color, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
+                if let Ink::Link(url) = &run.ink {
+                    let vis = clip(&r, &area);
+                    if inside(&vis, st.mouse.0, st.mouse.1) {
+                        let base = r.bottom - lead / 2 - px(d, 2);
+                        fill(dc, &RECT { left: r.left, top: base, right: r.right, bottom: base + px(d, 1).max(1) }, accent());
+                    }
+                    st.hits.push((vis, Act::OpenLink(url.clone())));
+                }
+            }
+            Item::Copy { text: t, label, .. } => {
+                let vis = clip(&r, &area);
+                let done = copied == Some(hash_of(t));
+                if inside(&vis, st.mouse.0, st.mouse.1) {
+                    round(dc, &r, if *label { HOVER } else { ACTIVE }, px(d, 6));
+                }
+                let glyph = if done { "\u{E73E}" } else { "\u{E8C8}" };
+                if *label {
+                    text(dc, glyph, &RECT { left: r.left + px(d, 8), ..r }, f.icons_small, SUBTEXT, LINE);
+                    text(dc, if done { "Kopiert" } else { "Kopieren" }, &RECT { left: r.left + px(d, 26), ..r }, f.small, SUBTEXT, LINE);
+                } else {
+                    text(dc, glyph, &r, f.icons_small, SUBTEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+                st.hits.push((vis, Act::CopyText(t.clone())));
+            }
+        }
     }
+    RestoreDC(dc, saved);
+
+    // Schmale Bildlaufleiste, wenn der Chat länger ist als der Platz.
+    if st.max_scroll > 0 {
+        let content = view_h + st.max_scroll;
+        let th = (view_h * view_h / content).max(px(d, 24));
+        let ty = area.top + (view_h - th) * st.scroll / st.max_scroll;
+        let x = area.right + px(d, 6);
+        round(dc, &RECT { left: x, top: ty, right: x + px(d, 3), bottom: ty + th }, mix(BG, TEXT, 0.25), px(d, 3));
+    }
+    // Weggescrollt, während die Antwort noch läuft oder darunter mehr steht:
+    // Knopf zurück ans Ende.
+    if !st.follow && st.max_scroll - st.scroll > px(d, 40) {
+        let s = px(d, 32);
+        let r = RECT { left: (area.left + area.right - s) / 2, top: area.bottom - s - px(d, 4), right: (area.left + area.right + s) / 2, bottom: area.bottom - px(d, 4) };
+        let hov = inside(&r, st.mouse.0, st.mouse.1);
+        round(dc, &r, if hov { ACTIVE } else { HOVER }, s);
+        outline(dc, &r, BORDER, s);
+        text(dc, "\u{E74B}", &r, f.icons_small, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        st.hits.push((r, Act::ScrollEnd));
+    }
+    st.chat_layout = Some((key, layout));
 }
 
 /// Rechtsklick auf eine App: anheften (Start/Taskleiste), als Admin starten,
@@ -967,17 +1219,26 @@ unsafe fn apply_file_results(hwnd: HWND, gen: u64) {
     }
 }
 
-/// Suchtext ändern (Einfügen, Ausschneiden, Wort löschen) und neu suchen.
-/// `f` bekommt den Text und ob er komplett markiert ist (Strg+A).
+/// Suchtext bzw. Folgefrage ändern (Einfügen, Ausschneiden, Wort löschen)
+/// und – in der Suche – neu suchen. `f` bekommt den Text und ob er komplett
+/// markiert ist (Strg+A).
 unsafe fn edit_query(hwnd: HWND, f: impl FnOnce(&mut String, bool)) {
-    with(|st| {
-        f(&mut st.query, st.select_all);
+    let chat = with(|st| {
+        let all = st.select_all;
+        f(field(st), all);
         st.select_all = false;
+        if chat_input(st) {
+            return true;
+        }
         st.results = if st.query.is_empty() { Vec::new() } else { search(st) };
         st.sel = 0;
         st.scroll = 0;
-    });
-    SetTimer(hwnd, TIMER_FILES, 160, None);
+        false
+    })
+    .unwrap_or(false);
+    if !chat {
+        SetTimer(hwnd, TIMER_FILES, 160, None);
+    }
     InvalidateRect(hwnd, null(), 0);
 }
 
@@ -989,22 +1250,30 @@ unsafe fn on_ctrl_key(hwnd: HWND, vk: u16) -> bool {
     const VK_X: u16 = b'X' as u16;
     match vk {
         VK_A => {
-            with(|st| st.select_all = !st.query.is_empty());
+            with(|st| st.select_all = !field(st).is_empty());
             InvalidateRect(hwnd, null(), 0);
         }
         VK_C | VK_X => {
-            let q = with(|st| st.query.clone()).unwrap_or_default();
+            let (q, chat) = with(|st| (field(st).clone(), chat_input(st))).unwrap_or_default();
             if !q.is_empty() {
                 set_clipboard_text(hwnd, &q);
+            } else if chat && vk == VK_C {
+                // Leere Eingabe im Chat: die letzte Antwort kopieren.
+                if let Some(a) = crate::ai::current().filter(|a| !a.text.trim().is_empty()) {
+                    set_clipboard_text(hwnd, a.text.trim());
+                }
             }
             if vk == VK_X {
                 edit_query(hwnd, |q, _| q.clear());
             }
         }
         VK_V => {
-            // Nur die erste Zeile, ohne Steuerzeichen (Tabs, Zeilenumbrüche).
+            // Suche: nur die erste Zeile; Folgefrage: Zeilen mit Leerzeichen
+            // verbinden. Ohne Steuerzeichen (Tabs, Zeilenumbrüche).
             let Some(t) = clipboard_text(hwnd) else { return true };
-            let line: String = t.lines().next().unwrap_or("").chars().filter(|c| !c.is_control()).collect();
+            let chat = with(|st| chat_input(st)).unwrap_or(false);
+            let text = if chat { t.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ") } else { t.lines().next().unwrap_or("").to_string() };
+            let line: String = text.chars().filter(|c| !c.is_control()).collect();
             edit_query(hwnd, |q, all| {
                 if all {
                     q.clear();
@@ -1023,6 +1292,56 @@ unsafe fn on_ctrl_key(hwnd: HWND, vk: u16) -> bool {
             let cut = q[..trimmed].char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
             q.truncate(cut);
         }),
+        // Strg+Pos1/Ende im Chat: an den Anfang bzw. ans Ende.
+        VK_HOME | VK_END if with(|st| chat_input(st)).unwrap_or(false) => {
+            with(|st| {
+                st.follow = vk == VK_END;
+                st.scroll = if vk == VK_END { st.max_scroll } else { 0 };
+            });
+            InvalidateRect(hwnd, null(), 0);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Tasten im Chat: Enter schickt die Folgefrage, Escape leert erst die
+/// Eingabe und geht dann zurück, Pfeile und Bild-Tasten scrollen.
+fn on_chat_key(st: &mut State, vk: u16, send: &mut Option<String>) -> bool {
+    let line = px(st.dpi, 40);
+    let page = (st.list_h - line).max(line);
+    let by = |st: &mut State, delta: i32| {
+        st.scroll = (st.scroll + delta).clamp(0, st.max_scroll);
+        st.follow = st.scroll >= st.max_scroll;
+    };
+    match vk {
+        VK_ESCAPE => {
+            if std::mem::take(&mut st.select_all) || !st.input.is_empty() {
+                st.input.clear();
+            } else {
+                crate::ai::cancel();
+                st.view = View::Home;
+                st.scroll = 0;
+                st.chat_layout = None;
+            }
+        }
+        VK_BACK => {
+            if std::mem::take(&mut st.select_all) {
+                st.input.clear();
+            } else {
+                st.input.pop();
+            }
+        }
+        VK_RETURN => {
+            let q = st.input.trim().to_string();
+            if !q.is_empty() {
+                *send = Some(q);
+            }
+        }
+        VK_UP => by(st, -line),
+        VK_DOWN => by(st, line),
+        VK_PRIOR => by(st, -page),
+        VK_NEXT => by(st, page),
         _ => return false,
     }
     true
@@ -1035,7 +1354,11 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
     let mut open_target = None;
     let mut close = false;
     let mut schedule_files = false;
+    let mut send = None;
     let handled = with(|st| {
+        if chat_input(st) {
+            return on_chat_key(st, vk, &mut send);
+        }
         let count = st.results.len();
         match vk {
             VK_ESCAPE => {
@@ -1090,6 +1413,8 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
         hide();
     } else if let Some(t) = open_target {
         open(t);
+    } else if let Some(q) = send {
+        ask(q);
     } else if handled {
         InvalidateRect(hwnd, null(), 0);
     }
@@ -1121,6 +1446,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             KillTimer(hwnd, TIMER_FILES);
             start_file_search(hwnd);
             0
+        }
+        WM_TIMER if wp == TIMER_COPIED => {
+            KillTimer(hwnd, TIMER_COPIED);
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_SETCURSOR if (lp & 0xffff) as u32 == HTCLIENT => {
+            // Hand über Links in Antworten.
+            let mut p = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut p);
+            ScreenToClient(hwnd, &mut p);
+            if matches!(with(|st| hit(st, p.x, p.y)).flatten(), Some(Act::OpenLink(_))) {
+                SetCursor(LoadCursorW(null_mut(), IDC_HAND));
+                return 1;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_FILES => {
             apply_file_results(hwnd, wp as u64);
@@ -1189,10 +1530,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     with(|st| {
                         if st.view == View::Answer {
                             crate::ai::cancel();
+                            st.input.clear();
+                            st.chat_layout = None;
                         }
                         st.view = View::Home;
                         st.scroll = 0;
                     });
+                }
+                Some(Act::NewChat) => {
+                    with(new_chat);
+                }
+                Some(Act::ScrollEnd) => {
+                    with(|st| {
+                        st.follow = true;
+                        st.scroll = st.max_scroll;
+                    });
+                }
+                Some(Act::OpenLink(url)) => {
+                    if url.starts_with("https://") || url.starts_with("http://") {
+                        open(Target::Uri(url));
+                    }
                 }
                 Some(Act::Power) => {
                     if menus::power_menu(hwnd) {
@@ -1204,10 +1561,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         hide();
                     }
                 }
-                Some(Act::CopyAnswer) => {
-                    if let Some(a) = crate::ai::current() {
-                        set_clipboard_text(hwnd, a.text.trim());
-                    }
+                Some(Act::CopyText(t)) => {
+                    set_clipboard_text(hwnd, &t);
+                    with(|st| st.copied = Some((hash_of(&t), Instant::now())));
+                    SetTimer(hwnd, TIMER_COPIED, 1600, None);
                 }
                 None => {}
             }
@@ -1230,16 +1587,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_CHAR => {
             if let Some(c) = char::from_u32(wp as u32).filter(|c| !c.is_control()) {
-                with(|st| {
-                    // Nach Strg+A ersetzt das erste Zeichen die markierte Suche.
+                let chat = with(|st| {
+                    // Nach Strg+A ersetzt das erste Zeichen die markierte Eingabe.
                     if std::mem::take(&mut st.select_all) {
-                        st.query.clear();
+                        field(st).clear();
                     }
-                    st.query.push(c);
+                    field(st).push(c);
+                    if chat_input(st) {
+                        return true;
+                    }
                     st.results = search(st);
                     st.sel = 0;
                     st.scroll = 0;
-                });
+                    false
+                })
+                .unwrap_or(false);
+                if chat {
+                    InvalidateRect(hwnd, null(), 0);
+                    return 0;
+                }
                 // Index-Suche erst nach kurzer Tipp-Pause.
                 SetTimer(hwnd, TIMER_FILES, 160, None);
                 InvalidateRect(hwnd, null(), 0);
@@ -1304,6 +1670,10 @@ pub unsafe fn create(inst: HINSTANCE) {
         max_scroll: 0,
         list_h: 0,
         follow: true,
+        input: String::new(),
+        hidden_at: None,
+        chat_layout: None,
+        copied: None,
         mouse: (-1, -1),
         tracking: false,
         hits: Vec::new(),
@@ -1311,4 +1681,126 @@ pub unsafe fn create(inst: HINSTANCE) {
     rebuild(&mut st);
     STATE.with(|s| *s.borrow_mut() = Some(st));
     HWND_START.store(hwnd, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chat-Layout mit echten GDI-Schriften: alles bleibt in der Breite,
+    /// Zeilen überlappen nicht.
+    #[test]
+    fn chat_layout_with_gdi_fonts() {
+        unsafe {
+            let f = Fonts::new(144);
+            let dc = CreateCompatibleDC(null_mut());
+            let text = "## Titel\nEin **fetter** Satz mit `code` und https://example.com/ein/sehr/langer/pfad/der/umbrechen/muss/weil/er/nicht/passt.\n\n- eins\n- zwei\n\n```\nfn main() { println!(\"hallo\"); }\n```";
+            let turn = crate::chat::Turn { question: "Frage?", steps: &[], text, thinking: false, done: true, error: None };
+            let width = px(144, 560);
+            let l = {
+                let m = GdiMeasure::new(dc, &f, 144);
+                crate::chat::layout(&m, &[turn], width, 144)
+            };
+            assert!(l.height > px(144, 200));
+            let mut last_top = i32::MIN;
+            for item in &l.items {
+                if let crate::chat::Item::Run(r) = item {
+                    assert!(r.rect.left >= 0 && r.rect.right <= width, "{} ragt hinaus", r.text);
+                    assert!(r.rect.bottom > r.rect.top);
+                    assert!(r.rect.top >= last_top.saturating_sub(px(144, 30)));
+                    last_top = r.rect.top;
+                }
+            }
+            DeleteDC(dc);
+            f.delete();
+        }
+    }
+}
+
+#[cfg(test)]
+mod render {
+    use super::*;
+
+    /// Zeichnet das Startmenü mit einem Beispiel-Chat nach `LIGHTBAR_SHOT`
+    /// (BMP). Nur von Hand: `LIGHTBAR_SHOT=chat.bmp cargo test render -- --ignored`
+    #[test]
+    #[ignore]
+    fn chat_screenshot() {
+        let Ok(path) = std::env::var("LIGHTBAR_SHOT") else { return };
+        let q1 = crate::ai::Answer { question: "Wie liste ich Dateien in PowerShell?".into(), text: "## Dateien auflisten\nMit **Get-ChildItem** (kurz `ls`):\n\n```powershell\nGet-ChildItem -Recurse -Filter *.rs | Select-Object FullName\n```\n\n- `-Recurse` geht in Unterordner\n- `-Filter` grenzt ein\n  - auch mit Platzhaltern\n1. erstens\n2. zweitens\n\nMehr unter https://learn.microsoft.com/powershell.".into(), done: true, ..Default::default() };
+        let q2 = crate::ai::Answer { question: "Und versteckte Dateien?".into(), text: "Dafür gibt es den Schalter `-Force`, der auch versteckte und Systemdateien".into(), ..Default::default() };
+        crate::ai::set_for_test(vec![q1], Some(q2));
+        unsafe {
+            let dpi = 120;
+            let (w, h) = (px(dpi, W), px(dpi, H));
+            let screen = GetDC(null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(dc, bmp);
+            let mut st = State {
+                dpi,
+                fonts: Some(Fonts::new(dpi)),
+                apps: Vec::new(),
+                all_rows: Vec::new(),
+                pins: Vec::new(),
+                pin_idx: Vec::new(),
+                recent: Vec::new(),
+                icons: HashMap::new(),
+                avatar: (0, null_mut()),
+                query: String::new(),
+                select_all: false,
+                results: Vec::new(),
+                exe_ids: None,
+                files: Vec::new(),
+                files_for: String::new(),
+                files_gen: 0,
+                view: View::Answer,
+                sel: 0,
+                scroll: 0,
+                max_scroll: 0,
+                list_h: 0,
+                follow: true,
+                input: "Geht das auch rek".into(),
+                hidden_at: None,
+                chat_layout: None,
+                copied: None,
+                mouse: (-1, -1),
+                tracking: false,
+                hits: Vec::new(),
+            };
+            draw(&mut st, dc, w, h);
+            if let Ok(s) = std::env::var("LIGHTBAR_SCROLL") {
+                st.follow = false;
+                st.scroll = s.parse().unwrap_or(0);
+                draw(&mut st, dc, w, h);
+            }
+            // 24-bit-BMP schreiben.
+            let row = ((w * 3 + 3) & !3) as usize;
+            let mut bi: BITMAPINFO = std::mem::zeroed();
+            bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+            bi.bmiHeader.biWidth = w;
+            bi.bmiHeader.biHeight = h;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 24;
+            let mut pixels = vec![0u8; row * h as usize];
+            SelectObject(dc, old);
+            GetDIBits(dc, bmp, 0, h as u32, pixels.as_mut_ptr() as _, &mut bi, DIB_RGB_COLORS);
+            let mut out = Vec::new();
+            out.extend_from_slice(b"BM");
+            out.extend_from_slice(&((54 + pixels.len()) as u32).to_le_bytes());
+            out.extend_from_slice(&[0; 4]);
+            out.extend_from_slice(&54u32.to_le_bytes());
+            out.extend_from_slice(&40u32.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&24u16.to_le_bytes());
+            out.extend_from_slice(&[0; 24]);
+            out.extend_from_slice(&pixels);
+            std::fs::write(path, out).unwrap();
+            DeleteObject(bmp);
+            DeleteDC(dc);
+            ReleaseDC(null_mut(), screen);
+        }
+    }
 }
