@@ -103,12 +103,30 @@ fn action(vk: u16, (shift, ctrl, alt): (bool, bool, bool)) -> Option<Action> {
     }
 }
 
+/// Kann das Loslassen dieser Taste das Tastaturlayout umgeschaltet haben?
+/// Win+Leertaste, Alt+Umschalt, Strg+Umschalt (Windows-Standardkürzel).
+fn layout_hotkey(vk: u16, win: bool, shift: bool, ctrl: bool, alt: bool) -> bool {
+    let is_shift = matches!(vk, VK_SHIFT | VK_LSHIFT | VK_RSHIFT);
+    let is_alt = matches!(vk, VK_MENU | VK_LMENU | VK_RMENU);
+    let is_ctrl = matches!(vk, VK_CONTROL | VK_LCONTROL | VK_RCONTROL);
+    (vk == VK_SPACE && win) || (is_shift && (alt || ctrl)) || ((is_alt || is_ctrl) && shift)
+}
+
 unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let k = &*(lp as *const KBDLLHOOKSTRUCT);
         let injected = k.flags & LLKHF_INJECTED != 0;
         let down = wp as u32 == WM_KEYDOWN || wp as u32 == WM_SYSKEYDOWN;
         let vk = k.vkCode as u16;
+        // Layout womöglich umgeschaltet: Die Leiste sieht gleich nach (statt
+        // ständig nachzufragen). Nur bei den wenigen betroffenen Tasten wird
+        // der Zustand der anderen abgefragt.
+        if !injected && !down && matches!(vk, VK_SPACE | VK_SHIFT | VK_LSHIFT | VK_RSHIFT | VK_MENU | VK_LMENU | VK_RMENU | VK_CONTROL | VK_LCONTROL | VK_RCONTROL) {
+            let (shift, ctrl, alt) = modifiers();
+            if layout_hotkey(vk, win_physically_down(), shift, ctrl, alt) {
+                PostMessageW(bar::hwnd(), bar::WM_BAR_KBD, 0, 0);
+            }
+        }
         if !injected {
             // Losgelassene Kombi-Taste (egal in welchem Zweig, auch nach der
             // Win-Taste): der nächste Druck zählt wieder als neuer.
@@ -219,6 +237,18 @@ pub fn reinstall() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_hotkeys() {
+        // Win+Leertaste, Alt+Umschalt (beide Reihenfolgen), Strg+Umschalt.
+        assert!(layout_hotkey(VK_SPACE, true, false, false, false));
+        assert!(!layout_hotkey(VK_SPACE, false, false, false, false));
+        assert!(layout_hotkey(VK_LSHIFT, false, false, false, true));
+        assert!(layout_hotkey(VK_LMENU, false, true, false, false));
+        assert!(layout_hotkey(VK_RSHIFT, false, false, true, false));
+        assert!(!layout_hotkey(VK_LSHIFT, false, false, false, false));
+        assert!(!layout_hotkey(VK_LMENU, false, false, false, false));
+    }
 
     const NONE: (bool, bool, bool) = (false, false, false);
     const SHIFT: (bool, bool, bool) = (true, false, false);

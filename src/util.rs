@@ -332,25 +332,108 @@ pub unsafe fn draw_alpha(dc: HDC, bmp: HBITMAP, x: i32, y: i32, size: i32) {
     DeleteDC(src);
 }
 
+thread_local! {
+    /// Wiederverwendete Zeichenpuffer (Breite, Höhe, Bitmap), zuletzt benutzte
+    /// vorne – Leiste, Uhr, Buttons und Popups malen meist in gleich große Bereiche.
+    static BUFFERS: std::cell::RefCell<Vec<(i32, i32, HBITMAP)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Speicher-DC dazu (bleibt bestehen).
+    static BUFFER_DC: std::cell::Cell<HDC> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// Läuft gerade ein paint_buffered (verschachtelt: eigener Puffer)?
+    static IN_PAINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// So viele Puffer verschiedener Größe bleiben liegen.
+const MAX_BUFFERS: usize = 4;
+
+/// Gemerkten Puffer passender Größe nehmen (aus dem Vorrat entfernt).
+fn take_buffer(w: i32, h: i32) -> Option<HBITMAP> {
+    BUFFERS.with(|b| {
+        let mut b = b.borrow_mut();
+        let i = b.iter().position(|e| e.0 == w && e.1 == h)?;
+        Some(b.remove(i).2)
+    })
+}
+
+/// Puffer zurücklegen (vorne); was über den Vorrat hinausgeht, freigeben.
+unsafe fn keep_buffer(w: i32, h: i32, bmp: HBITMAP) {
+    let evicted = BUFFERS.with(|b| {
+        let mut b = b.borrow_mut();
+        b.insert(0, (w, h, bmp));
+        let keep = b.len().min(MAX_BUFFERS);
+        b.split_off(keep)
+    });
+    for (_, _, old) in evicted {
+        DeleteObject(old);
+    }
+}
+
+/// COM für einen Arbeits-Thread: initialisiert beim Anlegen, gibt beim Ende
+/// des Gültigkeitsbereichs wieder frei (nur, wenn die Initialisierung gelang).
+/// Als erste Variable anlegen, damit COM-Objekte vorher freigegeben werden.
+pub struct ComGuard(bool);
+
+impl ComGuard {
+    pub fn sta() -> Self {
+        ComGuard(unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED) }.is_ok())
+    }
+
+    pub fn mta() -> Self {
+        ComGuard(unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) }.is_ok())
+    }
+}
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
 /// Doppelpuffer für WM_PAINT: zeichnet in `f` auf einen Speicher-DC und blittet.
+/// `f` bekommt Client-Koordinaten und die volle Client-Größe; der Puffer ist
+/// aber nur so groß wie der ungültige Bereich (Ursprung per SetViewportOrgEx
+/// verschoben) und wird für gleich große Bereiche wiederverwendet.
 pub unsafe fn paint_buffered(hwnd: HWND, f: impl FnOnce(HDC, i32, i32)) {
     let mut ps: PAINTSTRUCT = zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut rc: RECT = zeroed();
     GetClientRect(hwnd, &mut rc);
     let (w, h) = (rc.right, rc.bottom);
-    let mem = CreateCompatibleDC(hdc);
-    let bmp = CreateCompatibleBitmap(hdc, w, h);
+    let mut r: RECT = zeroed();
+    if IntersectRect(&mut r, &ps.rcPaint, &rc) == 0 {
+        EndPaint(hwnd, &ps);
+        return;
+    }
+    let (rw, rh) = (r.right - r.left, r.bottom - r.top);
+    let nested = IN_PAINT.with(|p| p.replace(true));
+    let cached_dc = if nested { std::ptr::null_mut() } else { BUFFER_DC.with(|d| d.get()) };
+    let mem = if cached_dc.is_null() {
+        let m = CreateCompatibleDC(hdc);
+        if !nested {
+            BUFFER_DC.with(|d| d.set(m));
+        }
+        m
+    } else {
+        cached_dc
+    };
+    let bmp = if nested { None } else { take_buffer(rw, rh) }.unwrap_or_else(|| CreateCompatibleBitmap(hdc, rw, rh));
     let old = SelectObject(mem, bmp);
-    // Nur der ungültige Bereich wird wirklich gerastert; Zeichenaufrufe
-    // außerhalb kosten fast nichts (Teil-Neuzeichnen z. B. nur der Uhr).
-    let r = ps.rcPaint;
+    // Zustand des (wiederverwendeten) DCs sichern: Was `f` auswählt oder
+    // einstellt, bleibt nicht hängen.
+    let saved = SaveDC(mem);
+    SetViewportOrgEx(mem, -r.left, -r.top, std::ptr::null_mut());
     IntersectClipRect(mem, r.left, r.top, r.right, r.bottom);
     f(mem, w, h);
-    BitBlt(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, mem, r.left, r.top, SRCCOPY);
+    BitBlt(hdc, r.left, r.top, rw, rh, mem, r.left, r.top, SRCCOPY);
+    RestoreDC(mem, saved);
     SelectObject(mem, old);
-    DeleteObject(bmp);
-    DeleteDC(mem);
+    if nested {
+        DeleteObject(bmp);
+        DeleteDC(mem);
+    } else {
+        keep_buffer(rw, rh, bmp);
+    }
+    IN_PAINT.with(|p| p.set(nested));
     EndPaint(hwnd, &ps);
 }
 

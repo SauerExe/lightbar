@@ -290,10 +290,7 @@ pub fn ask(question: String, notify: impl Fn() + Send + 'static) {
     notify();
     std::thread::spawn(move || {
         // Werkzeuge brauchen COM (App-Katalog, Suchindex, Audio).
-        unsafe {
-            use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        }
+        let _com = crate::util::ComGuard::sta();
         let result = run(&cfg, &messages, gen, &notify);
         update(gen, |a| {
             a.done = true;

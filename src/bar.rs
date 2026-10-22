@@ -71,7 +71,10 @@ const TIMER_AUTOHIDE: usize = 11;
 const TIMER_REFIT: usize = 12;
 /// Eingabesprache prüfen (Win+Leertaste, Alt+Umschalt melden sich nicht bei uns).
 const TIMER_KBD: usize = 13;
-const KBD_POLL_MS: u32 = 400;
+/// Sicherheitsnetz: Layoutwechsel melden Vordergrundwechsel und Tastaturhook
+/// (Win+Leertaste, Alt/Strg+Umschalt); was anders umschaltet (Sprachleiste,
+/// Apps selbst), fällt spätestens hier auf.
+const KBD_POLL_MS: u32 = 2000;
 /// Netzwerkmeldungen bündeln: erst nach dieser Ruhe Status (und WLAN) neu lesen.
 const TIMER_NET: usize = 14;
 const NET_DEBOUNCE_MS: u32 = 400;
@@ -108,6 +111,8 @@ pub const WM_BAR_NUM_LAST: u32 = WM_APP + 51;
 pub const WM_BAR_NUM_JUMP: u32 = WM_APP + 52;
 /// Win+B: Tastaturfokus in den Infobereich.
 pub const WM_BAR_TRAYFOCUS: u32 = WM_APP + 53;
+/// Tastenkürzel für Layoutwechsel gedrückt (aus dem Tastaturhook): nachsehen.
+pub const WM_BAR_KBD: u32 = WM_APP + 56;
 /// Automatisch ausblenden: Gründe zum Zeigen jetzt prüfen (nach Popups).
 const WM_BAR_AUTOHIDE: u32 = WM_APP + 55;
 /// Hervorhebung der Tray-Icons in der Registry geändert (`tray::watch_promoted`).
@@ -2013,6 +2018,8 @@ unsafe fn update_status(hwnd: HWND) {
 thread_local! {
     /// Aktueller Takt der Eingabesprache in ms (0 = keiner).
     static KBD_TIMER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Noch so viele schnelle Nachsehen nach einem Layout-Kürzel.
+    static KBD_BURST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 /// Takt der Eingabesprache an der Hauptleiste setzen (0 = anhalten).
@@ -2199,6 +2206,7 @@ unsafe fn kbd_menu(hwnd: HWND) {
     if crate::kbd::menu(hwnd, &k) {
         // Das Zielfenster stellt asynchron um: gleich und kurz danach nachsehen.
         update_kbd(self::hwnd(), false);
+        KBD_BURST.with(|b| b.set(3));
         arm_kbd(100);
     }
 }
@@ -3901,12 +3909,62 @@ unsafe fn draw_logo(dc: HDC, r: &RECT, dpi: u32) {
 /// Pixel zu einer Deckung mitteln und damit die Akzentfarbe über den
 /// vorhandenen Hintergrund mischen (HALFTONE schwingt über: helle und fast
 /// schwarze Säume).
+///
+/// Das Ergebnis wird je (DPI, Akzentfarbe) einmal als Bitmap mit
+/// vormultipliziertem Alpha erzeugt und per AlphaBlend gezeichnet – das
+/// ergibt dieselbe Mischung mit dem Hintergrund wie Pixel für Pixel.
 unsafe fn draw_tux(dc: HDC, r: &RECT, dpi: u32) {
+    thread_local! {
+        /// (DPI, Akzentfarbe, Breite, Höhe, Bitmap).
+        static TUX: std::cell::Cell<(u32, COLORREF, i32, i32, HBITMAP)> = const { std::cell::Cell::new((0, 0, 0, 0, std::ptr::null_mut())) };
+    }
+    let accent = accent();
+    let (mut d, mut c, mut w, mut h, mut bmp) = TUX.with(|t| t.get());
+    if bmp.is_null() || d != dpi || c != accent {
+        if !bmp.is_null() {
+            DeleteObject(bmp);
+        }
+        (w, h, bmp) = render_tux(dc, dpi, accent).unwrap_or((0, 0, null_mut()));
+        (d, c) = (dpi, accent);
+        TUX.with(|t| t.set((d, c, w, h, bmp)));
+    }
+    if bmp.is_null() {
+        return;
+    }
+    let (x, y) = (r.left + (r.right - r.left - w) / 2, r.top + (r.bottom - r.top - h) / 2);
+    let src = CreateCompatibleDC(dc);
+    let old = SelectObject(src, bmp);
+    let bf = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+    AlphaBlend(dc, x, y, w, h, src, 0, 0, w, h, bf);
+    SelectObject(src, old);
+    DeleteDC(src);
+}
+
+/// Deckung (0..1) eines Pixels aus SS × SS Maskenpixeln (grüner Kanal).
+fn tux_coverage(mask: &[u8], bw: i32, ss: i32, px_: i32, py: i32) -> f32 {
+    let mut sum = 0u32;
+    for sy in 0..ss {
+        let row = ((py * ss + sy) * bw + px_ * ss) as usize * 4;
+        for sx in 0..ss as usize {
+            sum += mask[row + sx * 4 + 1] as u32;
+        }
+    }
+    sum as f32 / (255 * ss * ss) as f32
+}
+
+/// Vormultipliziertes BGRA-Pixel der Farbe `c` mit Deckung `k`.
+fn premultiplied(c: COLORREF, k: f32) -> [u8; 4] {
+    let a = (k.clamp(0.0, 1.0) * 255.0).round();
+    let ch = |v: u32| ((v & 0xff) as f32 * a / 255.0).round() as u8;
+    [ch(c >> 16), ch(c >> 8), ch(c), a as u8]
+}
+
+/// Tux in der Akzentfarbe als Bitmap mit vormultipliziertem Alpha: (Breite, Höhe, Bitmap).
+unsafe fn render_tux(dc: HDC, dpi: u32, accent: COLORREF) -> Option<(i32, i32, HBITMAP)> {
     const SS: i32 = 4;
     // Entwurf 20 × 22, gezeichnet 26 px hoch: kleiner verschwimmt das Gesicht.
     let s = dpi as f32 / 96.0 * 26.0 / 22.0;
     let (w, h) = ((20.0 * s).round() as i32, (22.0 * s).round() as i32);
-    let (x, y) = (r.left + (r.right - r.left - w) / 2, r.top + (r.bottom - r.top - h) / 2);
     let (bw, bh) = (w * SS, h * SS);
     let mut bi: BITMAPINFO = zeroed();
     bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
@@ -3917,7 +3975,7 @@ unsafe fn draw_tux(dc: HDC, r: &RECT, dpi: u32) {
     let mut bits: *mut c_void = null_mut();
     let bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
     if bmp.is_null() {
-        return;
+        return None;
     }
     let mem = CreateCompatibleDC(dc);
     let old = SelectObject(mem, bmp);
@@ -3971,27 +4029,29 @@ unsafe fn draw_tux(dc: HDC, r: &RECT, dpi: u32) {
     ellipse(11.2, 17.0, 19.8, 22.0, a);
     GdiFlush();
     let mask = std::slice::from_raw_parts(bits as *const u8, (bw * bh * 4) as usize);
-    let accent = accent();
-    for py in 0..h {
-        for px_ in 0..w {
-            let mut sum = 0u32;
-            for sy in 0..SS {
-                let row = ((py * SS + sy) * bw + px_ * SS) as usize * 4;
-                for sx in 0..SS as usize {
-                    sum += mask[row + sx * 4 + 1] as u32;
-                }
+    // Ergebnis in Endgröße: Akzentfarbe mit der gemittelten Deckung als Alpha.
+    let mut oi: BITMAPINFO = zeroed();
+    oi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    oi.bmiHeader.biWidth = w;
+    oi.bmiHeader.biHeight = -h;
+    oi.bmiHeader.biPlanes = 1;
+    oi.bmiHeader.biBitCount = 32;
+    let mut out_bits: *mut c_void = null_mut();
+    let out = CreateDIBSection(dc, &oi, DIB_RGB_COLORS, &mut out_bits, null_mut(), 0);
+    if !out.is_null() {
+        let px_out = std::slice::from_raw_parts_mut(out_bits as *mut u8, (w * h * 4) as usize);
+        for py in 0..h {
+            for px_ in 0..w {
+                let i = ((py * w + px_) * 4) as usize;
+                px_out[i..i + 4].copy_from_slice(&premultiplied(accent, tux_coverage(mask, bw, SS, px_, py)));
             }
-            if sum == 0 {
-                continue;
-            }
-            let k = sum as f32 / (255 * SS * SS) as f32;
-            let under = GetPixel(dc, x + px_, y + py);
-            SetPixelV(dc, x + px_, y + py, mix(under, accent, k));
         }
+        GdiFlush();
     }
     SelectObject(mem, old);
     DeleteObject(bmp);
     DeleteDC(mem);
+    (!out.is_null()).then_some((w, h, out))
 }
 
 /// Uhr samt Hover-Fläche zeichnen (volles Zeichnen und Schnellweg).
@@ -4130,21 +4190,24 @@ unsafe fn paint_clock_only(hwnd: HWND, c: RECT) {
         return;
     };
     let (dpi, font, _) = bar_fonts(hwnd);
-    let mut ps: PAINTSTRUCT = zeroed();
-    let hdc = BeginPaint(hwnd, &mut ps);
-    let (w, h) = (c.right - c.left, c.bottom - c.top);
-    let mem = CreateCompatibleDC(hdc);
-    let bmp = CreateCompatibleBitmap(hdc, w, h);
-    let old = SelectObject(mem, bmp);
-    // Leisten-Koordinaten beibehalten: Ursprung des Puffers liegt bei der Uhr.
-    SetViewportOrgEx(mem, -c.left, -c.top, null_mut());
-    fill(mem, &c, BG);
-    draw_clock(mem, &c, dpi, font, k);
-    BitBlt(hdc, c.left, c.top, w, h, mem, c.left, c.top, SRCCOPY);
-    SelectObject(mem, old);
-    DeleteObject(bmp);
-    DeleteDC(mem);
-    EndPaint(hwnd, &ps);
+    // Der Puffer ist nur so groß wie der ungültige Bereich (die Uhr).
+    paint_buffered(hwnd, |dc, _, _| {
+        fill(dc, &c, BG);
+        draw_clock(dc, &c, dpi, font, k);
+    });
+}
+
+/// Was ein Bild von einem App-Button braucht.
+struct PaintGroup {
+    id: String,
+    windows: Vec<HWND>,
+    icon: HICON,
+    /// Aufmerksamkeit (Pulsstärke) oder None.
+    attention: Option<f32>,
+    /// Animationswerte: Position, Einblenden, Laufend-Strich.
+    x: Option<f32>,
+    appear: f32,
+    ind: f32,
 }
 
 unsafe fn paint(hwnd: HWND) {
@@ -4152,16 +4215,30 @@ unsafe fn paint(hwnd: HWND) {
         paint_clock_only(hwnd, c);
         return;
     }
+    // Nur die Werte, die dieses Bild braucht – nicht den ganzen Animationszustand.
     let snapshot = with(|s| {
-        let groups: Vec<(String, Vec<HWND>, HICON, Option<f32>)> = s
+        let groups: Vec<PaintGroup> = s
             .groups
             .iter()
-            .map(|g| (format!("g:{}", g.key), g.windows.clone(), g.icon, s.attention_of(&g.windows).map(attention_level)))
+            .map(|g| {
+                let id = format!("g:{}", g.key);
+                PaintGroup {
+                    x: s.anim.x.get(&id).copied(),
+                    appear: s.anim.appear.get(&id).copied().unwrap_or(0.0),
+                    ind: s.anim.ind.get(&id).copied().unwrap_or(0.0),
+                    windows: g.windows.clone(),
+                    icon: g.icon,
+                    attention: s.attention_of(&g.windows).map(attention_level),
+                    id,
+                }
+            })
             .collect();
         let dragged = s.drag.as_ref().filter(|d| d.active).and_then(|d| s.groups.iter().find(|g| g.slot == d.slot).map(|g| (format!("g:{}", g.key), d.pos)));
-        (s.dpi, s.font, s.icons, s.status.clone(), groups, s.anim.clone(), s.start.elapsed().as_secs_f32(), s.taskmgr_icon, s.cpu, dragged, s.hover_hwnd == hwnd)
+        // Hover gilt nur auf der Leiste unter der Maus.
+        let hover: Vec<(String, f32)> = if s.hover_hwnd == hwnd { s.anim.hover.iter().map(|(k, v)| (k.clone(), *v)).collect() } else { Vec::new() };
+        (s.status.clone(), groups, hover, s.anim.press.clone(), s.start.elapsed().as_secs_f32(), s.taskmgr_icon, s.cpu, dragged)
     });
-    let Some((_, _, _, status, groups, anim, t, taskmgr_icon, cpu, dragged, hover_here)) = snapshot else {
+    let Some((status, groups, hover, press_anim, t, taskmgr_icon, cpu, dragged)) = snapshot else {
         let mut ps: PAINTSTRUCT = zeroed();
         BeginPaint(hwnd, &mut ps);
         EndPaint(hwnd, &ps);
@@ -4171,7 +4248,7 @@ unsafe fn paint(hwnd: HWND) {
     let slide = animates_positions(hwnd);
     let edge = crate::display::edge();
     let vertical = edge.vertical();
-    let hv =|id: &str| if hover_here { anim.hover.get(id).copied().unwrap_or(0.0) } else { 0.0 };
+    let hv = |id: &str| hover.iter().find(|(k, _)| k == id).map_or(0.0, |(_, v)| *v);
     let Some((l, tray)) = current_layout(hwnd) else {
         ValidateRect(hwnd, null());
         return;
@@ -4222,11 +4299,11 @@ unsafe fn paint(hwnd: HWND) {
 
         let fg = GetForegroundWindow();
         let is = px(dpi, metrics(crate::display::small_buttons()).icon);
-        for (i, (id, windows, icon, attention)) in groups.iter().enumerate() {
+        for (i, PaintGroup { id, windows, icon, attention, x: anim_x, appear: anim_appear, ind: anim_ind }) in groups.iter().enumerate() {
             let Some(base) = l.tasks.get(i) else { continue };
             // Weich nachrutschende Position (entlang der Leiste).
             let rel = lead(vertical, base) - lead(vertical, &l.start);
-            let d = if slide { anim.x.get(id).map(|x| x.round() as i32 - rel).unwrap_or(0) } else { 0 };
+            let d = if slide { anim_x.map(|x| x.round() as i32 - rel).unwrap_or(0) } else { 0 };
             let mut r = shifted(vertical, base, d);
             // Gezogener Button klebt am Mauszeiger (senkrecht nur in y).
             let is_dragged = dragged.as_ref().is_some_and(|(did, _)| did == id);
@@ -4243,8 +4320,8 @@ unsafe fn paint(hwnd: HWND) {
                 hover_bg(dc, &r, hv(id));
             }
             // Einblenden (wächst aus 55 %) und Feder beim Klick.
-            let appear = anim::ease_out(anim.appear.get(id).copied().unwrap_or(0.0));
-            let press = match &anim.press {
+            let appear = anim::ease_out(*anim_appear);
+            let press = match &press_anim {
                 Some((pid, t0)) if pid == id => {
                     let p = (t0.elapsed().as_secs_f32() / PRESS_S).min(1.0);
                     1.0 - 0.16 * (p * std::f32::consts::PI).sin()
@@ -4289,7 +4366,7 @@ unsafe fn paint(hwnd: HWND) {
                     }
                 }
             }
-            let iw = anim.ind.get(id).copied().unwrap_or(0.0).round() as i32;
+            let iw = anim_ind.round() as i32;
             if iw >= 1 {
                 let ih = px(dpi, 3).max(2);
                 let cx = (r.left + r.right) / 2;
@@ -4650,6 +4727,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             autohide_wake();
             0
         }
+        // Layout-Kürzel (Hook) oder Sprachwechsel an uns: gleich und kurz danach
+        // nachsehen (die Zielanwendung stellt asynchron um).
+        WM_BAR_KBD | WM_INPUTLANGCHANGE if hwnd == self::hwnd() => {
+            update_kbd(hwnd, false);
+            if with(|s| s.kbd.is_some()).unwrap_or(false) {
+                KBD_BURST.with(|b| b.set(3));
+                arm_kbd(100);
+            }
+            if msg == WM_INPUTLANGCHANGE {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            0
+        }
         WM_BAR_TRAYPREFS => {
             tray::load_promoted();
             InvalidateRect(hwnd, null(), 0);
@@ -4679,11 +4769,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_TIMER if wp == TIMER_KBD => {
-            // Win+Leertaste/Alt+Umschalt meldet niemand: kurz nachsehen (billig,
-            // gezeichnet wird nur bei Änderung). Setzt auch den Takt nach dem
-            // schnellen Nachsehen aus dem Menü zurück.
-            // Stellt den Takt danach selbst wieder auf 400 ms bzw. hält ihn an.
+            // Nachsehen (billig, gezeichnet wird nur bei Änderung); stellt den
+            // Takt danach selbst auf das Sicherheitsnetz zurück bzw. hält ihn
+            // an. Nach einem Layout-Kürzel ein paar Mal kurz hintereinander –
+            // die Zielanwendung stellt asynchron um.
             update_kbd(hwnd, false);
+            if KBD_BURST.with(|b| b.replace(b.get().saturating_sub(1))) > 0 && with(|s| s.kbd.is_some()).unwrap_or(false) {
+                arm_kbd(150);
+            }
             0
         }
         WM_TIMER if wp == TIMER_CPU => {
@@ -5549,6 +5642,18 @@ mod tests {
         assert_eq!(autohide_interval(false, 1.0, true, false), HOLD_MS);
         // Verzögerung nach dem Verlassen läuft.
         assert_eq!(autohide_interval(false, 1.0, false, false), POLL_MS);
+    }
+
+    #[test]
+    fn tux_pixels_are_premultiplied() {
+        let c = rgb(200, 100, 50);
+        assert_eq!(premultiplied(c, 1.0), [50, 100, 200, 255]);
+        assert_eq!(premultiplied(c, 0.0), [0, 0, 0, 0]);
+        // Halbe Deckung: Farbe halb, AlphaBlend mischt dann wie mix(unter, c, 0.5).
+        assert_eq!(premultiplied(c, 0.5), [25, 50, 100, 128]);
+        // Deckung aus 2 × 2 Maskenpixeln (grüner Kanal).
+        let mask = [0, 255, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0];
+        assert_eq!(tux_coverage(&mask, 2, 2, 0, 0), 0.75);
     }
 
     #[test]

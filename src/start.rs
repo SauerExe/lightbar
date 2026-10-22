@@ -197,6 +197,9 @@ struct State {
     hidden_at: Option<Instant>,
     /// Gesetzter Chat zu (Inhalt+Breite als Hash), damit Scrollen nicht neu misst.
     chat_layout: Option<(u64, crate::chat::Layout)>,
+    /// Gesetzte Runden (Schlüssel, Layout ab y = 0): fertige werden beim
+    /// Streamen nicht neu gesetzt, nur die laufende.
+    chat_turns: Vec<(u64, crate::chat::Layout)>,
     /// Zuletzt kopierter Text (Hash) für das kurze „Kopiert“.
     copied: Option<(u64, Instant)>,
     mouse: (i32, i32),
@@ -250,6 +253,7 @@ impl State {
             input: String::new(),
             hidden_at: None,
             chat_layout: None,
+            chat_turns: Vec::new(),
             copied: None,
             mouse: (-1, -1),
             tracking: false,
@@ -1284,7 +1288,7 @@ unsafe fn check_catalog(hwnd: HWND) -> bool {
     };
     let target = hwnd as isize;
     std::thread::spawn(move || unsafe {
-        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        let _com = crate::util::ComGuard::sta();
         let now = apps::enumerate_ids();
         let changed = !now.is_empty() && catalog_sig(now.iter().map(|(n, i)| (n.as_str(), i.as_str()))) != sig;
         PostMessageW(target as HWND, WM_CATALOG, changed as usize, 0);
@@ -1533,11 +1537,23 @@ unsafe fn draw_answer(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bott
         _ => {
             let answers = crate::ai::turns();
             let m = GdiMeasure::new(dc, f, d);
-            let turns: Vec<crate::chat::Turn> = answers
+            let cache = std::mem::take(&mut st.chat_turns);
+            let parts: Vec<(u64, crate::chat::Layout)> = answers
                 .iter()
-                .map(|a| crate::chat::Turn { question: &a.question, steps: steps(a), text: &a.text, thinking: a.thinking, done: a.done, error: a.error.as_deref() })
+                .enumerate()
+                .map(|(i, a)| {
+                    let turn = crate::chat::Turn { question: &a.question, steps: steps(a), text: &a.text, thinking: a.thinking, done: a.done, error: a.error.as_deref() };
+                    let key = crate::chat::turn_key(&turn, width, d);
+                    // Fertige, unveränderte Runde: gemerktes Layout.
+                    match cache.get(i) {
+                        Some((k, l)) if *k == key && a.done => (key, l.clone()),
+                        _ => (key, crate::chat::layout_turn(&m, &turn, width, d)),
+                    }
+                })
                 .collect();
-            crate::chat::layout(&m, &turns, width, d)
+            let layouts: Vec<crate::chat::Layout> = parts.iter().map(|p| p.1.clone()).collect();
+            st.chat_turns = parts;
+            crate::chat::stack(&layouts, d)
         }
     };
     let lead = px(d, 4);
@@ -1710,18 +1726,56 @@ unsafe fn start_file_search(hwnd: HWND) {
     if query.chars().count() < 2 {
         return; // Ein Zeichen findet zu viel, um nützlich zu sein.
     }
-    let target = hwnd as isize;
-    std::thread::spawn(move || unsafe {
-        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
-        let found = apps::search_index(&query, 12);
-        if let Ok(mut r) = FILE_RESULTS.lock() {
-            // Ein langsamer älterer Lauf überschreibt kein neueres Ergebnis.
-            if r.as_ref().map_or(true, |(g, _, _)| *g < gen) {
-                *r = Some((gen, query, found));
-            }
+    file_worker().submit((gen, query, hwnd as isize));
+}
+
+/// Ein Arbeits-Thread für die Dateisuche: Es gilt immer nur die neueste
+/// Anfrage – was beim Tippen dazwischen kam, wird übersprungen, statt je
+/// Tastendruck einen Thread mit eigener Index-Abfrage zu starten.
+struct FileWorker {
+    job: std::sync::Mutex<Option<(u64, String, isize)>>,
+    ready: std::sync::Condvar,
+}
+
+impl FileWorker {
+    fn submit(&self, job: (u64, String, isize)) {
+        if let Ok(mut j) = self.job.lock() {
+            *j = Some(job);
+            self.ready.notify_one();
         }
-        PostMessageW(target as HWND, WM_FILES, gen as usize, 0);
-    });
+    }
+
+    /// Nächste (neueste) Anfrage abwarten.
+    fn next(&self) -> Option<(u64, String, isize)> {
+        let mut j = self.job.lock().ok()?;
+        loop {
+            if let Some(job) = j.take() {
+                return Some(job);
+            }
+            j = self.ready.wait(j).ok()?;
+        }
+    }
+}
+
+fn file_worker() -> &'static FileWorker {
+    static W: std::sync::OnceLock<&'static FileWorker> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
+        let w: &'static FileWorker = Box::leak(Box::new(FileWorker { job: std::sync::Mutex::new(None), ready: std::sync::Condvar::new() }));
+        std::thread::spawn(move || {
+            let _com = crate::util::ComGuard::sta();
+            while let Some((gen, query, target)) = w.next() {
+                let found = apps::search_index(&query, 12);
+                if let Ok(mut r) = FILE_RESULTS.lock() {
+                    // Ein älterer Lauf überschreibt kein neueres Ergebnis.
+                    if r.as_ref().map_or(true, |(g, _, _)| *g < gen) {
+                        *r = Some((gen, query, found));
+                    }
+                }
+                unsafe { PostMessageW(target as HWND, WM_FILES, gen as usize, 0) };
+            }
+        });
+        w
+    })
 }
 
 /// Index-Treffer übernehmen, wenn sie noch zur aktuellen Eingabe gehören.

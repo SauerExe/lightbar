@@ -438,14 +438,60 @@ fn mtime(path: &std::path::Path) -> i64 {
     std::fs::metadata(path).and_then(|m| m.modified()).map(unix).unwrap_or(0)
 }
 
+/// Kalenderdatum (Jahr, Monat, Tag, UTC) zu Unix-Sekunden.
+fn ymd(unix: i64) -> (u32, u32, u32) {
+    // Nach Howard Hinnant, "civil_from_days".
+    let z = unix.div_euclid(86400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    (y as u32, m as u32, d as u32)
+}
+
+/// Liegt ein Datumsordner (`JJJJ`, `JJJJ/MM` oder `JJJJ/MM/TT`, als bisher
+/// gelesene Zahlen) ganz vor dem Stichtag? Dann enthält er nichts Neues.
+fn dated_dir_too_old(date: &[u32], since: (u32, u32, u32)) -> bool {
+    let s = [since.0, since.1, since.2];
+    let n = date.len().min(3);
+    date[..n] < s[..n]
+}
+
 /// Alle `rollout-*.jsonl` unter `dir` (rekursiv) mit Änderungszeit ab `since`.
+/// Datumsordner (`JJJJ/MM/TT`), die ganz vor `since` liegen, werden gar nicht
+/// erst betreten – über Monate wächst `sessions` auf Tausende Dateien.
 fn collect_rollouts(dir: &std::path::Path, since: i64, out: &mut Vec<(i64, u64, PathBuf)>) {
+    // Ordner sind nach lokalem Datum benannt: einen Tag Spielraum.
+    collect_rollouts_in(dir, since, ymd(since - 86400), &mut Vec::new(), out);
+}
+
+fn collect_rollouts_in(dir: &std::path::Path, since: i64, cutoff: (u32, u32, u32), date: &mut Vec<u32>, out: &mut Vec<(i64, u64, PathBuf)>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let Ok(meta) = e.metadata() else { continue };
         let path = e.path();
         if meta.is_dir() {
-            collect_rollouts(&path, since, out);
+            // Nur Zahlen-Ordner bis Tiefe 3 als Datum lesen (Jahr, Monat, Tag).
+            let part = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()).filter(|_| date.len() < 3 && date.len() == depth_of_dates(date));
+            match part {
+                Some(p) => {
+                    date.push(p);
+                    if !dated_dir_too_old(date, cutoff) {
+                        collect_rollouts_in(&path, since, cutoff, date, out);
+                    }
+                    date.pop();
+                }
+                None => {
+                    // Kein Datumsordner: normal hineinsehen, Datum dort nicht mehr werten.
+                    date.push(u32::MAX);
+                    collect_rollouts_in(&path, since, cutoff, date, out);
+                    date.pop();
+                }
+            }
             continue;
         }
         let name = e.file_name();
@@ -458,6 +504,12 @@ fn collect_rollouts(dir: &std::path::Path, since: i64, out: &mut Vec<(i64, u64, 
             out.push((modified, meta.len(), path));
         }
     }
+}
+
+/// Wie viele führende Einträge von `date` echte Datumsteile sind (u32::MAX
+/// markiert einen Ordner, der kein Datum ist – darunter wird nicht gefiltert).
+fn depth_of_dates(date: &[u32]) -> usize {
+    date.iter().take_while(|&&p| p != u32::MAX).count()
 }
 
 /// Bereits gelesene Protokolle: (Änderungszeit, Größe, Ergebnis). Unveränderte
@@ -1780,6 +1832,35 @@ mod usage_tests {
         let mut none = Vec::new();
         collect_rollouts(&dir.join("fehlt"), 0, &mut none);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn dates_and_old_folders() {
+        assert_eq!(ymd(0), (1970, 1, 1));
+        assert_eq!(ymd(1_792_667_924), (2026, 10, 22));
+        assert_eq!(ymd(951_782_400), (2000, 2, 29));
+        let since = (2026, 10, 14);
+        assert!(dated_dir_too_old(&[2025], since));
+        assert!(!dated_dir_too_old(&[2026], since));
+        assert!(dated_dir_too_old(&[2026, 9], since));
+        assert!(!dated_dir_too_old(&[2026, 10], since));
+        assert!(dated_dir_too_old(&[2026, 10, 13], since));
+        assert!(!dated_dir_too_old(&[2026, 10, 14], since));
+        assert!(!dated_dir_too_old(&[2026, 11, 1], since));
+    }
+
+    #[test]
+    fn skips_old_day_folders() {
+        let dir = std::env::temp_dir().join(format!("lightbar-usage-old-{}", std::process::id()));
+        let old = dir.join("sessions").join("2001").join("01").join("02");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("rollout-alt.jsonl"), NEW_FORMAT).unwrap();
+        let mut files = Vec::new();
+        // Stichtag heute: der Ordner von 2001 wird nicht betreten, obwohl die
+        // Datei gerade erst geschrieben wurde.
+        collect_rollouts(&dir.join("sessions"), now(), &mut files);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(files.is_empty());
     }
 
     #[test]

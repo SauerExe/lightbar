@@ -558,14 +558,54 @@ pub fn wrap_code(m: &dyn Measure, code: &str, width: i32) -> Vec<String> {
 }
 
 /// Ganze Unterhaltung setzen. Koordinaten relativ zu (0, 0), Breite `width`.
+#[cfg(test)]
 pub fn layout(m: &dyn Measure, turns: &[Turn], width: i32, dpi: u32) -> Layout {
+    let parts: Vec<Layout> = turns.iter().map(|t| layout_turn(m, t, width, dpi)).collect();
+    stack(&parts, dpi)
+}
+
+/// Runden (je für sich ab y = 0 gesetzt) mit Abstand untereinander setzen.
+/// So lassen sich fertige Runden zwischenspeichern; beim Streamen wird nur
+/// die laufende neu gesetzt.
+pub fn stack(parts: &[Layout], dpi: u32) -> Layout {
+    let mut items = Vec::with_capacity(parts.iter().map(|p| p.items.len()).sum());
+    let mut y = 0;
+    for (n, p) in parts.iter().enumerate() {
+        if n > 0 {
+            y += px(dpi, 20);
+        }
+        items.extend(p.items.iter().cloned().map(|mut i| {
+            shift_item(&mut i, y);
+            i
+        }));
+        y += p.height;
+    }
+    Layout { items, height: y }
+}
+
+/// Element um `dy` nach unten verschieben.
+fn shift_item(i: &mut Item, dy: i32) {
+    match i {
+        Item::Run(r) => shift(&mut r.rect, 0, dy),
+        Item::Bubble(r) | Item::CodePanel(r) | Item::Rule(r) => shift(r, 0, dy),
+        Item::Copy { rect, .. } | Item::Marker { rect, .. } => shift(rect, 0, dy),
+    }
+}
+
+/// Fingerabdruck einer Runde samt Breite und Skalierung: gleich = gleiches Layout.
+pub fn turn_key(t: &Turn, width: i32, dpi: u32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (t.question, t.steps, t.text, t.thinking, t.done, t.error, width, dpi).hash(&mut h);
+    h.finish()
+}
+
+/// Eine Runde setzen, oben bei y = 0; `height` ist ihre Unterkante.
+pub fn layout_turn(m: &dyn Measure, turn: &Turn, width: i32, dpi: u32) -> Layout {
     let d = dpi;
     let mut items = Vec::new();
     let mut y = 0;
-    for (n, turn) in turns.iter().enumerate() {
-        if n > 0 {
-            y += px(d, 20);
-        }
+    {
         // Eigene Frage: rechtsbündige Blase, höchstens 80 % breit.
         let (bx, by) = (px(d, 12), px(d, 8));
         let max_w = width * 4 / 5 - 2 * bx;
@@ -872,6 +912,29 @@ mod tests {
         assert!(l.items.iter().any(|i| matches!(i, Item::CodePanel(_))));
         let last = l.items.iter().filter_map(|i| if let Item::Copy { rect, .. } = i { Some(rect.bottom) } else { None }).max().unwrap();
         assert_eq!(l.height, last);
+    }
+
+    #[test]
+    fn stacked_turns_match_full_layout() {
+        let steps = vec!["Schritt".to_string()];
+        let a = Turn { question: "erste Frage", steps: &[], text: "Antwort **fett**\n\n- eins\n- zwei", thinking: false, done: true, error: None };
+        let b = Turn { question: "zweite", steps: &steps, text: "läuft", thinking: false, done: false, error: None };
+        let full = layout(&Fixed, &[a, b], 360, 120);
+        let a = Turn { question: "erste Frage", steps: &[], text: "Antwort **fett**\n\n- eins\n- zwei", thinking: false, done: true, error: None };
+        let b = Turn { question: "zweite", steps: &steps, text: "läuft", thinking: false, done: false, error: None };
+        let parts = [layout_turn(&Fixed, &a, 360, 120), layout_turn(&Fixed, &b, 360, 120)];
+        let stacked = stack(&parts, 120);
+        assert_eq!(stacked.height, full.height);
+        let rects = |l: &Layout| l.items.iter().map(|i| match i {
+            Item::Run(r) => r.rect,
+            Item::Bubble(r) | Item::CodePanel(r) | Item::Rule(r) => *r,
+            Item::Copy { rect, .. } | Item::Marker { rect, .. } => *rect,
+        }).map(|r| (r.left, r.top, r.right, r.bottom)).collect::<Vec<_>>();
+        assert_eq!(rects(&stacked), rects(&full));
+        // Gleicher Inhalt, gleicher Schlüssel; anderer Text oder Breite: anderer.
+        assert_eq!(turn_key(&a, 360, 120), turn_key(&a, 360, 120));
+        assert_ne!(turn_key(&a, 360, 120), turn_key(&a, 361, 120));
+        assert_ne!(turn_key(&a, 360, 120), turn_key(&b, 360, 120));
     }
 
     #[test]

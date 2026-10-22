@@ -474,7 +474,8 @@ pub fn set_wanted(id: &str, on: bool) {
 /// der Position) kein WM_SETTINGCHANGE – so wirken sie trotzdem sofort.
 pub fn watch(notify: impl Fn() + Send + 'static) {
     std::thread::spawn(move || unsafe {
-        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects, INFINITE};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects, WaitForSingleObject, INFINITE};
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         let keys = [ADVANCED, r"Software\Microsoft\Windows\CurrentVersion\Search", r"Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3"];
         let mut handles: Vec<(HKEY, HANDLE)> = Vec::new();
         for k in keys {
@@ -488,16 +489,30 @@ pub fn watch(notify: impl Fn() + Send + 'static) {
         if handles.is_empty() {
             return;
         }
+        // Jede Meldung gilt nur einmal: anfangs alle Schlüssel anmelden, danach
+        // nur den (bzw. die), deren Ereignis kam.
+        let arm = |(key, event): (HKEY, HANDLE)| {
+            RegNotifyChangeKeyValue(key, 0, REG_NOTIFY_CHANGE_LAST_SET, event, 1);
+        };
+        for &h in &handles {
+            arm(h);
+        }
+        let events: Vec<HANDLE> = handles.iter().map(|h| h.1).collect();
         loop {
-            for &(key, event) in &handles {
-                RegNotifyChangeKeyValue(key, 0, REG_NOTIFY_CHANGE_LAST_SET, event, 1);
-            }
-            let events: Vec<HANDLE> = handles.iter().map(|h| h.1).collect();
-            if WaitForMultipleObjects(events.len() as u32, events.as_ptr(), 0, INFINITE) >= events.len() as u32 {
+            let fired = WaitForMultipleObjects(events.len() as u32, events.as_ptr(), 0, INFINITE).wrapping_sub(WAIT_OBJECT_0) as usize;
+            if fired >= events.len() {
                 return;
             }
             // Einstellungen-App schreibt oft mehrere Werte nacheinander.
             std::thread::sleep(std::time::Duration::from_millis(150));
+            arm(handles[fired]);
+            // Was in der Zwischenzeit an anderen Schlüsseln kam, gleich mit
+            // erledigen (eine Meldung an die Leiste) und neu anmelden.
+            for (i, &h) in handles.iter().enumerate() {
+                if i != fired && WaitForSingleObject(h.1, 0) == WAIT_OBJECT_0 {
+                    arm(h);
+                }
+            }
             notify();
         }
     });

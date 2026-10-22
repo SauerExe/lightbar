@@ -165,7 +165,13 @@ pub unsafe fn show(targets: &[HWND], icon: HICON, anchor: RECT, dpi: u32) {
             s.icons = icon_font(dpi, 10);
             s.dpi = dpi;
         }
-        s.icon = icon;
+        // Eigene Kopie: Das Gruppen-Icon der Leiste kann beim nächsten Einlesen
+        // (refresh) zerstört werden, während die Vorschau noch offen ist.
+        let copy = if icon.is_null() { null_mut() } else { CopyIcon(icon) };
+        let old = std::mem::replace(&mut s.icon, copy);
+        if !old.is_null() {
+            DestroyIcon(old);
+        }
         s.items = items;
     });
 

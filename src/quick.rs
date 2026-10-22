@@ -11,7 +11,6 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use windows::Devices::Radios::{Radio, RadioKind, RadioState};
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -90,7 +89,7 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 fn query_radios() {
     let target = hwnd() as isize;
     std::thread::spawn(move || unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _com = crate::util::ComGuard::mta();
         let bits = radio_bits().unwrap_or(0);
         PostMessageW(target as HWND, WM_RADIOS, bits, 0);
     });
@@ -114,7 +113,7 @@ fn radio_bits() -> windows::core::Result<usize> {
 fn toggle_radio(kind: RadioKind) {
     let target = hwnd() as isize;
     std::thread::spawn(move || unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _com = crate::util::ComGuard::mta();
         let _ = (|| -> windows::core::Result<()> {
             Radio::RequestAccessAsync()?.get()?;
             let radios = Radio::GetRadiosAsync()?.get()?;
