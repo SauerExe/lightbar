@@ -40,7 +40,9 @@ const DORMANT_S: u32 = 120;
 /// Pause zwischen zwei Kometen: kurz, solange an der Leiste etwas passiert
 /// (bis `AWAKE_S` nach Hover, Impuls oder Aufmerksamkeit), sonst länger.
 const COMET_GAP_AWAKE: f32 = 5.4;
-const COMET_GAP_QUIET: f32 = 43.4;
+/// Ruhig: 2 Bilder/s plus ~48 Kometenbilder alle ~2,5 min ≈ 2,3 Aufwachen/s
+/// (mit kurzer Pause wären es ~8/s – der Komet ist das Teuerste im Leerlauf).
+const COMET_GAP_QUIET: f32 = 150.0;
 const AWAKE_S: f32 = 60.0;
 /// So lange pulsiert das Orange einer App, die Aufmerksamkeit will; danach
 /// leuchtet es ruhig (wie die Buttons der Leiste).

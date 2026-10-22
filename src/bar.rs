@@ -5066,6 +5066,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_CAPTURECHANGED => {
             with(|s| s.drag = None);
+            // Nach dem Ziehen kommt nicht unbedingt WM_MOUSELEAVE: Ausblenden neu prüfen.
+            autohide_left(hwnd);
             0
         }
         WM_LBUTTONUP => {
