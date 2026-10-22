@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn lru_drops_least_recently_used() {
-        let mut c = Lru::new(2);
+        let mut c = crate::util::Lru::new(2);
         c.insert("a", 1);
         c.insert("b", 2);
         assert_eq!(c.get(&"a"), Some(&1));
