@@ -662,7 +662,7 @@ unsafe fn current_layout(hwnd: HWND) -> Option<(Layout, Vec<(usize, HICON)>)> {
         small: crate::display::small_buttons(),
         // Suche und Aufgabenansicht nur auf der Hauptleiste (wie bei Windows
         // zeigen Zweitleisten nur Start und Apps).
-        search: if primary { crate::display::search_mode() } else { 0 },
+        search: if primary && settings.taskbar_search { crate::display::search_mode() } else { 0 },
         task_view: primary && crate::display::task_view_button(),
     });
     if primary {
@@ -1233,7 +1233,7 @@ unsafe fn bar_menu(hwnd: HWND) {
             ),
             Item::Sub(t!("Startmenü", "Start menu"), vec![Item::Check(22, t!("Profilbild anzeigen", "Show profile picture"), s.start_avatar)]),
             Item::Check(14, t!("Uhr mit Sekunden", "Show seconds in clock"), clock_seconds()),
-            Item::Check(23, t!("Suche anzeigen", "Show search"), crate::display::search_mode() > 0),
+            Item::Check(23, t!("Suche anzeigen", "Show search"), s.taskbar_search && crate::display::search_mode() > 0),
             Item::Check(24, t!("Aufgabenansicht anzeigen", "Show Task view"), crate::display::task_view_button()),
             Item::Check(28, t!("Eingabesprache anzeigen", "Show input language"), s.input_lang),
             Item::Check(15, t!("Claude/Codex-Usage anzeigen", "Show Claude/Codex usage"), s.show_usage),
@@ -1273,7 +1273,15 @@ unsafe fn bar_menu(hwnd: HWND) {
         21 => crate::settings::update(|s| s.start_logo = StartLogo::Tux),
         22 => crate::settings::update(|s| s.start_avatar = !s.start_avatar),
         // Schreiben dieselben Windows-Einstellungen (Personalisierung → Taskleiste).
-        23 => crate::display::set_search(crate::display::search_mode() == 0),
+        // Lightbar-eigener Schalter; beim Einschalten auch Windows' Suchfeld an.
+        23 => {
+            let on = !(crate::settings::get().taskbar_search && crate::display::search_mode() > 0);
+            crate::settings::update(|s| s.taskbar_search = on);
+            if on && crate::display::search_mode() == 0 {
+                crate::display::set_search(true);
+            }
+            apply_taskbar_settings();
+        }
         24 => crate::display::set_task_view(!crate::display::task_view_button()),
         15 => crate::settings::update(|s| {
             s.show_usage = !s.show_usage;
