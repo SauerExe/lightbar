@@ -863,8 +863,8 @@ fn rpc_wait(rx: &std::sync::mpsc::Receiver<String>, id: i64, deadline: std::time
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         let line = match rx.recv_timeout(left) {
             Ok(l) => l,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err("Codex: App-Server antwortet nicht (Zeitüberschreitung)".into()),
-            Err(_) => return Err("Codex: App-Server unerwartet beendet".into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(t!("Codex: App-Server antwortet nicht (Zeitüberschreitung)", "Codex: app server not responding (timeout)").into()),
+            Err(_) => return Err(t!("Codex: App-Server unerwartet beendet", "Codex: app server exited unexpectedly").into()),
         };
         if let Some(r) = rpc_response(&line, id) {
             return r;
@@ -888,7 +888,7 @@ fn rpc_response(line: &str, id: i64) -> Option<Result<Value, Failure>> {
             text.into()
         }));
     }
-    Some(v.get_mut("result").map(Value::take).ok_or_else(|| "Codex: App-Server-Antwort unlesbar".into()))
+    Some(v.get_mut("result").map(Value::take).ok_or_else(|| t!("Codex: App-Server-Antwort unlesbar", "Codex: unreadable app server response").into()))
 }
 
 /// Codex' Limits über den App-Server des offiziellen CLI.
@@ -898,7 +898,7 @@ fn fetch_codex_app_server() -> Result<Fetched, Failure> {
     use std::process::{Command, Stdio};
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let cli = codex_cli().ok_or("Codex: Codex-CLI nicht gefunden")?;
+    let cli = codex_cli().ok_or(t!("Codex: Codex-CLI nicht gefunden", "Codex: Codex CLI not found"))?;
     let mut child = Command::new(&cli.program)
         .args(&cli.prefix)
         .args(["-s", "read-only", "-a", "never", "app-server"])
@@ -925,8 +925,8 @@ fn fetch_codex_app_server() -> Result<Fetched, Failure> {
     let mut stdin = child.stdin.take();
     let result = (|| {
         let mut send = |msg: Value| -> Result<(), Failure> {
-            let w = stdin.as_mut().ok_or("Codex: App-Server nicht erreichbar")?;
-            writeln!(w, "{msg}").and_then(|_| w.flush()).map_err(|_| Failure::from("Codex: App-Server unerwartet beendet"))
+            let w = stdin.as_mut().ok_or(t!("Codex: App-Server nicht erreichbar", "Codex: app server unreachable"))?;
+            writeln!(w, "{msg}").and_then(|_| w.flush()).map_err(|_| Failure::from(t!("Codex: App-Server unerwartet beendet", "Codex: app server exited unexpectedly")))
         };
         let version = env!("CARGO_PKG_VERSION");
         send(serde_json::json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "lightbar", "title": "Lightbar", "version": version}}}))?;
@@ -935,7 +935,7 @@ fn fetch_codex_app_server() -> Result<Fetched, Failure> {
         send(serde_json::json!({"id": 2, "method": "account/rateLimits/read", "params": {"excludeResetCreditDetails": true}}))?;
         let fetched = now();
         let r = rpc_wait(&rx, 2, deadline)?;
-        let limits = parse_app_server_limits(&r, fetched).ok_or("Codex: App-Server-Antwort ohne Limits")?;
+        let limits = parse_app_server_limits(&r, fetched).ok_or(t!("Codex: App-Server-Antwort ohne Limits", "Codex: app server response has no limits"))?;
         Ok(Fetched { limits, at: fetched, local: false })
     })();
     // stdin schließen → Codex beendet sich; sonst nach kurzer Frist beenden.
