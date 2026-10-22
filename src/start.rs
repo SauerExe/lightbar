@@ -32,6 +32,16 @@ const WM_AI: u32 = WM_APP + 13;
 const TIMER_FILES: usize = 4;
 /// Blendet das „Kopiert“ nach dem Kopieren wieder aus.
 const TIMER_COPIED: usize = 5;
+/// Hintergrundprüfung des App-Katalogs fertig (wp = 1: hat sich geändert).
+const WM_CATALOG: u32 = WM_APP + 14;
+/// Shell meldet Änderungen in den Startmenü-Ordnern.
+const WM_SHELL_CHANGE: u32 = WM_APP + 15;
+/// Element per Screenreader auslösen (wp = `Focus::code`).
+const WM_UIA_INVOKE: u32 = WM_APP + 16;
+/// Wartet nach Änderungen in den Startmenü-Ordnern, bis die Installation fertig ist.
+const TIMER_APPS: usize = 6;
+/// Älter als das wird der Katalog beim Öffnen im Hintergrund geprüft.
+const CATALOG_MAX_AGE: Duration = Duration::from_secs(30);
 /// So lange bleibt ein Chat nach dem Ausblenden erhalten.
 const CHAT_KEEP: Duration = Duration::from_secs(10 * 60);
 
@@ -189,6 +199,150 @@ struct State {
     mouse: (i32, i32),
     tracking: bool,
     hits: Vec<(RECT, Act)>,
+    /// Zusatz-Suchschlüssel je App: (exe-Name, Kern der Kennung); leer = neu bauen.
+    app_keys: Vec<(Option<String>, String)>,
+    /// Starts je App-Kennung (launches.txt).
+    launches: HashMap<String, u32>,
+    /// Tastaturfokus (Suchfeld, Kachel, Listenzeile, Fußleiste).
+    focus: Focus,
+    /// Fokusrahmen zeigen – erst nach Tastaturbedienung, wie bei Windows.
+    kb: bool,
+    /// Fokussierbare Elemente des letzten Frames mit ihrer Fläche (Client).
+    /// Grundlage für Tastaturnavigation und Screenreader.
+    nodes: Vec<(Focus, RECT)>,
+    /// Zuletzt fokussierte Zeile in „Alle Apps“ (für den Weg zurück von unten).
+    last_list: usize,
+    /// Wann der App-Katalog zuletzt gelesen bzw. als aktuell bestätigt wurde.
+    loaded_at: Instant,
+    /// Hintergrundprüfung des Katalogs läuft.
+    checking: bool,
+}
+
+impl State {
+    fn new(apps: Vec<App>, pins: Vec<String>, launches: HashMap<String, u32>) -> Self {
+        State {
+            dpi: 0,
+            fonts: None,
+            apps,
+            all_rows: Vec::new(),
+            pins,
+            pin_idx: Vec::new(),
+            recent: Vec::new(),
+            icons: HashMap::new(),
+            avatar: (0, null_mut()),
+            query: String::new(),
+            select_all: false,
+            results: Vec::new(),
+            exe_ids: None,
+            files: Vec::new(),
+            files_for: String::new(),
+            files_gen: 0,
+            view: View::Home,
+            sel: 0,
+            scroll: 0,
+            max_scroll: 0,
+            list_h: 0,
+            follow: true,
+            input: String::new(),
+            hidden_at: None,
+            chat_layout: None,
+            copied: None,
+            mouse: (-1, -1),
+            tracking: false,
+            hits: Vec::new(),
+            app_keys: Vec::new(),
+            launches,
+            focus: Focus::Search,
+            kb: false,
+            nodes: Vec::new(),
+            last_list: 0,
+            loaded_at: Instant::now(),
+            checking: false,
+        }
+    }
+}
+
+/// Ein fokussierbares Element im Startmenü.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Focus {
+    Search,
+    /// „Alle Apps“ auf der Startseite bzw. „Zurück“ in „Alle Apps“.
+    Pill,
+    /// Kachel im Raster der angehefteten Apps.
+    Pinned(usize),
+    /// Eintrag unter „Empfohlen“.
+    Rec(usize),
+    /// Zeile in „Alle Apps“ (gezählt ohne Buchstaben-Überschriften).
+    List(usize),
+    /// Zeile der Suchtreffer.
+    Result(usize),
+    Account,
+    Power,
+}
+
+impl Focus {
+    /// Als Zahl (für UI-Automation-Kennungen und Fensternachrichten).
+    pub fn code(self) -> usize {
+        let (kind, i) = match self {
+            Focus::Search => (0, 0),
+            Focus::Pill => (1, 0),
+            Focus::Pinned(i) => (2, i),
+            Focus::Rec(i) => (3, i),
+            Focus::List(i) => (4, i),
+            Focus::Result(i) => (5, i),
+            Focus::Account => (6, 0),
+            Focus::Power => (7, 0),
+        };
+        (kind << 24) | (i & 0xFF_FFFF)
+    }
+
+    pub fn from_code(c: usize) -> Option<Focus> {
+        let i = c & 0xFF_FFFF;
+        Some(match c >> 24 {
+            0 => Focus::Search,
+            1 => Focus::Pill,
+            2 => Focus::Pinned(i),
+            3 => Focus::Rec(i),
+            4 => Focus::List(i),
+            5 => Focus::Result(i),
+            6 => Focus::Account,
+            7 => Focus::Power,
+            _ => return None,
+        })
+    }
+}
+
+/// Richtung einer Pfeiltaste.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Schritt in einem Raster aus `n` Elementen mit `cols` Spalten, wie im
+/// Windows-Startmenü: links/rechts laufen über das Zeilenende hinaus weiter,
+/// runter in eine kürzere letzte Zeile landet auf deren letztem Element.
+/// `None` = das Raster wird in diese Richtung verlassen.
+fn grid_move(i: usize, n: usize, cols: usize, dir: Dir) -> Option<usize> {
+    if n == 0 || cols == 0 || i >= n {
+        return None;
+    }
+    match dir {
+        Dir::Left => i.checked_sub(1),
+        Dir::Right => (i + 1 < n).then_some(i + 1),
+        Dir::Up => i.checked_sub(cols),
+        Dir::Down => {
+            if i + cols < n {
+                Some(i + cols)
+            } else if i / cols < (n - 1) / cols {
+                Some(n - 1)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -238,12 +392,72 @@ pub(crate) const SETTINGS: &[(&str, &str, &str, &str)] = &[
     ("Systemsteuerung", "Control Panel", "shell:ControlPanelFolder", "systemsteuerung control panel"),
 ];
 
-/// Startbelegung, solange der Nutzer nichts angeheftet hat.
-const DEFAULT_PINS: &[&str] = &[
-    "edge", "explorer", "einstellungen", "store", "fotos", "rechner", "editor", "terminal",
-    "paint", "outlook", "word", "excel", "discord", "claude", "spotify", "steam", "visual studio code",
-    "firefox", "chrome", "duckduckgo",
+/// Startbelegung, solange der Nutzer nichts angeheftet hat. Je Platz die
+/// Namen, unter denen die App auf deutschen und englischen Systemen heißt.
+const DEFAULT_PINS: &[&[&str]] = &[
+    &["microsoft edge", "edge"],
+    &["datei-explorer", "file explorer", "explorer"],
+    &["einstellungen", "settings"],
+    &["microsoft store", "store"],
+    &["fotos", "photos", "microsoft fotos", "microsoft photos"],
+    &["rechner", "calculator", "windows-rechner"],
+    &["editor", "notepad", "windows-editor"],
+    &["terminal", "windows terminal"],
+    &["paint"],
+    &["outlook", "microsoft outlook"],
+    &["word", "microsoft word"],
+    &["excel", "microsoft excel"],
+    &["discord"],
+    &["claude"],
+    &["spotify"],
+    &["steam"],
+    &["visual studio code"],
+    &["firefox", "mozilla firefox"],
+    &["google chrome", "chrome"],
+    &["duckduckgo"],
 ];
+
+/// Wörter eines Namens: klein, an allem getrennt, was kein Buchstabe und
+/// keine Ziffer ist ("Datei-Explorer" → ["datei", "explorer"]).
+fn words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect()
+}
+
+/// Wie gut passt ein App-Name zu einem Standardnamen? Nur ganze Wörter:
+/// 0 = genau der Name, 1 = der Name beginnt damit ("Outlook (new)").
+/// Alles andere zählt nicht – sonst landete "Registrierungs-Editor" auf dem
+/// Platz des Editors und "1Password" auf dem von Word.
+fn pin_match(name: &str, key: &str) -> Option<u32> {
+    let (n, k) = (words(name), words(key));
+    if k.is_empty() || n.len() < k.len() || n[..k.len()] != k[..] {
+        return None;
+    }
+    if n.iter().any(|w| matches!(w.as_str(), "uninstall" | "deinstallieren" | "deinstallation")) {
+        return None;
+    }
+    Some(if n.len() == k.len() { 0 } else { 1 })
+}
+
+/// Standardbelegung aus (Name, Kennung) aller Apps: je Platz der beste Treffer
+/// (genauer Name vor Namensanfang, dann der kürzere Name).
+fn default_pins<'a>(apps: impl Iterator<Item = (&'a str, &'a str)> + Clone) -> Vec<String> {
+    let mut pins: Vec<String> = Vec::new();
+    for keys in DEFAULT_PINS {
+        let best = apps
+            .clone()
+            .filter_map(|(name, id)| keys.iter().filter_map(|k| pin_match(name, k)).min().map(|s| (s, name.len(), id)))
+            .min_by_key(|&(s, len, _)| (s, len));
+        if let Some((_, _, id)) = best {
+            if !pins.iter().any(|p| p == id) {
+                pins.push(id.to_string());
+            }
+        }
+        if pins.len() >= COLS * PIN_ROWS {
+            break;
+        }
+    }
+    pins
+}
 
 fn pins_path() -> Option<PathBuf> {
     Some(data_dir()?.join("pins.txt"))
@@ -253,21 +467,48 @@ fn load_pins(apps: &[App]) -> Vec<String> {
     if let Some(text) = pins_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         return text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
     }
-    let mut pins = Vec::new();
-    for key in DEFAULT_PINS {
-        let found = apps.iter().find(|a| {
-            a.lower.contains(key) && !a.lower.contains("uninstall") && !a.lower.contains("deinstall")
-        });
-        if let Some(a) = found {
-            if !pins.contains(&a.id) {
-                pins.push(a.id.clone());
-            }
+    default_pins(apps.iter().map(|a| (a.name.as_str(), a.id.as_str())))
+}
+
+// ------------------------------------------------------ Startzähler
+
+/// Wie oft eine App aus dem Startmenü gestartet wurde – entscheidet bei
+/// gleich guten Suchtreffern. Eine Zeile je App: `Kennung<Tab>Anzahl`.
+fn launches_path() -> Option<PathBuf> {
+    Some(data_dir()?.join("launches.txt"))
+}
+
+fn parse_launches(text: &str) -> HashMap<String, u32> {
+    text.lines()
+        .filter_map(|l| {
+            let (id, n) = l.rsplit_once('\t')?;
+            Some((id.to_string(), n.trim().parse().ok()?))
+        })
+        .filter(|(id, _): &(String, u32)| !id.is_empty())
+        .collect()
+}
+
+fn format_launches(map: &HashMap<String, u32>) -> String {
+    let mut v: Vec<_> = map.iter().collect();
+    // Häufigste zuerst, damit die Datei lesbar bleibt.
+    v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    v.iter().map(|(id, n)| format!("{id}\t{n}\n")).collect()
+}
+
+fn load_launches() -> HashMap<String, u32> {
+    launches_path().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| parse_launches(&t)).unwrap_or_default()
+}
+
+/// Start einer App mitzählen und sofort speichern (klein, selten).
+fn count_launch(st: &mut State, id: &str) {
+    let n = st.launches.entry(id.to_string()).or_insert(0);
+    *n = n.saturating_add(1);
+    if let Some(p) = launches_path() {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
         }
-        if pins.len() >= COLS * PIN_ROWS {
-            break;
-        }
+        let _ = std::fs::write(p, format_launches(&st.launches));
     }
-    pins
 }
 
 fn save_pins(pins: &[String]) {
@@ -345,6 +586,7 @@ fn rebuild(st: &mut State) {
     }
     st.all_rows = rows;
     st.exe_ids = None;
+    st.app_keys.clear();
     st.pin_idx = st.pins.iter().filter_map(|id| st.apps.iter().position(|a| &a.id == id)).collect();
 }
 
@@ -366,43 +608,109 @@ pub fn app_id_for_exe(exe: &str) -> Option<String> {
     .flatten()
 }
 
-fn search(st: &State) -> Vec<Row> {
-    let q = st.query.trim().to_lowercase();
-    let score = |hay: &str| -> Option<u32> {
-        if hay.starts_with(&q) {
+/// Trefferqualität eines Textes (klein geschrieben) für die Anfrage `q`
+/// (klein, getrimmt): 0 = beginnt damit, 1 = ein Wort beginnt damit,
+/// 2 = kommt irgendwo vor.
+fn quality(hay: &str, q: &str) -> Option<u32> {
+    if hay.starts_with(q) {
+        Some(0)
+    } else if hay.split(|c: char| !c.is_alphanumeric()).any(|w| w.starts_with(q)) {
+        Some(1)
+    } else if hay.contains(q) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Trefferqualität einer App: Anzeigename, dazu Dateiname der exe ("notepad"
+/// findet "Editor", "cmd" die Eingabeaufforderung) und der Kern der
+/// App-Kennung ("calc" findet den Store-Rechner). Die Zusatzschlüssel greifen
+/// erst ab zwei bzw. drei Zeichen, sonst passt fast alles.
+fn app_quality(q: &str, name: &str, exe: Option<&str>, id: &str) -> Option<u32> {
+    let n = q.chars().count();
+    let by_name = quality(name, q);
+    let by_exe = exe.filter(|_| n >= 2).and_then(|e| {
+        if e == q {
             Some(0)
-        } else if hay.split(|c: char| !c.is_alphanumeric()).any(|w| w.starts_with(&q)) {
+        } else if e.starts_with(q) {
             Some(1)
-        } else if hay.contains(&q) {
-            Some(2)
         } else {
-            None
+            (n >= 3 && e.contains(q)).then_some(2)
         }
-    };
-    // Rang = Trefferqualität * 3 + Kategorie (Apps vor Einstellungen vor Dateien).
-    let mut hits: Vec<(u32, Entry)> = Vec::new();
+    });
+    let by_id = (n >= 3 && id.contains(q)).then_some(2);
+    [by_name, by_exe, by_id].into_iter().flatten().min()
+}
+
+/// Trefferqualität einer Einstellungsseite – beide Sprachen und die
+/// Suchwörter, unabhängig von der Oberflächensprache.
+fn settings_quality(q: &str, de: &str, en: &str, keys: &str) -> Option<u32> {
+    [quality(&de.to_lowercase(), q), quality(&en.to_lowercase(), q), quality(keys, q)].into_iter().flatten().min()
+}
+
+/// Ein Suchtreffer vor dem Sortieren.
+struct Hit {
+    quality: u32,
+    /// Apps vor Einstellungen vor Dateien.
+    category: u32,
+    /// Starts aus dem Startmenü; bei gleichem Rang zuerst die häufigeren.
+    launches: u32,
+    entry: Entry,
+}
+
+/// Rang: Trefferqualität, dann Kategorie, dann Häufigkeit, dann der kürzere Titel.
+fn sort_hits(hits: &mut [Hit]) {
+    hits.sort_by(|a, b| {
+        (a.quality, a.category)
+            .cmp(&(b.quality, b.category))
+            .then(b.launches.cmp(&a.launches))
+            .then(a.entry.title.len().cmp(&b.entry.title.len()))
+    });
+}
+
+/// Zusätzliche Suchschlüssel je App (exe-Name, Kern der Kennung), beim
+/// ersten Bedarf nach dem (Neu-)Laden des Katalogs gebaut.
+fn ensure_keys(st: &mut State) {
+    if st.app_keys.len() == st.apps.len() {
+        return;
+    }
+    st.app_keys = st
+        .apps
+        .iter()
+        .map(|a| {
+            let exe = unsafe { apps::target_path(a) };
+            (exe.as_deref().map(apps::exe_stem), apps::id_key(&a.id))
+        })
+        .collect();
+}
+
+fn search(st: &mut State) -> Vec<Row> {
+    ensure_keys(st);
+    let q = st.query.trim().to_lowercase();
+    let mut hits: Vec<Hit> = Vec::new();
     for (i, a) in st.apps.iter().enumerate() {
-        if let Some(s) = score(&a.lower) {
+        let (exe, id) = &st.app_keys[i];
+        if let Some(s) = app_quality(&q, &a.lower, exe.as_deref(), id) {
             let e = Entry { title: a.name.clone(), kind: t!("App", "App"), sub: String::new(), target: Target::App(i), glyph: Glyph::App };
-            hits.push((s * 3, e));
+            let launches = st.launches.get(&a.id).copied().unwrap_or(0);
+            hits.push(Hit { quality: s, category: 0, launches, entry: e });
         }
     }
     for (de, en, uri, keys) in SETTINGS {
-        // Beide Sprachen durchsuchen, unabhängig von der Oberflächensprache.
-        let s = [score(&de.to_lowercase()), score(&en.to_lowercase()), score(keys)].into_iter().flatten().min();
-        if let Some(s) = s {
+        if let Some(s) = settings_quality(&q, de, en, keys) {
             let name = if crate::i18n::en() { en } else { de };
             let e = Entry { title: name.to_string(), kind: t!("Einstellungen", "Settings"), sub: String::new(), target: Target::Uri(uri.to_string()), glyph: Glyph::Settings };
-            hits.push((s * 3 + 1, e));
+            hits.push(Hit { quality: s, category: 1, launches: 0, entry: e });
         }
     }
     for e in &st.recent {
-        if let Some(s) = score(&e.title.to_lowercase()) {
-            hits.push((s * 3 + 2, e.clone()));
+        if let Some(s) = quality(&e.title.to_lowercase(), &q) {
+            hits.push(Hit { quality: s, category: 2, launches: 0, entry: e.clone() });
         }
     }
-    hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.title.len().cmp(&b.1.title.len())));
-    let mut rows: Vec<Row> = hits.into_iter().take(40).map(|(_, e)| Row::Item(e)).collect();
+    sort_hits(&mut hits);
+    let mut rows: Vec<Row> = hits.into_iter().take(40).map(|h| Row::Item(h.entry)).collect();
 
     // Dateien aus dem Suchindex (sobald da und noch zur Anfrage passend),
     // ohne Dopplungen mit "Zuletzt verwendet".
@@ -514,11 +822,61 @@ unsafe fn pill(st: &mut State, dc: HDC, f: &Fonts, label: &str, glyph: &str, gly
         text(dc, label, &RECT { left: r.left + px(d, 12), ..r }, f.small, TEXT, LINE);
         text(dc, glyph, &RECT { right: r.right - px(d, 10), ..r }, f.icons_small, TEXT, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
+    if matches!(act, Act::ShowAll) || (matches!(act, Act::ShowHome) && st.view == View::All) {
+        st.nodes.push((Focus::Pill, r));
+    }
     st.hits.push((r, act));
     r.left
 }
 
-unsafe fn draw_list(st: &mut State, dc: HDC, f: &Fonts, rows: &[Row], area: RECT, sel: Option<usize>) {
+/// Oberkante (relativ zum Listenanfang, ohne Bildlauf) und Höhe der
+/// `item`-ten Zeile einer Liste mit Überschriften.
+fn item_span(rows: &[Row], dpi: u32, item: usize) -> Option<(i32, i32)> {
+    let mut y = 0;
+    let mut n = 0;
+    for row in rows {
+        match row {
+            Row::Header(_) => y += px(dpi, HEAD_H),
+            Row::Item(_) => {
+                if n == item {
+                    return Some((y, px(dpi, ROW_H)));
+                }
+                y += px(dpi, ROW_H);
+                n += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Die `n`-te Zeile (ohne Überschriften) einer Liste.
+fn nth_item(rows: &[Row], n: usize) -> Option<&Entry> {
+    rows.iter()
+        .filter_map(|r| match r {
+            Row::Item(e) => Some(e),
+            Row::Header(_) => None,
+        })
+        .nth(n)
+}
+
+fn item_count(rows: &[Row]) -> usize {
+    rows.iter().filter(|r| matches!(r, Row::Item(_))).count()
+}
+
+/// Bildlauf so, dass die `item`-te Zeile ganz sichtbar ist.
+fn scroll_into_view(st: &mut State, rows_all: bool, item: usize) {
+    let rows = if rows_all { &st.all_rows } else { &st.results };
+    let Some((top, h)) = item_span(rows, st.dpi, item) else { return };
+    // Kopfzeile mit dabei, wenn die erste Zeile unter einer Überschrift steht.
+    let top = if item == 0 { 0 } else { top };
+    if top < st.scroll {
+        st.scroll = top;
+    } else if st.list_h > 0 && top + h > st.scroll + st.list_h {
+        st.scroll = top + h - st.list_h;
+    }
+}
+
+unsafe fn draw_list(st: &mut State, dc: HDC, f: &Fonts, rows: &[Row], area: RECT, sel: Option<usize>, node: fn(usize) -> Focus) {
     let d = st.dpi;
     let saved = SaveDC(dc);
     IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
@@ -560,6 +918,7 @@ unsafe fn draw_list(st: &mut State, dc: HDC, f: &Fonts, rows: &[Row], area: RECT
                         text(dc, e.kind, &kr, f.small, SUBTEXT, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
                     }
                     st.hits.push((vis, Act::Open(e.target.clone())));
+                    st.nodes.push((node(item), vis));
                 }
                 y += h;
                 item += 1;
@@ -604,6 +963,7 @@ unsafe fn draw_home(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bottom
         let tr = RECT { left: cell.left + px(d, 4), top: cell.top + px(d, 52), right: cell.right - px(d, 4), bottom: cell.bottom - px(d, 6) };
         text(dc, &e.title, &tr, f.small, TEXT, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         st.hits.push((cell, Act::Open(e.target)));
+        st.nodes.push((Focus::Pinned(n), cell));
     }
 
     // Empfohlen: zuletzt verwendete Dateien, zwei Spalten.
@@ -635,21 +995,40 @@ unsafe fn draw_home(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bottom
         text(dc, &e.title, &RECT { bottom: mid + px(d, 1), ..tr }, f.normal, TEXT, LINE);
         text(dc, &e.sub, &RECT { top: mid + px(d, 1), ..tr }, f.small, SUBTEXT, LINE);
         st.hits.push((cell, Act::Open(e.target.clone())));
+        st.nodes.push((Focus::Rec(n), cell));
     }
+}
+
+/// Fokusrahmen wie bei Windows 11: zwei Pixel hell außen, dunkle Kante innen.
+unsafe fn draw_focus(dc: HDC, r: &RECT, dpi: u32) {
+    let radius = px(dpi, 8);
+    let w = px(dpi, 2).max(2);
+    for k in 0..w {
+        let rr = RECT { left: r.left + k, top: r.top + k, right: r.right - k, bottom: r.bottom - k };
+        outline(dc, &rr, TEXT, radius);
+    }
+    let inner = RECT { left: r.left + w, top: r.top + w, right: r.right - w, bottom: r.bottom - w };
+    outline(dc, &inner, BG, radius);
 }
 
 unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     let Some(f) = st.fonts else { return };
     let d = st.dpi;
     st.hits.clear();
+    st.nodes.clear();
     fill(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, BG);
 
     // Suchfeld
     let field = RECT { left: px(d, PAD), top: px(d, 24), right: w - px(d, PAD), bottom: px(d, 24 + 36) };
+    st.nodes.push((Focus::Search, field));
     round(dc, &field, FIELD, px(d, 36));
     outline(dc, &field, BORDER, px(d, 36));
     // Win11 markiert das fokussierte Feld mit einer Akzentlinie unten.
-    fill(dc, &RECT { left: field.left + px(d, 18), top: field.bottom - px(d, 2), right: field.right - px(d, 18), bottom: field.bottom }, accent());
+    // Nur solange das Feld den Tastaturfokus hat (wie Akzentlinie und Schreibmarke).
+    let field_focused = matches!(st.focus, Focus::Search | Focus::Result(_)) || st.view == View::Answer;
+    if field_focused {
+        fill(dc, &RECT { left: field.left + px(d, 18), top: field.bottom - px(d, 2), right: field.right - px(d, 18), bottom: field.bottom }, accent());
+    }
     // Im Chat ist das Feld die Eingabe für Folgefragen.
     let chat = chat_input(st);
     let glyph = if chat { "\u{E8BD}" } else { "\u{E721}" };
@@ -677,7 +1056,9 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
         text(dc, &shown, &tr, f.normal, TEXT, flags);
     }
     let cx = (tx + text_width(dc, &shown, f.normal)).min(tr.right);
-    fill(dc, &RECT { left: cx, top: field.top + px(d, 10), right: cx + px(d, 1).max(1), bottom: field.bottom - px(d, 10) }, TEXT);
+    if field_focused {
+        fill(dc, &RECT { left: cx, top: field.top + px(d, 10), right: cx + px(d, 1).max(1), bottom: field.bottom - px(d, 10) }, TEXT);
+    }
 
     let body_top = px(d, 80);
     let body_bottom = h - px(d, FOOT);
@@ -685,7 +1066,7 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
         let rows = std::mem::take(&mut st.results);
         let area = RECT { left: 0, top: body_top, right: w, bottom: body_bottom - px(d, 8) };
         let sel = Some(st.sel);
-        draw_list(st, dc, &f, &rows, area, sel);
+        draw_list(st, dc, &f, &rows, area, sel, Focus::Result);
         st.results = rows;
     } else if st.view == View::Answer {
         draw_answer(st, dc, &f, w, body_top, body_bottom - px(d, 8));
@@ -694,7 +1075,7 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
         pill(st, dc, &f, t!("Zurück", "Back"), "\u{E76B}", true, w - px(d, PAD), body_top, Act::ShowHome);
         let rows = std::mem::take(&mut st.all_rows);
         let area = RECT { left: 0, top: body_top + px(d, 40), right: w, bottom: body_bottom - px(d, 8) };
-        draw_list(st, dc, &f, &rows, area, None);
+        draw_list(st, dc, &f, &rows, area, None, Focus::List);
         st.all_rows = rows;
     } else {
         draw_home(st, dc, &f, w, body_top, body_bottom - px(d, 8));
@@ -712,6 +1093,7 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
         round(dc, &account, HOVER, px(d, 6));
     }
     st.hits.push((account, Act::Account));
+    st.nodes.push((Focus::Account, account));
     let s = crate::settings::get();
     let picture = if s.start_avatar && !s.presentation { avatar(st, av) } else { null_mut() };
     if picture.is_null() {
@@ -728,6 +1110,12 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     }
     text(dc, "\u{E7E8}", &pb, f.icons, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     st.hits.push((pb, Act::Power));
+    st.nodes.push((Focus::Power, pb));
+    if st.kb && st.focus != Focus::Search {
+        if let Some((_, r)) = st.nodes.iter().find(|(n, _)| *n == st.focus) {
+            draw_focus(dc, r, d);
+        }
+    }
 }
 
 /// Kontobild in `size`, beim ersten Bedarf geladen. Null, wenn es keins gibt.
@@ -781,6 +1169,10 @@ unsafe fn show() {
         st.select_all = false;
         st.results.clear();
         st.sel = 0;
+        // Fokus im Suchfeld, Rahmen erst nach Tastaturbedienung.
+        st.focus = Focus::Search;
+        st.kb = false;
+        st.last_list = 0;
         // Kurz weg gewesen: zurück in den Chat, sonst neu auf der Startseite.
         let keep_chat = st.view == View::Answer && st.hidden_at.is_some_and(|t| t.elapsed() < CHAT_KEEP);
         if !keep_chat {
@@ -807,6 +1199,91 @@ unsafe fn show() {
     crate::anim::pop_in(h, x, y, w, hh, crate::display::pop_offset(px(dpi, 18)));
     force_foreground(h);
     InvalidateRect(h, null(), 0);
+    // Neu installierte Apps: Ist der Katalog schon eine Weile alt, im
+    // Hintergrund nachsehen und die Ansicht auffrischen, falls sich etwas getan hat.
+    if with(|st| st.loaded_at.elapsed() > CATALOG_MAX_AGE).unwrap_or(false) {
+        check_catalog(h);
+    }
+    raise_focus(h, Focus::Search);
+}
+
+/// Prüfsumme über (Name, Kennung) aller Apps, unabhängig von der Reihenfolge.
+fn catalog_sig<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> u64 {
+    let mut v: Vec<(&str, &str)> = items.collect();
+    v.sort_unstable();
+    v.dedup_by(|a, b| a.1 == b.1);
+    let mut s = String::new();
+    for (n, id) in v {
+        s.push_str(n);
+        s.push('\u{1}');
+        s.push_str(id);
+        s.push('\u{2}');
+    }
+    hash_of(&s)
+}
+
+/// Katalog in einem Hintergrund-Thread lesen und mit dem geladenen
+/// vergleichen. Meldet sich mit WM_CATALOG zurück; nur bei einer Änderung
+/// wird (im UI-Thread) neu geladen.
+unsafe fn check_catalog(hwnd: HWND) {
+    let Some(sig) = with(|st| {
+        if std::mem::replace(&mut st.checking, true) {
+            return None;
+        }
+        Some(catalog_sig(st.apps.iter().map(|a| (a.name.as_str(), a.id.as_str()))))
+    })
+    .flatten() else {
+        return;
+    };
+    let target = hwnd as isize;
+    std::thread::spawn(move || unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        let now = apps::enumerate_ids();
+        let changed = !now.is_empty() && catalog_sig(now.iter().map(|(n, i)| (n.as_str(), i.as_str()))) != sig;
+        PostMessageW(target as HWND, WM_CATALOG, changed as usize, 0);
+    });
+}
+
+/// App-Katalog neu laden und alles, was per Index darauf zeigt, nachziehen.
+unsafe fn reload(hwnd: HWND) {
+    let apps = apps::enumerate();
+    with(|st| {
+        // Kontobild kann sich geändert haben.
+        drop_avatar(st);
+        st.loaded_at = Instant::now();
+        if !apps.is_empty() {
+            st.apps = apps;
+            rebuild(st);
+            // Treffer zeigen per Index auf die alte App-Liste.
+            if !st.query.is_empty() {
+                let sel = st.sel;
+                st.results = search(st);
+                st.sel = sel.min(st.results.len().saturating_sub(1));
+            }
+            clamp_focus(st);
+        }
+    });
+    InvalidateRect(hwnd, null(), 0);
+}
+
+/// Startmenü-Ordner (Benutzer und alle Benutzer) bei der Shell beobachten:
+/// Neue oder entfernte Verknüpfungen melden sich als WM_SHELL_CHANGE.
+/// Store-Apps legen dort nichts ab – für die greift die Prüfung beim Öffnen.
+unsafe fn watch_start_folders(hwnd: HWND) {
+    use windows::Win32::UI::Shell::*;
+    let mut entries = Vec::new();
+    for csidl in [CSIDL_PROGRAMS, CSIDL_COMMON_PROGRAMS] {
+        if let Ok(pidl) = SHGetSpecialFolderLocation(None, csidl as i32) {
+            entries.push(SHChangeNotifyEntry { pidl, fRecursive: true.into() });
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    let events = SHCNE_CREATE.0 | SHCNE_DELETE.0 | SHCNE_RENAMEITEM.0 | SHCNE_MKDIR.0 | SHCNE_RMDIR.0 | SHCNE_UPDATEDIR.0;
+    let sources = SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_RecursiveInterrupt;
+    SHChangeNotifyRegister(windows::Win32::Foundation::HWND(hwnd as _), sources, events as i32, WM_SHELL_CHANGE, entries.len() as i32, entries.as_ptr());
+    // Die PIDLs bleiben für die Laufzeit des Prozesses bestehen (einmalig, klein).
 }
 
 unsafe fn hide() {
@@ -838,6 +1315,7 @@ unsafe fn open(t: Target) {
     match t {
         Target::App(_) => {
             if let Some(id) = app_id {
+                with(|st| count_launch(st, &id));
                 apps::launch(&id);
             }
         }
@@ -1237,6 +1715,7 @@ unsafe fn edit_query(hwnd: HWND, f: impl FnOnce(&mut String, bool)) {
         if chat_input(st) {
             return true;
         }
+        st.focus = Focus::Search;
         st.results = if st.query.is_empty() { Vec::new() } else { search(st) };
         st.sel = 0;
         st.scroll = 0;
@@ -1381,22 +1860,279 @@ fn on_chat_key(st: &mut State, vk: u16, send: &mut Option<String>) -> bool {
     true
 }
 
+/// Tab-Reihenfolge der Abschnitte in der aktuellen Ansicht. Jeder Abschnitt
+/// steht mit dem Element da, auf dem der Fokus beim Hineinspringen landet.
+fn sections(st: &State) -> Vec<Focus> {
+    let mut v = Vec::new();
+    if !st.query.is_empty() {
+        // Suche: Feld samt Trefferliste, dann die Fußleiste.
+        v.push(if st.results.is_empty() { Focus::Search } else { Focus::Result(st.sel) });
+    } else {
+        v.push(Focus::Search);
+        v.push(Focus::Pill);
+        match st.view {
+            View::All => {
+                let n = item_count(&st.all_rows);
+                if n > 0 {
+                    v.push(Focus::List(st.last_list.min(n - 1)));
+                }
+            }
+            _ => {
+                if pinned_count(st) > 0 {
+                    v.push(Focus::Pinned(0));
+                }
+                if rec_count(st) > 0 {
+                    v.push(Focus::Rec(0));
+                }
+            }
+        }
+    }
+    v.push(Focus::Account);
+    v.push(Focus::Power);
+    v
+}
+
+/// Gehören zwei Fokusziele zum selben Abschnitt?
+fn same_section(a: Focus, b: Focus) -> bool {
+    use Focus::*;
+    match (a, b) {
+        (Search | Result(_), Search | Result(_)) => true,
+        (Pinned(_), Pinned(_)) | (Rec(_), Rec(_)) | (List(_), List(_)) => true,
+        _ => a == b,
+    }
+}
+
+fn pinned_count(st: &State) -> usize {
+    st.pin_idx.len().min(COLS * PIN_ROWS)
+}
+
+/// Sichtbare Einträge unter „Empfohlen“ (so viele, wie zuletzt Platz hatten).
+fn rec_count(st: &State) -> usize {
+    st.nodes.iter().filter(|(f, _)| matches!(f, Focus::Rec(_))).count()
+}
+
+/// Neues Fokusziel für eine Navigationstaste, `None` = keine Navigationstaste
+/// bzw. hier ohne Wirkung.
+fn nav_target(st: &State, vk: u16, shift: bool) -> Option<Focus> {
+    use Focus::*;
+    if vk == VK_TAB {
+        let secs = sections(st);
+        let cur = secs.iter().position(|s| same_section(*s, st.focus)).unwrap_or(0);
+        let n = secs.len();
+        let next = if shift { (cur + n - 1) % n } else { (cur + 1) % n };
+        return Some(secs[next]);
+    }
+    let dir = match vk {
+        VK_LEFT => Dir::Left,
+        VK_RIGHT => Dir::Right,
+        VK_UP => Dir::Up,
+        VK_DOWN => Dir::Down,
+        VK_HOME | VK_END | VK_PRIOR | VK_NEXT => return page_target(st, vk),
+        _ => return None,
+    };
+    // Suche: hoch/runter durch die Treffer; das Feld behält dabei die Eingabe.
+    if !st.query.is_empty() {
+        let count = st.results.len();
+        return match (st.focus, dir) {
+            (Search | Result(_), Dir::Down) if count > 0 => Some(Result((st.sel + 1).min(count - 1))),
+            (Result(0), Dir::Up) => Some(Search),
+            (Result(i), Dir::Up) => Some(Result(i - 1)),
+            (Account, Dir::Right) => Some(Power),
+            (Power, Dir::Left) => Some(Account),
+            (Account | Power, Dir::Up) => Some(if count > 0 { Result(st.sel) } else { Search }),
+            _ => None,
+        };
+    }
+    let all = st.view == View::All;
+    let (np, nr, nl) = (pinned_count(st), rec_count(st), item_count(&st.all_rows));
+    // Erstes Element unter dem Suchfeld bzw. letztes über der Fußleiste.
+    let first_body = if all {
+        (nl > 0).then_some(List(0))
+    } else if np > 0 {
+        Some(Pinned(0))
+    } else {
+        (nr > 0).then_some(Rec(0))
+    };
+    let last_body = if all {
+        (nl > 0).then_some(List(st.last_list.min(nl.saturating_sub(1))))
+    } else if nr > 0 {
+        Some(Rec(0))
+    } else {
+        (np > 0).then_some(Pinned(0))
+    };
+    match (st.focus, dir) {
+        (Search, Dir::Down) => first_body,
+        (Pill, Dir::Down) => first_body,
+        (Pill, Dir::Up | Dir::Left) => Some(Search),
+        (Pinned(i), d) => match grid_move(i, np, COLS, d) {
+            Some(j) => Some(Pinned(j)),
+            None => match d {
+                Dir::Up => Some(Search),
+                // Spalte ungefähr mitnehmen: oben 6 Spalten, unten 2.
+                Dir::Down if nr > 0 => Some(Rec(((i % COLS) * 2 / COLS).min(nr - 1))),
+                Dir::Down => Some(Account),
+                _ => None,
+            },
+        },
+        (Rec(i), d) => match grid_move(i, nr, 2, d) {
+            Some(j) => Some(Rec(j)),
+            None => match d {
+                Dir::Up if np > 0 => {
+                    let last_row = (np - 1) / COLS;
+                    Some(Pinned((last_row * COLS + (i % 2) * COLS / 2).min(np - 1)))
+                }
+                Dir::Up => Some(Search),
+                Dir::Down => Some(Account),
+                _ => None,
+            },
+        },
+        (List(i), Dir::Up) => Some(if i == 0 { Search } else { List(i - 1) }),
+        (List(i), Dir::Down) => Some(if i + 1 < nl { List(i + 1) } else { Account }),
+        (Account, Dir::Right) => Some(Power),
+        (Power, Dir::Left) => Some(Account),
+        (Account | Power, Dir::Up) => Some(last_body.unwrap_or(Search)),
+        _ => None,
+    }
+}
+
+/// Pos1/Ende/Bild auf/ab in „Alle Apps“.
+fn page_target(st: &State, vk: u16) -> Option<Focus> {
+    let Focus::List(i) = st.focus else { return None };
+    let n = item_count(&st.all_rows);
+    if n == 0 {
+        return None;
+    }
+    let page = ((st.list_h / px(st.dpi, ROW_H)).max(2) - 1) as usize;
+    Some(Focus::List(match vk {
+        VK_HOME => 0,
+        VK_END => n - 1,
+        VK_PRIOR => i.saturating_sub(page),
+        _ => (i + page).min(n - 1),
+    }))
+}
+
+/// Fokus setzen und das Ziel sichtbar machen.
+fn set_focus(st: &mut State, f: Focus) {
+    st.focus = f;
+    match f {
+        Focus::Result(i) => {
+            st.sel = i;
+            scroll_into_view(st, false, i);
+        }
+        Focus::List(i) => {
+            st.last_list = i;
+            scroll_into_view(st, true, i);
+        }
+        _ => {}
+    }
+}
+
+/// Fokus nach einem Neuladen gültig halten.
+fn clamp_focus(st: &mut State) {
+    let ok = match st.focus {
+        Focus::Pinned(i) => i < pinned_count(st),
+        Focus::Rec(i) => i < st.recent.len(),
+        Focus::List(i) => i < item_count(&st.all_rows),
+        Focus::Result(i) => i < st.results.len(),
+        _ => true,
+    };
+    if !ok {
+        st.focus = Focus::Search;
+    }
+    st.last_list = st.last_list.min(item_count(&st.all_rows).saturating_sub(1));
+}
+
+/// Ansicht „Alle Apps“ bzw. Startseite.
+fn show_view(st: &mut State, view: View) {
+    if view == View::Home && st.view == View::Answer {
+        crate::ai::cancel();
+        st.input.clear();
+        st.chat_layout = None;
+    }
+    st.view = view;
+    st.scroll = 0;
+    st.last_list = 0;
+}
+
+/// Ziel eines Fokuselements (App, Datei, …), falls es eins öffnet.
+fn focus_target(st: &State, f: Focus) -> Option<Target> {
+    match f {
+        Focus::Pinned(i) => st.pin_idx.get(i).map(|&a| Target::App(a)),
+        Focus::Rec(i) => st.recent.get(i).map(|e| e.target.clone()),
+        Focus::List(i) => nth_item(&st.all_rows, i).map(|e| e.target.clone()),
+        Focus::Result(i) => nth_item(&st.results, i).map(|e| e.target.clone()),
+        _ => None,
+    }
+}
+
+/// Fokuselement auslösen – wie ein Klick darauf (Enter, Screenreader).
+unsafe fn activate(hwnd: HWND, f: Focus) {
+    if let Some(t) = with(|st| focus_target(st, f)).flatten() {
+        open(t);
+        return;
+    }
+    match f {
+        Focus::Pill => {
+            with(|st| {
+                let to = if st.view == View::Home { View::All } else { View::Home };
+                show_view(st, to);
+                st.focus = Focus::Pill;
+            });
+            raise_focus(hwnd, Focus::Pill);
+        }
+        Focus::Account => {
+            if menus::account_menu(hwnd) {
+                hide();
+            }
+        }
+        Focus::Power => {
+            if menus::power_menu(hwnd) {
+                hide();
+            }
+        }
+        Focus::Search => {
+            if let Some(t) = with(|st| nth_item(&st.results, st.sel).map(|e| e.target.clone())).flatten() {
+                open(t);
+            }
+        }
+        _ => {}
+    }
+    InvalidateRect(hwnd, null(), 0);
+}
+
+/// Fokuswechsel an Screenreader melden (außerhalb von `with`, weil UIA dabei
+/// zurückfragen kann).
+fn raise_focus(hwnd: HWND, f: Focus) {
+    crate::uia::start_focus_changed(hwnd as isize, f.code());
+}
+
 unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
     if GetKeyState(VK_CONTROL as i32) < 0 && on_ctrl_key(hwnd, vk) {
         return true;
     }
+    let shift = GetKeyState(VK_SHIFT as i32) < 0;
     let mut open_target = None;
     let mut close = false;
     let mut schedule_files = false;
     let mut send = None;
+    let mut moved = None;
+    let mut trigger = None;
     let handled = with(|st| {
         if chat_input(st) {
             return on_chat_key(st, vk, &mut send);
         }
-        let count = st.results.len();
+        if let Some(f) = nav_target(st, vk, shift) {
+            st.kb = true;
+            if f != st.focus {
+                set_focus(st, f);
+                moved = Some(f);
+            }
+            return true;
+        }
         match vk {
             VK_ESCAPE => {
                 st.select_all = false;
+                st.focus = Focus::Search;
                 if st.query.is_empty() && st.view == View::Home {
                     close = true;
                 } else {
@@ -1418,23 +2154,16 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
                 schedule_files = true;
                 st.sel = 0;
                 st.scroll = 0;
+                st.focus = Focus::Search;
             }
-            VK_RETURN => {
-                if let Some(Row::Item(e)) = st.results.get(st.sel) {
-                    open_target = Some(e.target.clone());
+            VK_RETURN => match st.focus {
+                Focus::Search | Focus::Result(_) => {
+                    if let Some(Row::Item(e)) = st.results.get(st.sel) {
+                        open_target = Some(e.target.clone());
+                    }
                 }
-            }
-            VK_DOWN | VK_UP if count > 0 => {
-                st.sel = if vk == VK_DOWN { (st.sel + 1).min(count - 1) } else { st.sel.saturating_sub(1) };
-                // Auswahl sichtbar halten.
-                let rh = px(st.dpi, ROW_H);
-                let top = st.sel as i32 * rh;
-                if top < st.scroll {
-                    st.scroll = top;
-                } else if top + rh > st.scroll + st.list_h {
-                    st.scroll = top + rh - st.list_h;
-                }
-            }
+                f => trigger = Some(f),
+            },
             _ => return false,
         }
         true
@@ -1443,16 +2172,144 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
     if schedule_files {
         SetTimer(hwnd, TIMER_FILES, 160, None);
     }
+    if let Some(f) = moved {
+        raise_focus(hwnd, f);
+    }
     if close {
         hide();
     } else if let Some(t) = open_target {
         open(t);
+    } else if let Some(f) = trigger {
+        activate(hwnd, f);
     } else if let Some(q) = send {
         ask(q);
     } else if handled {
         InvalidateRect(hwnd, null(), 0);
     }
     handled
+}
+
+/// App hinter dem fokussierten Element (für das Kontextmenü per Tastatur).
+fn focused_app(st: &State) -> Option<usize> {
+    let f = match st.focus {
+        Focus::Search if !st.query.is_empty() => Focus::Result(st.sel),
+        f => f,
+    };
+    match focus_target(st, f)? {
+        Target::App(i) => Some(i),
+        _ => None,
+    }
+}
+
+// --------------------------------------------------- UI Automation
+
+/// Rolle eines Elements für Screenreader.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    Edit,
+    ListItem,
+    Button,
+}
+
+/// Ein Element des Startmenüs für UI Automation.
+pub struct UiNode {
+    pub code: usize,
+    pub name: String,
+    pub role: Role,
+    /// Bildschirmkoordinaten.
+    pub rect: RECT,
+}
+
+fn node_name(st: &State, f: Focus) -> String {
+    let entry = |e: &Entry| if e.sub.is_empty() { e.title.clone() } else { format!("{}, {}", e.title, e.sub) };
+    match f {
+        Focus::Search => {
+            if chat_input(st) {
+                t!("Frage an die KI", "Ask the AI").to_string()
+            } else {
+                t!("Suchfeld", "Search box").to_string()
+            }
+        }
+        Focus::Pill => if st.view == View::All { t!("Zurück", "Back") } else { t!("Alle Apps", "All apps") }.to_string(),
+        Focus::Pinned(i) => st.pin_idx.get(i).and_then(|&a| st.apps.get(a)).map(|a| a.name.clone()).unwrap_or_default(),
+        Focus::Rec(i) => st.recent.get(i).map(entry).unwrap_or_default(),
+        Focus::List(i) => nth_item(&st.all_rows, i).map(entry).unwrap_or_default(),
+        Focus::Result(i) => nth_item(&st.results, i).map(|e| if e.kind.is_empty() { entry(e) } else { format!("{}, {}", entry(e), e.kind) }).unwrap_or_default(),
+        Focus::Account => {
+            if crate::settings::get().presentation {
+                t!("Benutzer", "User").to_string()
+            } else {
+                std::env::var("USERNAME").unwrap_or_default()
+            }
+        }
+        Focus::Power => t!("Ein/Aus", "Power").to_string(),
+    }
+}
+
+/// Alle sichtbaren Elemente in Lesereihenfolge (Stand des letzten Frames).
+pub fn ui_nodes() -> Vec<UiNode> {
+    let h = hwnd();
+    if h.is_null() || unsafe { IsWindowVisible(h) } == 0 {
+        return Vec::new();
+    }
+    let mut origin = POINT { x: 0, y: 0 };
+    unsafe { ClientToScreen(h, &mut origin) };
+    with(|st| {
+        st.nodes
+            .iter()
+            .map(|&(f, r)| UiNode {
+                code: f.code(),
+                name: node_name(st, f),
+                role: match f {
+                    Focus::Search => Role::Edit,
+                    Focus::Pill | Focus::Account | Focus::Power => Role::Button,
+                    _ => Role::ListItem,
+                },
+                rect: RECT { left: r.left + origin.x, top: r.top + origin.y, right: r.right + origin.x, bottom: r.bottom + origin.y },
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Element mit Tastaturfokus (als Code), wenn Start sichtbar ist.
+pub fn ui_focus() -> Option<usize> {
+    let h = hwnd();
+    if h.is_null() || unsafe { IsWindowVisible(h) } == 0 {
+        return None;
+    }
+    with(|st| st.focus.code())
+}
+
+/// Fokus von außen setzen (Screenreader).
+pub fn ui_set_focus(code: usize) {
+    let Some(f) = Focus::from_code(code) else { return };
+    let h = hwnd();
+    with(|st| set_focus(st, f));
+    unsafe { InvalidateRect(h, null(), 0) };
+    raise_focus(h, f);
+}
+
+/// Element auslösen (Screenreader) – asynchron, damit der UIA-Aufruf nicht
+/// in Menüs oder das Ausblenden hinein wartet.
+pub fn ui_invoke(code: usize) {
+    unsafe { PostMessageW(hwnd(), WM_UIA_INVOKE, code, 0) };
+}
+
+/// Text im Suchfeld (bzw. der Folgefrage im Chat).
+pub fn ui_query() -> String {
+    with(|st| if chat_input(st) { st.input.clone() } else { st.query.clone() }).unwrap_or_default()
+}
+
+/// Suchtext von außen setzen (Screenreader, ValuePattern).
+pub fn ui_set_query(text: &str) {
+    let line: String = text.chars().filter(|c| !c.is_control()).take(MAX_PASTE).collect();
+    unsafe {
+        edit_query(hwnd(), |q, _| {
+            q.clear();
+            q.push_str(&line);
+        })
+    };
 }
 
 // -------------------------------------------------------------- WndProc
@@ -1508,23 +2365,55 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_RELOAD => {
-            let apps = apps::enumerate();
-            with(|st| {
-                // Kontobild kann sich geändert haben.
-                drop_avatar(st);
-                if !apps.is_empty() {
-                    st.apps = apps;
-                    rebuild(st);
-                    // Treffer zeigen per Index auf die alte App-Liste.
-                    if !st.query.is_empty() {
-                        let sel = st.sel;
-                        st.results = search(st);
-                        st.sel = sel.min(st.results.len().saturating_sub(1));
-                    }
-                }
-            });
-            InvalidateRect(hwnd, null(), 0);
+            reload(hwnd);
             0
+        }
+        WM_CATALOG => {
+            with(|st| {
+                st.checking = false;
+                st.loaded_at = Instant::now();
+            });
+            if wp == 1 {
+                reload(hwnd);
+            }
+            0
+        }
+        WM_SHELL_CHANGE => {
+            // Installationen schreiben oft mehrere Verknüpfungen nacheinander.
+            SetTimer(hwnd, TIMER_APPS, 1500, None);
+            0
+        }
+        WM_TIMER if wp == TIMER_APPS => {
+            KillTimer(hwnd, TIMER_APPS);
+            if IsWindowVisible(hwnd) != 0 {
+                check_catalog(hwnd);
+            } else {
+                reload(hwnd);
+            }
+            0
+        }
+        WM_UIA_INVOKE => {
+            if let Some(f) = Focus::from_code(wp) {
+                if IsWindowVisible(hwnd) != 0 {
+                    activate(hwnd, f);
+                }
+            }
+            0
+        }
+        // Kontextmenü per Tastatur (Menütaste, Umschalt+F10): für die App im Fokus.
+        WM_CONTEXTMENU => {
+            if lp as i32 == -1 {
+                if let Some(i) = with(|st| focused_app(st)).flatten() {
+                    app_menu(hwnd, i);
+                }
+            }
+            0
+        }
+        // Screenreader fragen nach unserem UI-Automation-Provider.
+        WM_GETOBJECT if lp as i32 == windows::Win32::UI::Accessibility::UiaRootObjectId => {
+            use windows::Win32::Foundation as wf;
+            let root = crate::uia::start_root(hwnd as isize);
+            windows::Win32::UI::Accessibility::UiaReturnRawElementProvider(wf::HWND(hwnd as _), wf::WPARAM(wp), wf::LPARAM(lp), &root).0
         }
         WM_MOUSEMOVE => {
             let p = xy(lp);
@@ -1559,23 +2448,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_LBUTTONUP => {
             let (x, y) = xy(lp);
+            // Mausbedienung: Fokusrahmen wieder aus, wie bei Windows.
+            with(|st| st.kb = false);
             match with(|st| hit(st, x, y)).flatten() {
                 Some(Act::Open(t)) => open(t),
                 Some(Act::ShowAll) => {
                     with(|st| {
-                        st.view = View::All;
-                        st.scroll = 0;
+                        show_view(st, View::All);
+                        st.focus = Focus::Search;
                     });
                 }
                 Some(Act::ShowHome) => {
                     with(|st| {
-                        if st.view == View::Answer {
-                            crate::ai::cancel();
-                            st.input.clear();
-                            st.chat_layout = None;
-                        }
-                        st.view = View::Home;
-                        st.scroll = 0;
+                        show_view(st, View::Home);
+                        st.focus = Focus::Search;
                     });
                 }
                 Some(Act::NewChat) => {
@@ -1648,6 +2534,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if chat_input(st) {
                         return true;
                     }
+                    // Tippen geht immer in die Suche, egal wo der Fokus stand.
+                    st.focus = Focus::Search;
                     st.results = search(st);
                     st.sel = 0;
                     st.scroll = 0;
@@ -1699,40 +2587,11 @@ pub unsafe fn create(inst: HINSTANCE) {
 
     let apps = apps::enumerate();
     let pins = load_pins(&apps);
-    let mut st = State {
-        dpi: 0,
-        fonts: None,
-        apps,
-        all_rows: Vec::new(),
-        pins,
-        pin_idx: Vec::new(),
-        recent: Vec::new(),
-        icons: HashMap::new(),
-        avatar: (0, null_mut()),
-        query: String::new(),
-        select_all: false,
-        results: Vec::new(),
-        exe_ids: None,
-        files: Vec::new(),
-        files_for: String::new(),
-        files_gen: 0,
-        view: View::Home,
-        sel: 0,
-        scroll: 0,
-        max_scroll: 0,
-        list_h: 0,
-        follow: true,
-        input: String::new(),
-        hidden_at: None,
-        chat_layout: None,
-        copied: None,
-        mouse: (-1, -1),
-        tracking: false,
-        hits: Vec::new(),
-    };
+    let mut st = State::new(apps, pins, load_launches());
     rebuild(&mut st);
     STATE.with(|s| *s.borrow_mut() = Some(st));
     HWND_START.store(hwnd, Ordering::Relaxed);
+    watch_start_folders(hwnd);
 }
 
 #[cfg(test)]
@@ -1783,6 +2642,243 @@ mod tests {
             f.delete();
         }
     }
+
+    // ------------------------------------------------ Standardbelegung
+
+    fn pins_for(names: &[(&str, &str)]) -> Vec<String> {
+        default_pins(names.iter().map(|&(n, id)| (n, id)))
+    }
+
+    #[test]
+    fn default_pins_match_whole_words() {
+        // "word" darf nicht 1Password oder WordPad treffen, "editor" nicht
+        // den Registrierungs-Editor.
+        let pins = pins_for(&[("1Password", "pw"), ("WordPad", "wp"), ("Registrierungs-Editor", "reg"), ("Registry Editor", "reg-en")]);
+        assert!(pins.is_empty(), "{pins:?}");
+        let pins = pins_for(&[("1Password", "pw"), ("Word", "word"), ("Registry Editor", "reg"), ("Editor", "notepad")]);
+        assert_eq!(pins, vec!["notepad", "word"]);
+    }
+
+    #[test]
+    fn default_pins_know_english_names() {
+        let pins = pins_for(&[
+            ("Calculator", "calc"),
+            ("Photos", "photos"),
+            ("Notepad", "notepad"),
+            ("Settings", "settings"),
+            ("Microsoft Edge", "edge"),
+            ("File Explorer", "explorer"),
+            ("Internet Explorer", "ie"),
+            ("Word", "word"),
+            ("Microsoft Store", "store"),
+        ]);
+        assert_eq!(pins, vec!["edge", "explorer", "settings", "store", "photos", "calc", "notepad", "word"]);
+    }
+
+    #[test]
+    fn default_pins_prefer_exact_names() {
+        // Genauer Name vor längeren Varianten; Deinstallierer nie.
+        let pins = pins_for(&[("Paint 3D", "p3d"), ("Paint", "paint"), ("Steam uninstall", "su"), ("Outlook (new)", "outlook")]);
+        assert_eq!(pins, vec!["paint", "outlook"]);
+        assert_eq!(pin_match("Datei-Explorer", "datei-explorer"), Some(0));
+        assert_eq!(pin_match("Microsoft Edge WebView2", "microsoft edge"), Some(1));
+        assert_eq!(pin_match("Microsoft Edge", "edge"), None);
+    }
+
+    // ------------------------------------------------------- Suche
+
+    fn hit(title: &str, quality: u32, category: u32, launches: u32) -> Hit {
+        let entry = Entry { title: title.into(), kind: "", sub: String::new(), target: Target::Uri(String::new()), glyph: Glyph::App };
+        Hit { quality, category, launches, entry }
+    }
+
+    #[test]
+    fn apps_match_exe_and_id() {
+        // "notepad" findet den deutschen „Editor“ über den exe-Namen bzw. die Store-Kennung.
+        assert_eq!(app_quality("notepad", "editor", Some("notepad"), "windowsnotepad"), Some(0));
+        assert_eq!(app_quality("notepad", "editor", None, "windowsnotepad"), Some(2));
+        // "cmd" findet die Eingabeaufforderung (Kennung "{GUID}\cmd.exe").
+        assert_eq!(app_quality("cmd", "eingabeaufforderung", None, "cmd"), Some(2));
+        assert_eq!(app_quality("cmd", "eingabeaufforderung", Some("cmd"), "cmd"), Some(0));
+        // Name schlägt Zusatzschlüssel; kurze Anfragen nur über den Namen.
+        assert_eq!(app_quality("ed", "editor", Some("notepad"), "windowsnotepad"), Some(0));
+        assert_eq!(app_quality("n", "editor", Some("notepad"), "windowsnotepad"), None);
+        assert_eq!(app_quality("xyz", "editor", Some("notepad"), "windowsnotepad"), None);
+    }
+
+    #[test]
+    fn settings_keywords_in_both_languages() {
+        let find = |q: &str| -> Vec<&str> { SETTINGS.iter().filter(|(de, en, _, k)| settings_quality(q, de, en, k).is_some()).map(|s| s.1).collect() };
+        assert!(find("wlan").contains(&"Wi-Fi"));
+        assert!(find("wifi").contains(&"Wi-Fi"));
+        assert!(find("anzeige").contains(&"Display"));
+        assert!(find("display").contains(&"Display"));
+        assert!(find("dunkel").contains(&"Colors"));
+        assert!(find("dark").contains(&"Colors"));
+        assert!(find("drucker").contains(&"Printers & scanners"));
+        assert!(find("printer").contains(&"Printers & scanners"));
+        assert_eq!(settings_quality("blue", "Bluetooth & Geräte", "Bluetooth & devices", "bluetooth"), Some(0));
+    }
+
+    #[test]
+    fn launches_break_ties() {
+        let mut hits = vec![hit("Visual Studio", 0, 0, 1), hit("Visual Studio Code", 0, 0, 9), hit("Vivaldi", 1, 0, 50), hit("Video", 0, 1, 0)];
+        sort_hits(&mut hits);
+        let order: Vec<&str> = hits.iter().map(|h| h.entry.title.as_str()).collect();
+        // Häufiger vor kürzer – aber nie über eine bessere Trefferqualität hinweg.
+        assert_eq!(order, vec!["Visual Studio Code", "Visual Studio", "Video", "Vivaldi"]);
+        // Ohne Starts entscheidet wie bisher der kürzere Titel.
+        let mut hits = vec![hit("Paint 3D", 0, 0, 0), hit("Paint", 0, 0, 0)];
+        sort_hits(&mut hits);
+        assert_eq!(hits[0].entry.title, "Paint");
+    }
+
+    #[test]
+    fn launches_file_round_trip() {
+        let mut m = HashMap::new();
+        m.insert(r"{6D809377-6AF0-444B-8957-A3773F02200E}\app.exe".to_string(), 3);
+        m.insert("Microsoft.WindowsNotepad_8wekyb3d8bbwe!App".to_string(), 12);
+        let text = format_launches(&m);
+        assert!(text.starts_with("Microsoft.WindowsNotepad"));
+        assert_eq!(parse_launches(&text), m);
+        // Kaputte Zeilen werden übersprungen.
+        assert_eq!(parse_launches("ohne-tab\n\tleer\nx\tabc\ny\t2\n").len(), 1);
+    }
+
+    // ---------------------------------------------------- Tastatur
+
+    #[test]
+    fn grid_moves_like_windows() {
+        // 8 Elemente in 6 Spalten: Zeile 0 = 0..6, Zeile 1 = 6..8.
+        assert_eq!(grid_move(5, 8, 6, Dir::Right), Some(6));
+        assert_eq!(grid_move(6, 8, 6, Dir::Left), Some(5));
+        assert_eq!(grid_move(0, 8, 6, Dir::Left), None);
+        assert_eq!(grid_move(7, 8, 6, Dir::Right), None);
+        assert_eq!(grid_move(1, 8, 6, Dir::Down), Some(7));
+        assert_eq!(grid_move(4, 8, 6, Dir::Down), Some(7));
+        assert_eq!(grid_move(7, 8, 6, Dir::Down), None);
+        assert_eq!(grid_move(7, 8, 6, Dir::Up), Some(1));
+        assert_eq!(grid_move(3, 8, 6, Dir::Up), None);
+        assert_eq!(grid_move(0, 0, 6, Dir::Down), None);
+    }
+
+    #[test]
+    fn focus_codes_round_trip() {
+        for f in [Focus::Search, Focus::Pill, Focus::Pinned(17), Focus::Rec(3), Focus::List(412), Focus::Result(0), Focus::Account, Focus::Power] {
+            assert_eq!(Focus::from_code(f.code()), Some(f));
+        }
+        assert_eq!(Focus::from_code(99 << 24), None);
+    }
+
+    fn row(t: &str) -> Row {
+        Row::Item(Entry { title: t.into(), kind: "", sub: String::new(), target: Target::Uri(String::new()), glyph: Glyph::App })
+    }
+
+    #[test]
+    fn list_spans_count_headers() {
+        let rows = vec![Row::Header("A".into()), row("Alarm"), row("Atlas"), Row::Header("B".into()), row("Bing")];
+        assert_eq!(item_count(&rows), 3);
+        assert_eq!(nth_item(&rows, 2).map(|e| e.title.as_str()), Some("Bing"));
+        assert_eq!(item_span(&rows, 96, 0), Some((HEAD_H, ROW_H)));
+        assert_eq!(item_span(&rows, 96, 2), Some((2 * HEAD_H + 2 * ROW_H, ROW_H)));
+        assert_eq!(item_span(&rows, 96, 3), None);
+    }
+
+    /// Startseite mit 8 angehefteten Apps und 3 Empfehlungen.
+    fn home_state() -> State {
+        let mut st = State::new(Vec::new(), Vec::new(), HashMap::new());
+        st.dpi = 96;
+        st.pin_idx = (0..8).collect();
+        st.nodes = (0..3).map(|i| (Focus::Rec(i), RECT { left: 0, top: 0, right: 1, bottom: 1 })).collect();
+        st
+    }
+
+    #[test]
+    fn tab_cycles_sections() {
+        let mut st = home_state();
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            let f = nav_target(&st, VK_TAB, false).unwrap();
+            seen.push(f);
+            st.focus = f;
+        }
+        assert_eq!(seen, vec![Focus::Pill, Focus::Pinned(0), Focus::Rec(0), Focus::Account, Focus::Power, Focus::Search, Focus::Pill]);
+        // Umschalt+Tab rückwärts, auch mitten aus einem Abschnitt heraus.
+        st.focus = Focus::Pinned(5);
+        assert_eq!(nav_target(&st, VK_TAB, true), Some(Focus::Pill));
+        st.focus = Focus::Search;
+        assert_eq!(nav_target(&st, VK_TAB, true), Some(Focus::Power));
+    }
+
+    #[test]
+    fn arrows_cross_sections() {
+        let mut st = home_state();
+        let go = |st: &mut State, vk: u16| {
+            let f = nav_target(st, vk, false);
+            if let Some(f) = f {
+                st.focus = f;
+            }
+            f
+        };
+        assert_eq!(go(&mut st, VK_DOWN), Some(Focus::Pinned(0)));
+        assert_eq!(go(&mut st, VK_RIGHT), Some(Focus::Pinned(1)));
+        assert_eq!(go(&mut st, VK_DOWN), Some(Focus::Pinned(7)));
+        // Spalte 2 von 6 liegt in der linken Hälfte → linke Empfehlung.
+        assert_eq!(go(&mut st, VK_DOWN), Some(Focus::Rec(0)));
+        assert_eq!(go(&mut st, VK_DOWN), Some(Focus::Rec(2)));
+        assert_eq!(go(&mut st, VK_DOWN), Some(Focus::Account));
+        assert_eq!(go(&mut st, VK_RIGHT), Some(Focus::Power));
+        assert_eq!(go(&mut st, VK_RIGHT), None);
+        assert_eq!(go(&mut st, VK_UP), Some(Focus::Rec(0)));
+        assert_eq!(go(&mut st, VK_UP), Some(Focus::Pinned(6)));
+        assert_eq!(go(&mut st, VK_UP), Some(Focus::Pinned(0)));
+        assert_eq!(go(&mut st, VK_UP), Some(Focus::Search));
+        // Pfeile links/rechts im Suchfeld tun nichts.
+        assert_eq!(go(&mut st, VK_LEFT), None);
+    }
+
+    #[test]
+    fn arrows_in_search_results() {
+        let mut st = home_state();
+        st.query = "pa".into();
+        st.results = vec![row("Paint"), row("Paint 3D")];
+        assert_eq!(nav_target(&st, VK_DOWN, false), Some(Focus::Result(1)));
+        st.focus = Focus::Result(1);
+        st.sel = 1;
+        assert_eq!(nav_target(&st, VK_DOWN, false), Some(Focus::Result(1)));
+        assert_eq!(nav_target(&st, VK_UP, false), Some(Focus::Result(0)));
+        // Tab: Treffer → Konto → Ein/Aus → Treffer.
+        assert_eq!(nav_target(&st, VK_TAB, false), Some(Focus::Account));
+        st.focus = Focus::Power;
+        assert_eq!(nav_target(&st, VK_TAB, false), Some(Focus::Result(1)));
+    }
+
+    #[test]
+    fn all_apps_list_navigation() {
+        let mut st = home_state();
+        st.view = View::All;
+        st.all_rows = vec![Row::Header("A".into()), row("Alarm"), row("Atlas"), Row::Header("B".into()), row("Bing")];
+        st.list_h = 2 * ROW_H;
+        assert_eq!(nav_target(&st, VK_DOWN, false), Some(Focus::List(0)));
+        st.focus = Focus::List(0);
+        assert_eq!(nav_target(&st, VK_UP, false), Some(Focus::Search));
+        assert_eq!(nav_target(&st, VK_END, false), Some(Focus::List(2)));
+        set_focus(&mut st, Focus::List(2));
+        // Zeile 2 liegt bei 2 Überschriften + 2 Zeilen; ganz sichtbar halten.
+        assert_eq!(st.scroll, 2 * HEAD_H + 3 * ROW_H - 2 * ROW_H);
+        assert_eq!(nav_target(&st, VK_DOWN, false), Some(Focus::Account));
+        st.focus = Focus::Account;
+        assert_eq!(nav_target(&st, VK_UP, false), Some(Focus::List(2)));
+    }
+
+    #[test]
+    fn catalog_signature_ignores_order() {
+        let a = [("Paint", "p"), ("Word", "w")];
+        let b = [("Word", "w"), ("Paint", "p")];
+        assert_eq!(catalog_sig(a.iter().copied()), catalog_sig(b.iter().copied()));
+        let c = [("Word", "w"), ("Paint", "p"), ("Neu", "n")];
+        assert_ne!(catalog_sig(a.iter().copied()), catalog_sig(c.iter().copied()));
+    }
 }
 
 #[cfg(test)]
@@ -1808,33 +2904,9 @@ mod render {
             let mut st = State {
                 dpi,
                 fonts: Some(Fonts::new(dpi)),
-                apps: Vec::new(),
-                all_rows: Vec::new(),
-                pins: Vec::new(),
-                pin_idx: Vec::new(),
-                recent: Vec::new(),
-                icons: HashMap::new(),
-                avatar: (0, null_mut()),
-                query: String::new(),
-                select_all: false,
-                results: Vec::new(),
-                exe_ids: None,
-                files: Vec::new(),
-                files_for: String::new(),
-                files_gen: 0,
                 view: View::Answer,
-                sel: 0,
-                scroll: 0,
-                max_scroll: 0,
-                list_h: 0,
-                follow: true,
                 input: "Geht das auch rek".into(),
-                hidden_at: None,
-                chat_layout: None,
-                copied: None,
-                mouse: (-1, -1),
-                tracking: false,
-                hits: Vec::new(),
+                ..State::new(Vec::new(), Vec::new(), HashMap::new())
             };
             draw(&mut st, dc, w, h);
             if let Ok(s) = std::env::var("LIGHTBAR_SCROLL") {
