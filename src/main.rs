@@ -5,6 +5,8 @@
 
 #![windows_subsystem = "windows"]
 
+#[macro_use]
+mod i18n;
 mod ai;
 mod ai_tools;
 mod anim;

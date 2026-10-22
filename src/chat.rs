@@ -589,7 +589,7 @@ pub fn layout(m: &dyn Measure, turns: &[Turn], width: i32, dpi: u32) -> Layout {
         }
 
         if turn.thinking && turn.text.trim().is_empty() {
-            let (runs, bottom) = wrap(m, &[span("denkt nach …", Style::Plain)], Font::Normal, &Ink::Sub, 0, y, width, d);
+            let (runs, bottom) = wrap(m, &[span(t!("denkt nach …", "thinking ..."), Style::Plain)], Font::Normal, &Ink::Sub, 0, y, width, d);
             items.extend(runs.into_iter().map(Item::Run));
             y = bottom;
         } else {
@@ -606,7 +606,7 @@ pub fn layout(m: &dyn Measure, turns: &[Turn], width: i32, dpi: u32) -> Layout {
         }
         if turn.done && turn.error.is_none() && !turn.text.trim().is_empty() {
             y += px(d, 6);
-            let w = m.width(Font::Small, "Kopieren") + px(d, 38);
+            let w = m.width(Font::Small, t!("Kopieren", "Copy")) + px(d, 38);
             let r = rect(-px(d, 6), y, w - px(d, 6), y + px(d, 26));
             items.push(Item::Copy { rect: r, text: turn.text.trim().to_string(), label: true });
             y = r.bottom;
@@ -868,7 +868,7 @@ mod tests {
         let t = Turn { question: "q", steps: &steps, text: "", thinking: true, done: false, error: None };
         let l = layout(&Fixed, &[t], 300, 96);
         let runs: Vec<&str> = l.items.iter().filter_map(|i| if let Item::Run(r) = i { Some(r.text.as_str()) } else { None }).collect();
-        assert_eq!(runs, vec!["q", "Suche im Web", "denkt nach …"]);
+        assert_eq!(runs, vec!["q", "Suche im Web", t!("denkt nach …", "thinking ...")]);
         let t = Turn { question: "q", steps: &[], text: "teil", thinking: false, done: false, error: None };
         let l = layout(&Fixed, &[t], 300, 96);
         assert!(l.items.iter().any(|i| matches!(i, Item::Run(r) if r.text == "teil ▍")));

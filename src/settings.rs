@@ -64,11 +64,13 @@ pub struct Settings {
     pub presentation: bool,
     /// Kontobild statt Anfangsbuchstabe im Startmenü.
     pub start_avatar: bool,
+    /// Sprache der Oberfläche (auto = Windows-Anzeigesprache).
+    pub language: crate::i18n::LangSetting,
 }
 
 // Usage-Anzeige standardmäßig aus: Sie liest lokale Logins und nutzt nicht
 // offiziell dokumentierte Schnittstellen – das soll man bewusst einschalten.
-const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: false, usage_claude: true, usage_codex: true, start_logo: StartLogo::Orb, presentation: false, start_avatar: true };
+const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: false, usage_claude: true, usage_codex: true, start_logo: StartLogo::Orb, presentation: false, start_avatar: true, language: crate::i18n::LangSetting::Auto };
 
 static CURRENT: Mutex<Option<Settings>> = Mutex::new(None);
 
@@ -111,6 +113,7 @@ fn load() -> Settings {
                     "windows_logo" if on => s.start_logo = StartLogo::Windows,
                     "presentation" => s.presentation = on,
                     "start_avatar" => s.start_avatar = on,
+                    "language" => s.language = crate::i18n::LangSetting::parse(v).unwrap_or(s.language),
                     _ => {}
                 }
             }
@@ -140,7 +143,7 @@ fn save(s: &Settings) {
     let _ = std::fs::create_dir_all(&dir);
     let b = |v: bool| if v { "1" } else { "0" };
     let text = format!(
-        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\nusage_claude={}\nusage_codex={}\nstart_logo={}\npresentation={}\nstart_avatar={}\n",
+        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\nusage_claude={}\nusage_codex={}\nstart_logo={}\npresentation={}\nstart_avatar={}\nlanguage={}\n",
         s.glow.key(),
         b(s.mono_tray),
         b(s.clock_seconds),
@@ -149,7 +152,8 @@ fn save(s: &Settings) {
         b(s.usage_codex),
         s.start_logo.key(),
         b(s.presentation),
-        b(s.start_avatar)
+        b(s.start_avatar),
+        s.language.key()
     );
     let _ = std::fs::write(dir.join("settings.txt"), text);
 }

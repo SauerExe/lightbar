@@ -77,7 +77,7 @@ impl IRawElementProviderSimple_Impl for Root_Impl {
     }
     fn GetPropertyValue(&self, id: UIA_PROPERTY_ID) -> Result<VARIANT> {
         Ok(match id {
-            UIA_NamePropertyId => VARIANT::from("Taskleiste"),
+            UIA_NamePropertyId => VARIANT::from(t!("Taskleiste", "Taskbar")),
             UIA_ControlTypePropertyId => VARIANT::from(UIA_ToolBarControlTypeId.0),
             UIA_AutomationIdPropertyId => VARIANT::from("Lightbar"),
             _ => VARIANT::default(),

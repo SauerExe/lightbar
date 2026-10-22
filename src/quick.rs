@@ -171,12 +171,12 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     let x0 = px(d, PAD);
     let wifi_label = match &s.net {
         Net::Wifi(_, ssid) if !ssid.is_empty() => ssid.clone(),
-        _ => "WLAN".to_string(),
+        _ => t!("WLAN", "Wi-Fi").to_string(),
     };
     let known = st.radios.is_some();
     tile(st, dc, fonts, x0, y, "\u{E701}", &wifi_label, bits & WIFI_ON != 0, !known || bits & WIFI_PRESENT != 0, Act::Wifi);
     tile(st, dc, fonts, x0 + px(d, TILE_W) + gap, y, "\u{E702}", "Bluetooth", bits & BT_ON != 0, !known || bits & BT_PRESENT != 0, Act::Bluetooth);
-    tile(st, dc, fonts, x0 + 2 * (px(d, TILE_W) + gap), y, "\u{EBC6}", "Projizieren", false, true, Act::Project);
+    tile(st, dc, fonts, x0 + 2 * (px(d, TILE_W) + gap), y, "\u{EBC6}", t!("Projizieren", "Project"), false, true, Act::Project);
 
     // Lautstärke
     let vy = y + px(d, TILE_H + 28 + 16);
@@ -212,7 +212,7 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
             round(dc, &br, HOVER, px(d, 6));
         }
         text(dc, &status::battery_glyph(p, charging), &RECT { left: br.left + px(d, 8), ..br }, fonts.2, TEXT, LINE);
-        let label = if charging { format!("{p} % · lädt") } else { format!("{p} %") };
+        let label = if charging { tf!("{p} % · lädt", "{p}% · charging") } else { format!("{p} %") };
         text(dc, &label, &RECT { left: br.left + px(d, 34), ..br }, fonts.0, TEXT, LINE);
         st.hits.push((br, Act::Battery));
     }
@@ -417,7 +417,7 @@ pub unsafe fn create(inst: HINSTANCE) {
     let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
         class.as_ptr(),
-        w16("Schnelleinstellungen").as_ptr(),
+        w16(t!("Schnelleinstellungen", "Quick settings")).as_ptr(),
         WS_POPUP,
         0,
         0,

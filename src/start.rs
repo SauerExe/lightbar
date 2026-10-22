@@ -205,34 +205,37 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 
 // --------------------------------------------------------------- Daten
 
-pub(crate) const SETTINGS: &[(&str, &str, &str)] = &[
-    ("Einstellungen", "ms-settings:", "settings einstellungen"),
-    ("Bluetooth & Geräte", "ms-settings:bluetooth", "bluetooth geräte maus tastatur kopfhörer"),
-    ("WLAN", "ms-settings:network-wifi", "wlan wifi netzwerk internet"),
-    ("Netzwerk & Internet", "ms-settings:network-status", "netzwerk internet ethernet lan"),
-    ("VPN", "ms-settings:network-vpn", "vpn"),
-    ("Anzeige", "ms-settings:display", "anzeige bildschirm monitor auflösung skalierung helligkeit"),
-    ("Sound", "ms-settings:sound", "sound audio lautstärke lautsprecher mikrofon"),
-    ("Benachrichtigungen", "ms-settings:notifications", "benachrichtigungen mitteilungen"),
-    ("Energie & Akku", "ms-settings:powersleep", "energie akku batterie strom ruhezustand"),
-    ("Speicher", "ms-settings:storagesense", "speicher festplatte platz"),
-    ("Hintergrund", "ms-settings:personalization-background", "hintergrund wallpaper personalisierung"),
-    ("Farben", "ms-settings:colors", "farben dunkel modus dark theme akzent"),
-    ("Taskleiste", "ms-settings:taskbar", "taskleiste"),
-    ("Installierte Apps", "ms-settings:appsfeatures", "apps programme deinstallieren"),
-    ("Standard-Apps", "ms-settings:defaultapps", "standard apps browser"),
-    ("Autostart", "ms-settings:startupapps", "autostart"),
-    ("Konten", "ms-settings:yourinfo", "konto account"),
-    ("Datum & Uhrzeit", "ms-settings:dateandtime", "datum uhrzeit zeit zone"),
-    ("Sprache & Region", "ms-settings:regionlanguage", "sprache region"),
-    ("Maus", "ms-settings:mousetouchpad", "maus touchpad zeiger"),
-    ("Drucker & Scanner", "ms-settings:printers", "drucker scanner"),
-    ("Windows Update", "ms-settings:windowsupdate", "update aktualisierung"),
-    ("Datenschutz & Sicherheit", "ms-settings:privacy", "datenschutz sicherheit privacy"),
-    ("Windows-Sicherheit", "windowsdefender:", "defender virus sicherheit"),
-    ("Info", "ms-settings:about", "info system pc name version"),
-    ("Gaming", "ms-settings:gaming-gamebar", "gaming spiele game bar"),
-    ("Systemsteuerung", "shell:ControlPanelFolder", "systemsteuerung control panel"),
+/// Einstellungsseiten: (Name deutsch, Name englisch, Adresse, Suchwörter).
+/// Die Suchwörter enthalten beide Sprachen, damit die Suche unabhängig von
+/// der Oberflächensprache trifft.
+pub(crate) const SETTINGS: &[(&str, &str, &str, &str)] = &[
+    ("Einstellungen", "Settings", "ms-settings:", "settings einstellungen"),
+    ("Bluetooth & Geräte", "Bluetooth & devices", "ms-settings:bluetooth", "bluetooth geräte maus tastatur kopfhörer devices mouse keyboard headphones"),
+    ("WLAN", "Wi-Fi", "ms-settings:network-wifi", "wlan wifi netzwerk internet network wireless"),
+    ("Netzwerk & Internet", "Network & internet", "ms-settings:network-status", "netzwerk internet ethernet lan network"),
+    ("VPN", "VPN", "ms-settings:network-vpn", "vpn"),
+    ("Anzeige", "Display", "ms-settings:display", "anzeige bildschirm monitor auflösung skalierung helligkeit display screen resolution scaling brightness"),
+    ("Sound", "Sound", "ms-settings:sound", "sound audio lautstärke lautsprecher mikrofon volume speakers microphone"),
+    ("Benachrichtigungen", "Notifications", "ms-settings:notifications", "benachrichtigungen mitteilungen notifications"),
+    ("Energie & Akku", "Power & battery", "ms-settings:powersleep", "energie akku batterie strom ruhezustand power battery sleep"),
+    ("Speicher", "Storage", "ms-settings:storagesense", "speicher festplatte platz storage disk space"),
+    ("Hintergrund", "Background", "ms-settings:personalization-background", "hintergrund wallpaper personalisierung background personalization"),
+    ("Farben", "Colors", "ms-settings:colors", "farben dunkel modus dark theme akzent colors colours mode accent light"),
+    ("Taskleiste", "Taskbar", "ms-settings:taskbar", "taskleiste taskbar"),
+    ("Installierte Apps", "Installed apps", "ms-settings:appsfeatures", "apps programme deinstallieren programs uninstall installed"),
+    ("Standard-Apps", "Default apps", "ms-settings:defaultapps", "standard apps browser default"),
+    ("Autostart", "Startup apps", "ms-settings:startupapps", "autostart startup"),
+    ("Konten", "Accounts", "ms-settings:yourinfo", "konto account accounts"),
+    ("Datum & Uhrzeit", "Date & time", "ms-settings:dateandtime", "datum uhrzeit zeit zone date time timezone clock"),
+    ("Sprache & Region", "Language & region", "ms-settings:regionlanguage", "sprache region language"),
+    ("Maus", "Mouse", "ms-settings:mousetouchpad", "maus touchpad zeiger mouse pointer cursor"),
+    ("Drucker & Scanner", "Printers & scanners", "ms-settings:printers", "drucker scanner printer printers scanners"),
+    ("Windows Update", "Windows Update", "ms-settings:windowsupdate", "update aktualisierung updates"),
+    ("Datenschutz & Sicherheit", "Privacy & security", "ms-settings:privacy", "datenschutz sicherheit privacy security"),
+    ("Windows-Sicherheit", "Windows Security", "windowsdefender:", "defender virus sicherheit security antivirus"),
+    ("Info", "About", "ms-settings:about", "info system pc name version about"),
+    ("Gaming", "Gaming", "ms-settings:gaming-gamebar", "gaming spiele game bar games"),
+    ("Systemsteuerung", "Control Panel", "shell:ControlPanelFolder", "systemsteuerung control panel"),
 ];
 
 /// Startbelegung, solange der Nutzer nichts angeheftet hat.
@@ -279,11 +282,11 @@ fn save_pins(pins: &[String]) {
 fn ago(t: SystemTime) -> String {
     let s = SystemTime::now().duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
     match s {
-        0..=59 => "Gerade eben".into(),
-        60..=3599 => format!("vor {} Min.", s / 60),
-        3600..=86399 => format!("vor {} Std.", s / 3600),
-        86400..=172799 => "Gestern".into(),
-        _ => format!("vor {} Tagen", s / 86400),
+        0..=59 => t!("Gerade eben", "Just now").into(),
+        60..=3599 => tf!("vor {} Min.", "{} min ago", s / 60),
+        3600..=86399 => tf!("vor {} Std.", "{} h ago", s / 3600),
+        86400..=172799 => t!("Gestern", "Yesterday").into(),
+        _ => tf!("vor {} Tagen", "{} days ago", s / 86400),
     }
 }
 
@@ -314,7 +317,7 @@ fn load_recent() -> Vec<Entry> {
         .into_iter()
         .map(|(t, p)| Entry {
             title: p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-            kind: "Datei",
+            kind: t!("Datei", "File"),
             sub: ago(t),
             target: Target::Path(p.to_string_lossy().into_owned()),
             glyph: Glyph::File,
@@ -380,14 +383,16 @@ fn search(st: &State) -> Vec<Row> {
     let mut hits: Vec<(u32, Entry)> = Vec::new();
     for (i, a) in st.apps.iter().enumerate() {
         if let Some(s) = score(&a.lower) {
-            let e = Entry { title: a.name.clone(), kind: "App", sub: String::new(), target: Target::App(i), glyph: Glyph::App };
+            let e = Entry { title: a.name.clone(), kind: t!("App", "App"), sub: String::new(), target: Target::App(i), glyph: Glyph::App };
             hits.push((s * 3, e));
         }
     }
-    for (name, uri, keys) in SETTINGS {
-        let s = [score(&name.to_lowercase()), score(keys)].into_iter().flatten().min();
+    for (de, en, uri, keys) in SETTINGS {
+        // Beide Sprachen durchsuchen, unabhängig von der Oberflächensprache.
+        let s = [score(&de.to_lowercase()), score(&en.to_lowercase()), score(keys)].into_iter().flatten().min();
         if let Some(s) = s {
-            let e = Entry { title: name.to_string(), kind: "Einstellungen", sub: String::new(), target: Target::Uri(uri.to_string()), glyph: Glyph::Settings };
+            let name = if crate::i18n::en() { en } else { de };
+            let e = Entry { title: name.to_string(), kind: t!("Einstellungen", "Settings"), sub: String::new(), target: Target::Uri(uri.to_string()), glyph: Glyph::Settings };
             hits.push((s * 3 + 1, e));
         }
     }
@@ -413,7 +418,7 @@ fn search(st: &State) -> Vec<Row> {
     if crate::ai::enabled() {
         let question = raw.trim_start_matches('?').trim();
         if !question.is_empty() {
-            let e = Entry { title: format!("„{question}“ fragen"), kind: "KI", sub: String::new(), target: Target::Ask(question.to_string()), glyph: Glyph::Ai };
+            let e = Entry { title: tf!("„{question}“ fragen", "Ask \"{question}\""), kind: t!("KI", "AI"), sub: String::new(), target: Target::Ask(question.to_string()), glyph: Glyph::Ai };
             if raw.starts_with('?') {
                 rows.insert(0, Row::Item(e));
             } else {
@@ -423,14 +428,14 @@ fn search(st: &State) -> Vec<Row> {
     }
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     rows.push(Row::Item(Entry {
-        title: format!("„{raw}“ in Dateien suchen"),
+        title: tf!("„{raw}“ in Dateien suchen", "Search files for \"{raw}\""),
         kind: "Explorer",
         sub: String::new(),
         target: Target::Uri(format!("search-ms:query={}&crumb=location:{}", url_encode(raw), url_encode(&home))),
         glyph: Glyph::Search,
     }));
     rows.push(Row::Item(Entry {
-        title: format!("„{raw}“ im Web suchen"),
+        title: tf!("„{raw}“ im Web suchen", "Search the web for \"{raw}\""),
         kind: "Web",
         sub: String::new(),
         target: Target::Uri(format!("https://duckduckgo.com/?q={}", url_encode(raw))),
@@ -565,8 +570,8 @@ unsafe fn draw_list(st: &mut State, dc: HDC, f: &Fonts, rows: &[Row], area: RECT
 unsafe fn draw_home(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bottom: i32) {
     let d = st.dpi;
     let head = RECT { left: px(d, PAD + 12), top, right: w / 2, bottom: top + px(d, 28) };
-    text(dc, "Angeheftet", &head, f.bold, TEXT, LINE);
-    pill(st, dc, f, "Alle Apps", "\u{E76C}", false, w - px(d, PAD), top, Act::ShowAll);
+    text(dc, t!("Angeheftet", "Pinned"), &head, f.bold, TEXT, LINE);
+    pill(st, dc, f, t!("Alle Apps", "All apps"), "\u{E76C}", false, w - px(d, PAD), top, Act::ShowAll);
 
     let grid_top = top + px(d, 40);
     let cell_w = (w - 2 * px(d, PAD)) / COLS as i32;
@@ -602,7 +607,7 @@ unsafe fn draw_home(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bottom
     if rec_top + px(d, 40) >= bottom {
         return;
     }
-    text(dc, "Empfohlen", &RECT { left: px(d, PAD + 12), top: rec_top, right: w, bottom: rec_top + px(d, 28) }, f.bold, TEXT, LINE);
+    text(dc, t!("Empfohlen", "Recommended"), &RECT { left: px(d, PAD + 12), top: rec_top, right: w, bottom: rec_top + px(d, 28) }, f.bold, TEXT, LINE);
     let item_top = rec_top + px(d, 40);
     let col_w = (w - 2 * px(d, PAD)) / 2;
     let row_h = px(d, 56);
@@ -650,11 +655,11 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     let shown = if chat { st.input.clone() } else { st.query.clone() };
     if shown.is_empty() {
         let hint = if chat {
-            if crate::ai::current().is_some() { "Nachfragen …" } else { "Frag etwas …" }
+            if crate::ai::current().is_some() { t!("Nachfragen …", "Ask a follow-up …") } else { t!("Frag etwas …", "Ask something …") }
         } else if crate::ai::enabled() {
-            "Suchen – mit ? am Anfang die KI fragen"
+            t!("Suchen – mit ? am Anfang die KI fragen", "Search – start with ? to ask the AI")
         } else {
-            "Nach Apps, Einstellungen und Dateien suchen"
+            t!("Nach Apps, Einstellungen und Dateien suchen", "Search for apps, settings and files")
         };
         text(dc, hint, &tr, f.normal, DIM, LINE);
     } else {
@@ -681,8 +686,8 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     } else if st.view == View::Answer {
         draw_answer(st, dc, &f, w, body_top, body_bottom - px(d, 8));
     } else if st.view == View::All {
-        text(dc, "Alle Apps", &RECT { left: px(d, PAD + 12), top: body_top, right: w / 2, bottom: body_top + px(d, 28) }, f.bold, TEXT, LINE);
-        pill(st, dc, &f, "Zurück", "\u{E76B}", true, w - px(d, PAD), body_top, Act::ShowHome);
+        text(dc, t!("Alle Apps", "All apps"), &RECT { left: px(d, PAD + 12), top: body_top, right: w / 2, bottom: body_top + px(d, 28) }, f.bold, TEXT, LINE);
+        pill(st, dc, &f, t!("Zurück", "Back"), "\u{E76B}", true, w - px(d, PAD), body_top, Act::ShowHome);
         let rows = std::mem::take(&mut st.all_rows);
         let area = RECT { left: 0, top: body_top + px(d, 40), right: w, bottom: body_bottom - px(d, 8) };
         draw_list(st, dc, &f, &rows, area, None);
@@ -695,7 +700,7 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     let foot = RECT { left: 0, top: body_bottom, right: w, bottom: h };
     fill(dc, &foot, PANEL);
     fill(dc, &RECT { bottom: foot.top + 1, ..foot }, BORDER);
-    let user = if crate::settings::get().presentation { "Benutzer".to_string() } else { std::env::var("USERNAME").unwrap_or_default() };
+    let user = if crate::settings::get().presentation { t!("Benutzer", "User").to_string() } else { std::env::var("USERNAME").unwrap_or_default() };
     let av = px(d, 32);
     let ar = RECT { left: px(d, PAD + 16), top: foot.top + (px(d, FOOT) - av) / 2, right: px(d, PAD + 16) + av, bottom: foot.top + (px(d, FOOT) + av) / 2 };
     let account = RECT { left: px(d, PAD), top: foot.top + px(d, 12), right: ar.right + px(d, 24) + text_width(dc, &user, f.normal), bottom: h - px(d, 12) };
@@ -972,10 +977,10 @@ unsafe fn draw_answer(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bott
     let d = st.dpi;
     let answers = crate::ai::turns();
     let head = RECT { left: px(d, PAD + 12), top, right: w / 2, bottom: top + px(d, 28) };
-    text(dc, "KI-Chat", &head, f.bold, TEXT, LINE);
-    let left = pill(st, dc, f, "Zurück", "\u{E76B}", true, w - px(d, PAD), top, Act::ShowHome);
+    text(dc, t!("KI-Chat", "AI chat"), &head, f.bold, TEXT, LINE);
+    let left = pill(st, dc, f, t!("Zurück", "Back"), "\u{E76B}", true, w - px(d, PAD), top, Act::ShowHome);
     if !answers.is_empty() {
-        pill(st, dc, f, "Neuer Chat", "\u{E710}", true, left - px(d, 8), top, Act::NewChat);
+        pill(st, dc, f, t!("Neuer Chat", "New chat"), "\u{E710}", true, left - px(d, 8), top, Act::NewChat);
     }
     let area = RECT { left: px(d, PAD + 12), top: top + px(d, 44), right: w - px(d, PAD + 12), bottom };
     let view_h = area.bottom - area.top;
@@ -984,7 +989,7 @@ unsafe fn draw_answer(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bott
         st.max_scroll = 0;
         st.scroll = 0;
         let r = RECT { bottom: area.top + px(d, 60), ..area };
-        text(dc, "Stell oben im Feld eine Frage – Folgefragen kennen den bisherigen Verlauf.", &r, f.normal, SUBTEXT, DT_CENTER | DT_WORDBREAK);
+        text(dc, t!("Stell oben im Feld eine Frage – Folgefragen kennen den bisherigen Verlauf.", "Ask a question in the field above – follow-ups know the conversation so far."), &r, f.normal, SUBTEXT, DT_CENTER | DT_WORDBREAK);
         return;
     }
 
@@ -1074,7 +1079,7 @@ unsafe fn draw_answer(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bott
                 let glyph = if done { "\u{E73E}" } else { "\u{E8C8}" };
                 if *label {
                     text(dc, glyph, &RECT { left: r.left + px(d, 8), ..r }, f.icons_small, SUBTEXT, LINE);
-                    text(dc, if done { "Kopiert" } else { "Kopieren" }, &RECT { left: r.left + px(d, 26), ..r }, f.small, SUBTEXT, LINE);
+                    text(dc, if done { t!("Kopiert", "Copied") } else { t!("Kopieren", "Copy") }, &RECT { left: r.left + px(d, 26), ..r }, f.small, SUBTEXT, LINE);
                 } else {
                     text(dc, glyph, &r, f.icons_small, SUBTEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 }
@@ -1116,16 +1121,16 @@ unsafe fn app_menu(hwnd: HWND, app: usize) {
     .flatten() else {
         return;
     };
-    let mut items = vec![Item::Cmd(1, if pinned { "Von Start lösen" } else { "An Start anheften" })];
+    let mut items = vec![Item::Cmd(1, if pinned { t!("Von Start lösen", "Unpin from Start") } else { t!("An Start anheften", "Pin to Start") })];
     if let Some(exe) = &exe {
         let on_bar = crate::bar::is_pinned(exe);
-        items.push(Item::Cmd(2, if on_bar { "Von Taskleiste lösen" } else { "An Taskleiste anheften" }));
+        items.push(Item::Cmd(2, if on_bar { t!("Von Taskleiste lösen", "Unpin from taskbar") } else { t!("An Taskleiste anheften", "Pin to taskbar") }));
         items.push(Item::Sep);
-        items.push(Item::Cmd(3, "Als Administrator ausführen"));
-        items.push(Item::Cmd(4, "Dateispeicherort öffnen"));
+        items.push(Item::Cmd(3, t!("Als Administrator ausführen", "Run as administrator")));
+        items.push(Item::Cmd(4, t!("Dateispeicherort öffnen", "Open file location")));
     }
     items.push(Item::Sep);
-    items.push(Item::Cmd(5, "Deinstallieren"));
+    items.push(Item::Cmd(5, t!("Deinstallieren", "Uninstall")));
     let cmd = menus::popup(hwnd, &items);
     let exe = exe.unwrap_or_default();
     match cmd {
@@ -1203,7 +1208,7 @@ unsafe fn apply_file_results(hwnd: HWND, gen: u64) {
             .into_iter()
             .map(|(name, path)| {
                 let folder = Path::new(&path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-                Entry { title: name, kind: "Datei", sub: folder, target: Target::Path(path), glyph: Glyph::File }
+                Entry { title: name, kind: t!("Datei", "File"), sub: folder, target: Target::Path(path), glyph: Glyph::File }
             })
             .collect();
         st.files_for = st.query.clone();
@@ -1802,4 +1807,31 @@ mod render {
             ReleaseDC(null_mut(), screen);
         }
     }
+}
+
+/// Sprache umgeschaltet: zwischengespeicherte Texte (Zeilen, Kopfzeilen) neu
+/// aufbauen. Wird von der Leiste nach `i18n::apply` aufgerufen.
+pub fn language_changed() {
+    let h = hwnd();
+    if h.is_null() {
+        return;
+    }
+    // Zuletzt verwendete Dateien tragen Art und Alter als fertigen Text.
+    let recent = load_recent();
+    with(|st| {
+        st.recent = recent;
+        for e in &mut st.files {
+            e.kind = t!("Datei", "File");
+        }
+        rebuild(st);
+        // Trefferliste mit neuen Namen/Arten (Einstellungen, „… fragen“, Web).
+        if !st.query.is_empty() {
+            let sel = st.sel;
+            st.results = search(st);
+            st.sel = sel.min(st.results.len().saturating_sub(1));
+        }
+        // Gemerktes Chat-Layout beim nächsten Zeichnen neu setzen.
+        st.chat_layout = None;
+    });
+    unsafe { InvalidateRect(h, null(), 0) };
 }

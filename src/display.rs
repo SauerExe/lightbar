@@ -366,8 +366,8 @@ pub fn list() -> Vec<Monitor> {
             .collect();
         out.sort_by_key(|m| (!m.primary, m.rect.left, m.rect.top));
         for (i, m) in out.iter_mut().enumerate() {
-            let main = if m.primary { " (Hauptbildschirm)" } else { "" };
-            m.label = format!("Bildschirm {} · {}{main}", i + 1, m.label);
+            let main = if m.primary { t!(" (Hauptbildschirm)", " (main display)") } else { "" };
+            m.label = tf!("Bildschirm {} · {}{main}", "Display {} · {}{main}", i + 1, m.label);
         }
         out
     }

@@ -105,12 +105,12 @@ const P_SHUTDOWN: usize = 905;
 
 fn power_items() -> Vec<Item<'static>> {
     vec![
-        Item::Cmd(P_LOCK, "Sperren"),
-        Item::Cmd(P_LOGOFF, "Abmelden"),
+        Item::Cmd(P_LOCK, t!("Sperren", "Lock")),
+        Item::Cmd(P_LOGOFF, t!("Abmelden", "Sign out")),
         Item::Sep,
-        Item::Cmd(P_SLEEP, "Energie sparen"),
-        Item::Cmd(P_RESTART, "Neu starten"),
-        Item::Cmd(P_SHUTDOWN, "Herunterfahren"),
+        Item::Cmd(P_SLEEP, t!("Energie sparen", "Sleep")),
+        Item::Cmd(P_RESTART, t!("Neu starten", "Restart")),
+        Item::Cmd(P_SHUTDOWN, t!("Herunterfahren", "Shut down")),
     ]
 }
 
@@ -142,10 +142,10 @@ pub unsafe fn account_menu(owner: HWND) -> bool {
     let id = popup(
         owner,
         &[
-            Item::Cmd(1, "Kontoeinstellungen ändern"),
+            Item::Cmd(1, t!("Kontoeinstellungen ändern", "Change account settings")),
             Item::Sep,
-            Item::Cmd(P_LOCK, "Sperren"),
-            Item::Cmd(P_LOGOFF, "Abmelden"),
+            Item::Cmd(P_LOCK, t!("Sperren", "Lock")),
+            Item::Cmd(P_LOGOFF, t!("Abmelden", "Sign out")),
         ],
     );
     match id {
@@ -171,25 +171,25 @@ pub unsafe fn winx(owner: HWND) {
     let id = popup(
         owner,
         &[
-            Item::Cmd(1, "Installierte Apps"),
-            Item::Cmd(2, "Energieoptionen"),
-            Item::Cmd(3, "Ereignisanzeige"),
+            Item::Cmd(1, t!("Installierte Apps", "Installed apps")),
+            Item::Cmd(2, t!("Energieoptionen", "Power Options")),
+            Item::Cmd(3, t!("Ereignisanzeige", "Event Viewer")),
             Item::Cmd(4, "System"),
-            Item::Cmd(5, "Geräte-Manager"),
-            Item::Cmd(6, "Netzwerkverbindungen"),
-            Item::Cmd(7, "Datenträgerverwaltung"),
-            Item::Cmd(8, "Computerverwaltung"),
+            Item::Cmd(5, t!("Geräte-Manager", "Device Manager")),
+            Item::Cmd(6, t!("Netzwerkverbindungen", "Network Connections")),
+            Item::Cmd(7, t!("Datenträgerverwaltung", "Disk Management")),
+            Item::Cmd(8, t!("Computerverwaltung", "Computer Management")),
             Item::Sep,
             Item::Cmd(9, "Terminal"),
-            Item::Cmd(10, "Terminal (Administrator)"),
+            Item::Cmd(10, t!("Terminal (Administrator)", "Terminal (Admin)")),
             Item::Sep,
-            Item::Cmd(11, "Task-Manager"),
-            Item::Cmd(12, "Einstellungen"),
-            Item::Cmd(13, "Datei-Explorer"),
-            Item::Cmd(14, "Suchen"),
-            Item::Cmd(15, "Ausführen"),
+            Item::Cmd(11, t!("Task-Manager", "Task Manager")),
+            Item::Cmd(12, t!("Einstellungen", "Settings")),
+            Item::Cmd(13, t!("Datei-Explorer", "File Explorer")),
+            Item::Cmd(14, t!("Suchen", "Search")),
+            Item::Cmd(15, t!("Ausführen", "Run")),
             Item::Sep,
-            Item::Sub("Herunterfahren oder abmelden", power_items()),
+            Item::Sub(t!("Herunterfahren oder abmelden", "Shut down or sign out"), power_items()),
             Item::Cmd(16, "Desktop"),
         ],
     );
