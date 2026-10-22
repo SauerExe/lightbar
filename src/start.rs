@@ -25,7 +25,6 @@ use crate::menus::{self, Item};
 use crate::util::*;
 
 pub const WM_TOGGLE: u32 = WM_APP + 10;
-const WM_RELOAD: u32 = WM_APP + 11;
 const WM_FILES: u32 = WM_APP + 12;
 /// Neues Stück einer KI-Antwort.
 const WM_AI: u32 = WM_APP + 13;
@@ -42,6 +41,8 @@ const WM_UIA_INVOKE: u32 = WM_APP + 16;
 const TIMER_APPS: usize = 6;
 /// Älter als das wird der Katalog beim Öffnen im Hintergrund geprüft.
 const CATALOG_MAX_AGE: Duration = Duration::from_secs(30);
+/// So lange gilt ein gelesenes Kontobild (selten geändert, Lesen kostet etwas).
+const AVATAR_MAX_AGE: Duration = Duration::from_secs(600);
 /// So lange bleibt ein Chat nach dem Ausblenden erhalten.
 const CHAT_KEEP: Duration = Duration::from_secs(10 * 60);
 
@@ -170,6 +171,8 @@ struct State {
     icons: HashMap<String, HBITMAP>,
     /// Kontobild für die Fußleiste: (Größe, Bitmap); Größe 0 = noch nicht geladen.
     avatar: (i32, HBITMAP),
+    /// Wann das Kontobild gelesen wurde (es ändert sich selten).
+    avatar_at: Instant,
     query: String,
     /// Strg+A: ganze Suche markiert – Tippen oder Einfügen ersetzt sie.
     select_all: bool,
@@ -230,6 +233,7 @@ impl State {
             recent: Vec::new(),
             icons: HashMap::new(),
             avatar: (0, null_mut()),
+            avatar_at: Instant::now(),
             query: String::new(),
             select_all: false,
             results: Vec::new(),
@@ -782,6 +786,23 @@ unsafe fn purge_icons(st: &mut State, all: bool) {
     });
 }
 
+/// App-Kennung eines App-Icon-Schlüssels ("a<Größe>:<Kennung>").
+fn icon_app_id(key: &str) -> Option<&str> {
+    key.strip_prefix('a')?.split_once(':').map(|(_, id)| id)
+}
+
+/// Nach dem Neuladen des Katalogs: Icons deinstallierter Apps freigeben.
+unsafe fn drop_removed_app_icons(st: &mut State) {
+    let ids: std::collections::HashSet<&str> = st.apps.iter().map(|a| a.id.as_str()).collect();
+    st.icons.retain(|k, b| {
+        let keep = icon_app_id(k).is_none_or(|id| ids.contains(id));
+        if !keep && !b.is_null() {
+            DeleteObject(*b);
+        }
+        keep
+    });
+}
+
 unsafe fn icon_bitmap(st: &mut State, t: &Target, size: i32) -> HBITMAP {
     // Index kann nach einem Neuladen der Apps veraltet sein – dann kein Symbol.
     let key = match t {
@@ -1140,6 +1161,7 @@ unsafe fn avatar(st: &mut State, size: i32) -> HBITMAP {
     if st.avatar.0 != size {
         drop_avatar(st);
         st.avatar = (size, apps::account_picture(size));
+        st.avatar_at = Instant::now();
     }
     st.avatar.1
 }
@@ -1155,6 +1177,8 @@ unsafe fn drop_avatar(st: &mut State) {
 // ------------------------------------------------------------- Aktionen
 
 pub unsafe fn toggle(_search: bool) {
+    // Automatisch ausgeblendete Leiste: nach dem Öffnen/Schließen nachsehen.
+    crate::bar::autohide_wake_later();
     let h = hwnd();
     if h.is_null() {
         return;
@@ -1221,6 +1245,12 @@ unsafe fn show() {
     if with(|st| st.loaded_at.elapsed() > CATALOG_MAX_AGE).unwrap_or(false) {
         check_catalog(h);
     }
+    // Kontobild gelegentlich neu lesen (könnte in den Einstellungen geändert sein).
+    with(|st| {
+        if st.avatar_at.elapsed() > AVATAR_MAX_AGE {
+            drop_avatar(st);
+        }
+    });
     raise_focus(h, Focus::Search);
 }
 
@@ -1241,8 +1271,8 @@ fn catalog_sig<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> u64 {
 
 /// Katalog in einem Hintergrund-Thread lesen und mit dem geladenen
 /// vergleichen. Meldet sich mit WM_CATALOG zurück; nur bei einer Änderung
-/// wird (im UI-Thread) neu geladen.
-unsafe fn check_catalog(hwnd: HWND) {
+/// wird (im UI-Thread) neu geladen. `false`, wenn schon eine Prüfung läuft.
+unsafe fn check_catalog(hwnd: HWND) -> bool {
     let Some(sig) = with(|st| {
         if std::mem::replace(&mut st.checking, true) {
             return None;
@@ -1250,7 +1280,7 @@ unsafe fn check_catalog(hwnd: HWND) {
         Some(catalog_sig(st.apps.iter().map(|a| (a.name.as_str(), a.id.as_str()))))
     })
     .flatten() else {
-        return;
+        return false;
     };
     let target = hwnd as isize;
     std::thread::spawn(move || unsafe {
@@ -1259,17 +1289,17 @@ unsafe fn check_catalog(hwnd: HWND) {
         let changed = !now.is_empty() && catalog_sig(now.iter().map(|(n, i)| (n.as_str(), i.as_str()))) != sig;
         PostMessageW(target as HWND, WM_CATALOG, changed as usize, 0);
     });
+    true
 }
 
 /// App-Katalog neu laden und alles, was per Index darauf zeigt, nachziehen.
 unsafe fn reload(hwnd: HWND) {
     let apps = apps::enumerate();
     with(|st| {
-        // Kontobild kann sich geändert haben.
-        drop_avatar(st);
         st.loaded_at = Instant::now();
         if !apps.is_empty() {
             st.apps = apps;
+            drop_removed_app_icons(st);
             rebuild(st);
             // Treffer zeigen per Index auf die alte App-Liste.
             if !st.query.is_empty() {
@@ -1311,8 +1341,9 @@ unsafe fn hide() {
         // Datei-Icons (Suche, Empfohlen) freigeben – sonst wüchse der Cache mit
         // jeder je angezeigten Datei. App-Icons bleiben (begrenzt, oft gebraucht).
         with(|st| purge_icons(st, false));
-        // Katalog im Hintergrund auffrischen, solange keiner hinschaut.
-        PostMessageW(h, WM_RELOAD, 0, 0);
+        // Kein Neuladen des Katalogs mehr nach jedem Schließen (apps::enumerate
+        // im UI-Thread fror die Oberfläche ein): Beim Öffnen und nach
+        // Änderungen der Startmenü-Ordner prüft eine Prüfsumme im Hintergrund.
     }
 }
 
@@ -2381,10 +2412,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
-        WM_RELOAD => {
-            reload(hwnd);
-            0
-        }
         WM_CATALOG => {
             with(|st| {
                 st.checking = false;
@@ -2402,10 +2429,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER if wp == TIMER_APPS => {
             KillTimer(hwnd, TIMER_APPS);
-            if IsWindowVisible(hwnd) != 0 {
-                check_catalog(hwnd);
-            } else {
-                reload(hwnd);
+            // Im Hintergrund prüfen, neu geladen wird nur bei einer Änderung. Läuft
+            // gerade eine Prüfung (die die Änderung evtl. noch nicht sah): später nochmal.
+            if !check_catalog(hwnd) {
+                SetTimer(hwnd, TIMER_APPS, 1500, None);
             }
             0
         }
@@ -2614,6 +2641,13 @@ pub unsafe fn create(inst: HINSTANCE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icon_keys_name_their_app() {
+        assert_eq!(icon_app_id("a32:Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"), Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"));
+        assert_eq!(icon_app_id("a24:C:/x/y.lnk"), Some("C:/x/y.lnk"));
+        assert_eq!(icon_app_id("p32:C:/a.txt"), None);
+    }
 
     #[test]
     fn surrogate_pairs_make_emoji() {

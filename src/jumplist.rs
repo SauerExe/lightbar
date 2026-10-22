@@ -77,8 +77,10 @@ pub fn custom_exists(app_id: &str) -> bool {
 }
 
 type CacheKey = (std::time::SystemTime, u64);
-type Cache = std::collections::HashMap<std::path::PathBuf, (CacheKey, Vec<Category>)>;
+/// Je Sprunglisten-Datei, begrenzt auf die zuletzt gebrauchten.
+type Cache = crate::util::Lru<std::path::PathBuf, (CacheKey, Vec<Category>)>;
 static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
+const CACHE_MAX: usize = 32;
 
 /// Aufgaben, eigene und bekannte Kategorien (in Datei-Reihenfolge) der ersten
 /// Kennung, zu der es eine Datei mit Inhalt gibt. `None` = die App hat keine
@@ -90,8 +92,8 @@ pub fn load(app_ids: &[String]) -> Option<Vec<Category>> {
         let Ok(meta) = std::fs::metadata(&path) else { continue };
         let key: Option<CacheKey> = meta.modified().ok().map(|m| (m, meta.len()));
         let cached = key.and_then(|k| {
-            let c = CACHE.lock().ok()?;
-            c.as_ref()?.get(&path).filter(|(ck, _)| *ck == k).map(|(_, v)| v.clone())
+            let mut c = CACHE.lock().ok()?;
+            c.as_mut()?.get(&path).filter(|(ck, _)| *ck == k).map(|(_, v)| v.clone())
         });
         let cats = match cached {
             Some(c) => c,
@@ -99,7 +101,7 @@ pub fn load(app_ids: &[String]) -> Option<Vec<Category>> {
                 let Ok(bytes) = std::fs::read(&path) else { continue };
                 let cats = unsafe { parse(&bytes) };
                 if let (Some(k), Ok(mut c)) = (key, CACHE.lock()) {
-                    c.get_or_insert_with(Default::default).insert(path.clone(), (k, cats.clone()));
+                    c.get_or_insert_with(|| crate::util::Lru::new(CACHE_MAX)).insert(path.clone(), (k, cats.clone()));
                 }
                 cats
             }

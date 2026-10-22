@@ -151,13 +151,20 @@ static NOTIFY: AtomicIsize = AtomicIsize::new(0);
 /// Standard-Audiogerät gewechselt: beim nächsten Abruf neu öffnen.
 static DEVICE_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn notify() {
+/// wParam von WM_BAR_STATUS: Netzwerk (gebündelt, WLAN neu lesen) statt Audio.
+pub const NOTIFY_NETWORK: usize = 1;
+
+fn notify_kind(kind: usize) {
     let h = NOTIFY.load(Ordering::Relaxed);
     if h != 0 {
         unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(h as _, crate::bar::WM_BAR_STATUS, 0, 0);
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(h as _, crate::bar::WM_BAR_STATUS, kind, 0);
         }
     }
+}
+
+fn notify() {
+    notify_kind(0);
 }
 
 #[implement(IAudioEndpointVolumeCallback)]
@@ -196,7 +203,8 @@ impl IMMNotificationClient_Impl for DeviceWatch_Impl {
 }
 
 unsafe extern "system" fn on_network(_: *const core::ffi::c_void, _: *const windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPINTERFACE_ROW, _: windows_sys::Win32::NetworkManagement::IpHelper::MIB_NOTIFICATION_TYPE) {
-    notify();
+    // Kommt oft in Schüben (je Schnittstelle, IPv4/IPv6): die Leiste bündelt.
+    notify_kind(NOTIFY_NETWORK);
 }
 
 /// Rückmeldungen einrichten; Änderungen kommen als WM_BAR_STATUS an hwnd.

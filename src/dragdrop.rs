@@ -79,6 +79,10 @@ impl IDropTarget_Impl for Target_Impl {
     fn DragEnter(&self, data: Option<&IDataObject>, _keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
         unsafe {
             self.files.set(data.is_some_and(|d| d.QueryGetData(&hdrop_format()).is_ok()));
+            // Ausgeblendete Leiste: beim Ziehen über den Streifen einblenden.
+            if autohide_on() {
+                autohide_tick(self.bar as HWND);
+            }
             self.over(pt, effect);
         }
         Ok(())
@@ -90,7 +94,12 @@ impl IDropTarget_Impl for Target_Impl {
     }
 
     fn DragLeave(&self) -> Result<()> {
-        unsafe { end_hover() };
+        unsafe {
+            end_hover();
+            if autohide_on() {
+                autohide_tick(self.bar as HWND);
+            }
+        }
         Ok(())
     }
 

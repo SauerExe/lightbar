@@ -480,6 +480,43 @@ pub unsafe fn rect_to_screen(hwnd: HWND, r: RECT) -> RECT {
     RECT { left: a.x, top: a.y, right: b.x, bottom: b.y }
 }
 
+/// Kleiner Zwischenspeicher mit fester Größe: Beim Überlaufen fliegt der am
+/// längsten nicht benutzte Eintrag (für Sprunglisten u. Ä., je App ein Eintrag).
+pub struct Lru<K, V> {
+    cap: usize,
+    tick: u64,
+    map: std::collections::HashMap<K, (V, u64)>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
+    pub fn new(cap: usize) -> Self {
+        Lru { cap: cap.max(1), tick: 0, map: std::collections::HashMap::new() }
+    }
+
+    pub fn get(&mut self, k: &K) -> Option<&V> {
+        self.tick += 1;
+        let t = self.tick;
+        self.map.get_mut(k).map(|e| {
+            e.1 = t;
+            &e.0
+        })
+    }
+
+    pub fn insert(&mut self, k: K, v: V) {
+        self.tick += 1;
+        self.map.insert(k, (v, self.tick));
+        while self.map.len() > self.cap {
+            let Some(oldest) = self.map.iter().min_by_key(|(_, e)| e.1).map(|(k, _)| k.clone()) else { break };
+            self.map.remove(&oldest);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::write_atomic;
@@ -507,5 +544,18 @@ mod tests {
     #[test]
     fn write_atomic_fails_without_file_name() {
         assert!(write_atomic(std::path::Path::new("C:\\"), b"x").is_err());
+    }
+
+    #[test]
+    fn lru_drops_least_recently_used() {
+        let mut c = Lru::new(2);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        assert_eq!(c.get(&"a"), Some(&1));
+        c.insert("c", 3);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.get(&"b"), None);
+        assert_eq!(c.get(&"a"), Some(&1));
+        assert_eq!(c.get(&"c"), Some(&3));
     }
 }

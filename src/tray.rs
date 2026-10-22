@@ -422,7 +422,7 @@ pub unsafe fn forward_to_explorer(ours: HWND, wp: WPARAM, lp: LPARAM) {
                 }
                 let cds = COPYDATASTRUCT { dwData: kind, cbData: data.len() as u32, lpData: data.as_mut_ptr() as *mut c_void };
                 let mut result = 0usize;
-                SendMessageTimeoutW(ex, WM_COPYDATA, wp, &cds as *const _ as LPARAM, SMTO_ABORTIFHUNG, 2000, &mut result);
+                SendMessageTimeoutW(ex, WM_COPYDATA, wp, &cds as *const _ as LPARAM, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &mut result);
             }
         });
         Mutex::new(tx)

@@ -275,6 +275,8 @@ pub fn visible() -> bool {
 }
 
 pub unsafe fn toggle() {
+    // Automatisch ausgeblendete Leiste: nach dem Öffnen/Schließen nachsehen.
+    crate::bar::autohide_wake_later();
     let h = HWND_CAL.load(Ordering::Relaxed);
     if h.is_null() {
         return;

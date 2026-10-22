@@ -58,6 +58,8 @@ pub fn menu_open() -> bool {
 /// Menü am Mauszeiger zeigen, gewählte ID zurückgeben (0 = abgebrochen).
 /// Menüs der Leiste öffnen sich oberhalb der Leiste, wie bei Windows.
 pub unsafe fn popup(owner: HWND, items: &[Item]) -> usize {
+    // Automatisch ausgeblendete Leiste: nach dem Öffnen/Schließen nachsehen.
+    crate::bar::autohide_wake_later();
     let menu = build(items);
     let mut pt: POINT = zeroed();
     GetCursorPos(&mut pt);

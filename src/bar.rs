@@ -72,6 +72,9 @@ const TIMER_REFIT: usize = 12;
 /// Eingabesprache prüfen (Win+Leertaste, Alt+Umschalt melden sich nicht bei uns).
 const TIMER_KBD: usize = 13;
 const KBD_POLL_MS: u32 = 400;
+/// Netzwerkmeldungen bündeln: erst nach dieser Ruhe Status (und WLAN) neu lesen.
+const TIMER_NET: usize = 14;
+const NET_DEBOUNCE_MS: u32 = 400;
 
 /// Energieeinstellung "Bildschirm an/aus" (GUID_CONSOLE_DISPLAY_STATE).
 const GUID_CONSOLE_DISPLAY_STATE: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
@@ -105,6 +108,8 @@ pub const WM_BAR_NUM_LAST: u32 = WM_APP + 51;
 pub const WM_BAR_NUM_JUMP: u32 = WM_APP + 52;
 /// Win+B: Tastaturfokus in den Infobereich.
 pub const WM_BAR_TRAYFOCUS: u32 = WM_APP + 53;
+/// Automatisch ausblenden: Gründe zum Zeigen jetzt prüfen (nach Popups).
+const WM_BAR_AUTOHIDE: u32 = WM_APP + 55;
 /// Hervorhebung der Tray-Icons in der Registry geändert (`tray::watch_promoted`).
 const WM_BAR_TRAYPREFS: u32 = WM_APP + 54;
 const USAGE_W: i32 = 236;
@@ -1944,6 +1949,12 @@ unsafe fn cycle_group(g: &Group, forward: bool) {
 pub static PROF: [std::sync::atomic::AtomicU32; 8] = [const { std::sync::atomic::AtomicU32::new(0) }; 8];
 const PROF_NAMES: [&str; 8] = ["shell-hook", "winevent", "refresh", "refresh-geändert", "paint", "timer", "status", "copydata"];
 
+/// LIGHTBAR_PROFILE gesetzt? Einmal gelesen – der Shell-Hook fragt bei jeder Meldung.
+fn profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LIGHTBAR_PROFILE").is_some())
+}
+
 pub fn prof(i: usize) {
     PROF[i].fetch_add(1, Ordering::Relaxed);
 }
@@ -1953,7 +1964,7 @@ thread_local! {
 }
 
 fn dump_profile() {
-    if std::env::var("LIGHTBAR_PROFILE").is_err() {
+    if !profiling() {
         return;
     }
     let mut detail: Vec<(String, u32)> = PROF_DETAIL.with(|d| d.borrow_mut().drain().collect());
@@ -2724,35 +2735,54 @@ unsafe fn covers_monitor(h: HWND) -> bool {
 /// unter die Leiste oder lassen nach einem Umzug der Leiste eine Lücke.
 /// Windows passt sie nicht von selbst an – also auf den Arbeitsbereich setzen.
 pub unsafe fn fit_maximized(bar: HWND) {
-    use crate::display::Edge;
     let edge = crate::display::edge();
     let work = monitor_rect(bar, true);
     let mut windows: Vec<HWND> = Vec::new();
     EnumWindows(Some(enum_cb), &mut windows as *mut _ as LPARAM);
     for h in windows {
-        // Rahmenlose "maximierte" Vollbild-Fenster (Spiele, Videoplayer) nicht kürzen.
-        if IsZoomed(h) == 0 || !same_monitor(h, bar) || (borderless(h) && covers_monitor(h)) {
-            continue;
-        }
-        let mut r: RECT = zeroed();
-        GetWindowRect(h, &mut r);
-        // Rahmenbreite an einer Seite ablesen, die keine Leiste und keine eigene
-        // Titelleiste hat (Chrome/Electron stehen oben nicht über): waagerechte
-        // Leiste → links, senkrechte → unten.
-        let border = if edge.vertical() { r.bottom - work.bottom } else { work.left - r.left }.max(0);
-        // Nur die Seite zur Leiste, und nur wenn das Fenster wirklich darunter
-        // ragt. Danach ist der Zustand stabil – wer anders maximiert, wird nicht
-        // immer wieder umgesetzt (das ließ Fenster springen).
-        let mut fixed = r;
-        match edge {
-            Edge::Bottom if r.bottom > work.bottom + border + 1 => fixed.bottom = work.bottom + border,
-            Edge::Top if r.top < work.top - border - 1 => fixed.top = work.top - border,
-            Edge::Left if r.left < work.left - border - 1 => fixed.left = work.left - border,
-            Edge::Right if r.right > work.right + border + 1 => fixed.right = work.right + border,
-            _ => continue,
-        }
-        SetWindowPos(h, null_mut(), fixed.left, fixed.top, fixed.right - fixed.left, fixed.bottom - fixed.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS);
+        fit_window(bar, h, edge, work);
     }
+}
+
+/// Nur das Vordergrundfenster anpassen (bei jedem Vordergrundwechsel – der
+/// volle Durchgang mit EnumWindows läuft nur bei Arbeitsbereich-, Bildschirm-
+/// und Einstellungsänderungen sowie im 30-s-Takt).
+unsafe fn fit_foreground() {
+    let fg = GetForegroundWindow();
+    if fg.is_null() || IsZoomed(fg) == 0 || !is_task_window(fg) {
+        return;
+    }
+    let edge = crate::display::edge();
+    if let Some(bar) = all_bars().into_iter().find(|&b| !b.is_null() && same_monitor(fg, b)) {
+        fit_window(bar, fg, edge, monitor_rect(bar, true));
+    }
+}
+
+/// Ein maximiertes Fenster auf dem Monitor der Leiste an deren Arbeitsbereich anpassen.
+unsafe fn fit_window(bar: HWND, h: HWND, edge: crate::display::Edge, work: RECT) {
+    use crate::display::Edge;
+    // Rahmenlose "maximierte" Vollbild-Fenster (Spiele, Videoplayer) nicht kürzen.
+    if IsZoomed(h) == 0 || !same_monitor(h, bar) || (borderless(h) && covers_monitor(h)) {
+        return;
+    }
+    let mut r: RECT = zeroed();
+    GetWindowRect(h, &mut r);
+    // Rahmenbreite an einer Seite ablesen, die keine Leiste und keine eigene
+    // Titelleiste hat (Chrome/Electron stehen oben nicht über): waagerechte
+    // Leiste → links, senkrechte → unten.
+    let border = if edge.vertical() { r.bottom - work.bottom } else { work.left - r.left }.max(0);
+    // Nur die Seite zur Leiste, und nur wenn das Fenster wirklich darunter
+    // ragt. Danach ist der Zustand stabil – wer anders maximiert, wird nicht
+    // immer wieder umgesetzt (das ließ Fenster springen).
+    let mut fixed = r;
+    match edge {
+        Edge::Bottom if r.bottom > work.bottom + border + 1 => fixed.bottom = work.bottom + border,
+        Edge::Top if r.top < work.top - border - 1 => fixed.top = work.top - border,
+        Edge::Left if r.left < work.left - border - 1 => fixed.left = work.left - border,
+        Edge::Right if r.right > work.right + border + 1 => fixed.right = work.right + border,
+        _ => return,
+    }
+    SetWindowPos(h, null_mut(), fixed.left, fixed.top, fixed.right - fixed.left, fixed.bottom - fixed.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS);
 }
 
 /// Deckt das Vordergrundfenster den ganzen Monitor ab (Spiel, Video, F11)?
@@ -2792,7 +2822,7 @@ unsafe fn foreground_fullscreen(bar: HWND) -> bool {
 /// Eine App hat per MarkFullscreenWindow ihren Vollbild-Zustand gemeldet.
 pub unsafe fn fullscreen_marks_changed() {
     update_fullscreen(hwnd());
-    tick_secondaries();
+    secondaries_fullscreen();
 }
 
 /// Fensterliste gebündelt neu einlesen (z. B. nach ITaskbarList::AddTab/DeleteTab).
@@ -3160,7 +3190,11 @@ const STRIP: i32 = 2;
 const SLIDE_S: f32 = 0.15;
 /// So lange nach dem Verlassen der Maus bleibt die Leiste noch stehen.
 const HIDE_DELAY_MS: u128 = 400;
+/// Nachsehen während der Ausblend-Verzögerung.
 const POLL_MS: u32 = 100;
+/// Nachsehen, solange etwas anderes als die Maus die Leiste hält (Popup,
+/// Blinken, Vorschau): endet es, gleitet sie danach weg.
+const HOLD_MS: u32 = 250;
 const FRAME_MS: u32 = 15;
 
 /// Automatisch ausblenden ist für alle Leisten aktiv (siehe `sync_autohide`).
@@ -3360,10 +3394,10 @@ unsafe fn popup_open() -> bool {
     (!start.is_null() && IsWindowVisible(start) != 0) || crate::calendar::visible() || crate::quick::visible() || tray::overflow_visible() || menus::menu_open()
 }
 
-/// Gibt es gerade einen Grund, diese Leiste zu zeigen?
-unsafe fn wants_shown(hwnd: HWND) -> bool {
+/// Gibt es gerade einen Grund, diese Leiste zu zeigen? (Grund, Maus darauf)
+unsafe fn wants_shown(hwnd: HWND) -> (bool, bool) {
     if IsWindowVisible(hwnd) == 0 {
-        return false;
+        return (false, false);
     }
     // Maus auf dem sichtbaren Teil: dem Streifen bzw. der Leiste.
     let mut pt = POINT { x: 0, y: 0 };
@@ -3373,14 +3407,14 @@ unsafe fn wants_shown(hwnd: HWND) -> bool {
     let m = monitor_rect(hwnd, false);
     let mut vis: RECT = zeroed();
     if IntersectRect(&mut vis, &r, &m) != 0 && PtInRect(&vis, pt) != 0 {
-        return true;
+        return (true, true);
     }
     // Popups öffnen sich an der zuletzt benutzten Leiste.
     if hwnd == anchor() && popup_open() {
-        return true;
+        return (true, false);
     }
     let me = hwnd == self::hwnd();
-    with(|s| {
+    let other = with(|s| {
         // Ziehen, Tastaturfokus (Win+T), Vorschau dieser Leiste.
         s.drag.is_some()
             || (me && s.kb_focus.is_some())
@@ -3388,7 +3422,62 @@ unsafe fn wants_shown(hwnd: HWND) -> bool {
             // Eine App blinkt (nur Fenster mit Button, wie beim Pulsieren).
             || s.groups.iter().any(|g| s.attention_of(&g.windows).is_some())
     })
-    .unwrap_or(false)
+    .unwrap_or(false);
+    (other, false)
+}
+
+/// Nächster Abfrage-Abstand beim automatischen Ausblenden (0 = keiner):
+/// im Bildtakt beim Gleiten; keiner, wenn die Leiste ganz weg ist (die Maus
+/// auf dem Streifen und Ereignisse wecken sie) oder die Maus auf ihr ruht
+/// (WM_MOUSELEAVE weckt); sonst langsam, bis der Grund zum Zeigen endet.
+fn autohide_interval(moving: bool, shown: f32, want: bool, cursor: bool) -> u32 {
+    if moving {
+        FRAME_MS
+    } else if shown <= 0.0 && !want {
+        0
+    } else if cursor {
+        0
+    } else if want {
+        HOLD_MS
+    } else {
+        POLL_MS
+    }
+}
+
+/// Ein Grund zum Zeigen ist entstanden (Blinken, Popup, Win+T): alle
+/// ausgeblendeten Leisten prüfen ihn sofort.
+pub unsafe fn autohide_wake() {
+    if !autohide_on() {
+        return;
+    }
+    for b in all_bars() {
+        if !b.is_null() {
+            autohide_tick(b);
+        }
+    }
+}
+
+/// Wie `autohide_wake`, aber erst nach der laufenden Nachricht – ein Popup,
+/// das gerade auf- oder zugeht, ist dann schon sichtbar bzw. weg.
+pub unsafe fn autohide_wake_later() {
+    if autohide_on() {
+        PostMessageW(self::hwnd(), WM_BAR_AUTOHIDE, 0, 0);
+    }
+}
+
+/// Die Maus hat die Leiste gerade verlassen: Verzögerung ab jetzt, dann weg.
+unsafe fn autohide_left(hwnd: HWND) {
+    if !autohide_on() {
+        return;
+    }
+    SLIDES.with(|s| {
+        if let Some(sl) = s.borrow_mut().get_mut(&(hwnd as isize)) {
+            if sl.show {
+                sl.last_want = Instant::now();
+            }
+        }
+    });
+    autohide_tick(hwnd);
 }
 
 /// Ein Schritt: Gründe prüfen, Ziel setzen, ein Stück gleiten.
@@ -3397,10 +3486,10 @@ unsafe fn autohide_tick(hwnd: HWND) {
         KillTimer(hwnd, TIMER_AUTOHIDE);
         return;
     }
-    let want = wants_shown(hwnd);
+    let (want, cursor) = wants_shown(hwnd);
     let animate = animations_enabled();
     let was_full = fully_shown(hwnd);
-    let Some((moving, hiding)) = SLIDES.with(|s| {
+    let Some((moving, hiding, shown)) = SLIDES.with(|s| {
         let mut s = s.borrow_mut();
         let sl = s.get_mut(&(hwnd as isize))?;
         let now = Instant::now();
@@ -3417,7 +3506,7 @@ unsafe fn autohide_tick(hwnd: HWND) {
         let step = if animate { dt / SLIDE_S } else { 1.0 };
         sl.shown = if sl.shown < target { (sl.shown + step).min(target) } else { (sl.shown - step).max(target) };
         sl.moving = sl.shown != target;
-        Some((sl.moving, !sl.show))
+        Some((sl.moving, !sl.show, sl.shown))
     }) else {
         KillTimer(hwnd, TIMER_AUTOHIDE);
         return;
@@ -3436,7 +3525,15 @@ unsafe fn autohide_tick(hwnd: HWND) {
         }
         crate::glow::sync();
     }
-    SetTimer(hwnd, TIMER_AUTOHIDE, if moving { FRAME_MS } else { POLL_MS }, None);
+    // Maus auf der Leiste zählt nur als Wecker, wenn ihr Verlassen gemeldet
+    // wird (nicht z. B. beim Ziehen von Dateien – dann weiter nachsehen).
+    let tracked = cursor && with(|s| s.tracking == hwnd).unwrap_or(false);
+    let ms = autohide_interval(moving, shown, want, tracked);
+    if ms == 0 {
+        KillTimer(hwnd, TIMER_AUTOHIDE);
+    } else {
+        SetTimer(hwnd, TIMER_AUTOHIDE, ms, None);
+    }
 }
 
 /// Nach dem Umschalten: maximierte Fenster an den Arbeitsbereich anpassen –
@@ -3733,10 +3830,18 @@ unsafe fn create_secondary(inst: HINSTANCE, rect: RECT) -> Option<HWND> {
 /// Sekundentakt der Hauptleiste für die Zweitleisten: maximierte Fenster
 /// kürzen und bei Vollbild auf ihrem Monitor aus-/einblenden.
 unsafe fn tick_secondaries() {
-    let mut changed = false;
     for h in secondaries() {
         ensure_work_area(h);
         fit_maximized(h);
+    }
+    secondaries_fullscreen();
+}
+
+/// Zweitleisten bei Vollbild auf ihrem Monitor aus- bzw. wieder einblenden
+/// (billig: nur das Vordergrundfenster, kein EnumWindows).
+unsafe fn secondaries_fullscreen() {
+    let mut changed = false;
+    for h in secondaries() {
         let full = foreground_fullscreen(h);
         let visible = IsWindowVisible(h) != 0;
         if full && visible {
@@ -4316,6 +4421,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0x8006 if crate::display::flashing() => {
                 // Wiederholte Meldungen desselben Blinkens zählen nicht neu.
                 with(|s| if !s.attention.iter().any(|(w, _)| *w == target) { s.attention.push((target, Instant::now())) });
+                // Ausgeblendete Leiste zeigt sich (wie bei Windows).
+                autohide_wake();
             }
             // 0x8004 = HSHELL_RUDEAPPACTIVATED (fehlt in windows-sys).
             // HSHELL_REDRAW ohne 0x8000: Die App blinkt nicht mehr (FlashWindowEx
@@ -4336,7 +4443,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         // Nur so viel tun wie nötig: REDRAW kommt bei jeder Titeländerung (Browser,
         // Chats, Fortschrittsanzeigen) mehrmals pro Sekunde und ändert die Leiste nicht.
-        if std::env::var("LIGHTBAR_PROFILE").is_ok() {
+        if profiling() {
             let mut cls = [0u16; 64];
             let n = GetClassNameW(target, cls.as_mut_ptr(), 64).max(0) as usize;
             let exe = exe_of(target).unwrap_or_default();
@@ -4398,8 +4505,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if let Some(r) = forward_appbar(ex, wp, lp) {
                 return r;
             }
+            // Auf dem UI-Thread: kurz warten (hängender Explorer bremst sonst die Leiste),
+            // und nicht auf einen Explorer, der sich gerade beendet.
             let mut result: usize = 0;
-            SendMessageTimeoutW(ex, WM_COPYDATA, wp, lp, SMTO_ABORTIFHUNG, 3000, &mut result);
+            SendMessageTimeoutW(ex, WM_COPYDATA, wp, lp, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 500, &mut result);
             result as LRESULT
         }
         WM_PAINT => {
@@ -4484,6 +4593,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_BAR_FOCUS => {
+            autohide_wake();
             // Win+T: auf die erste App, sonst auf Start. Liegt der Fokus schon
             // in der Leiste, weiter zur nächsten App (wie Windows).
             let els = ui_elements();
@@ -4534,6 +4644,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let els = ui_elements();
             let first = els.iter().position(|e| matches!(e.hit, Hit::Chevron | Hit::Tray(_))).or_else(|| els.iter().position(|e| e.hit == Hit::Clock));
             ui_set_focus(first.unwrap_or(0));
+            0
+        }
+        WM_BAR_AUTOHIDE => {
+            autohide_wake();
             0
         }
         WM_BAR_TRAYPREFS => {
@@ -4622,7 +4736,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER if wp == TIMER_FULL => {
             update_fullscreen(hwnd);
-            tick_secondaries();
+            secondaries_fullscreen();
             // Die ausgeblendete Hauptleiste bekommt kein WM_PAINT – und nur sie hat
             // bisher die Zweitleisten mitgezeichnet. Solange: hier direkt (Uhr,
             // Fensterliste, aktive App bleiben so auf den anderen Monitoren aktuell).
@@ -4697,11 +4811,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             1
         }
+        // Netzwerk: Meldungen kommen in Schüben – einmal danach nachsehen.
+        WM_BAR_STATUS if wp == status::NOTIFY_NETWORK => {
+            prof(6);
+            SetTimer(hwnd, TIMER_NET, NET_DEBOUNCE_MS, None);
+            0
+        }
+        WM_TIMER if wp == TIMER_NET => {
+            KillTimer(hwnd, TIMER_NET);
+            status::invalidate_network();
+            update_status(hwnd);
+            0
+        }
         WM_BAR_STATUS | WM_POWERBROADCAST => {
             prof(6);
-            if msg == WM_BAR_STATUS {
-                status::invalidate_network();
-            }
+            // Lautstärke/Gerät sofort; das WLAN-Ergebnis bleibt gültig (5 s).
             update_status(hwnd);
             if msg == WM_POWERBROADCAST {
                 // Nach dem Standby kann Windows den Tastaturhook still entfernt haben.
@@ -4740,7 +4864,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     update_kbd(hwnd, false);
                     update_fullscreen(hwnd);
                     ensure_work_area(hwnd);
-                    tick_secondaries();
+                    // Nur das neue Vordergrundfenster prüfen; der volle Durchgang
+                    // (EnumWindows je Leiste) läuft bei Arbeitsbereich-,
+                    // Bildschirm- und Einstellungsänderungen.
+                    secondaries_fullscreen();
+                    fit_foreground();
                     kick(hwnd);
                 }
                 _ => {
@@ -4801,6 +4929,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_MOUSELEAVE => {
+            // Automatisch ausblenden: Ab jetzt läuft die Verzögerung.
+            autohide_left(hwnd);
             KillTimer(hwnd, TIMER_TIP);
             crate::tooltip::hide();
             crate::preview::schedule_hide();
@@ -4999,7 +5129,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ABN_POSCHANGED => {}
                 // Der Vollbild-Merker gehört der Hauptleiste; Zweitleisten prüfen sich selbst.
                 ABN_FULLSCREENAPP if hwnd == self::hwnd() => update_fullscreen(hwnd),
-                ABN_FULLSCREENAPP => tick_secondaries(),
+                ABN_FULLSCREENAPP => secondaries_fullscreen(),
                 _ => {}
             }
             0
@@ -5408,6 +5538,20 @@ mod tests {
     }
 
     #[test]
+    fn autohide_polls_only_when_needed() {
+        // Gleiten: Bildtakt.
+        assert_eq!(autohide_interval(true, 0.5, false, false), FRAME_MS);
+        // Ganz weg, kein Grund: kein Takt (Streifen/Ereignisse wecken).
+        assert_eq!(autohide_interval(false, 0.0, false, false), 0);
+        // Maus ruht auf der Leiste: WM_MOUSELEAVE weckt.
+        assert_eq!(autohide_interval(false, 1.0, true, true), 0);
+        // Popup/Blinken hält sie: langsam nachsehen.
+        assert_eq!(autohide_interval(false, 1.0, true, false), HOLD_MS);
+        // Verzögerung nach dem Verlassen läuft.
+        assert_eq!(autohide_interval(false, 1.0, false, false), POLL_MS);
+    }
+
+    #[test]
     fn glow_pulses_as_long_as_the_buttons() {
         assert_eq!(FLASH_PULSES * FLASH_PERIOD, crate::glow::ATTENTION_PULSE_S);
     }
@@ -5665,7 +5809,7 @@ unsafe fn forward_appbar(ex: HWND, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
     m.pid = ex_pid;
     let fwd = COPYDATASTRUCT { dwData: 0, cbData: size_of::<AppBarMsg>() as u32, lpData: &mut m as *mut _ as *mut c_void };
     let mut result = 0usize;
-    let sent = SendMessageTimeoutW(ex, WM_COPYDATA, wp, &fwd as *const _ as LPARAM, SMTO_ABORTIFHUNG, 3000, &mut result) != 0;
+    let sent = SendMessageTimeoutW(ex, WM_COPYDATA, wp, &fwd as *const _ as LPARAM, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 3000, &mut result) != 0;
     if sent {
         // QUERYPOS/SETPOS: Explorer passt das Rechteck ggf. an.
         let back = SHLockShared(new, ex_pid) as *const AppBarData32;

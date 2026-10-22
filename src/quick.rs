@@ -227,12 +227,14 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
 // ------------------------------------------------------------ Steuerung
 
 pub unsafe fn toggle() {
+    // Automatisch ausgeblendete Leiste: nach dem Öffnen/Schließen nachsehen.
+    crate::bar::autohide_wake_later();
     let h = hwnd();
     if h.is_null() {
         return;
     }
     if IsWindowVisible(h) != 0 {
-        ShowWindow(h, SW_HIDE);
+        hide(h);
         return;
     }
     let bar = crate::bar::anchor();
@@ -262,6 +264,17 @@ pub unsafe fn toggle() {
     InvalidateRect(h, null(), 0);
 }
 
+/// Schließen – auf jedem Weg hierüber, damit der Abfrage-Takt mit endet.
+unsafe fn hide(hwnd: HWND) {
+    ShowWindow(hwnd, SW_HIDE);
+    KillTimer(hwnd, TIMER_POLL);
+    // Mitten im Ziehen geschlossen (Win, Alt+Tab): sonst springt die
+    // Lautstärke beim nächsten Öffnen zur Mausposition.
+    if with(|st| std::mem::replace(&mut st.dragging, false)) == Some(true) {
+        ReleaseCapture();
+    }
+}
+
 unsafe fn set_from_x(x: i32) {
     let Some(track) = with(|st| st.track) else { return };
     let v = (x - track.left) as f32 / (track.right - track.left).max(1) as f32;
@@ -286,21 +299,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_ACTIVATE => {
             if (wp & 0xffff) as u32 == WA_INACTIVE {
-                ShowWindow(hwnd, SW_HIDE);
-                // Mitten im Ziehen geschlossen (Win, Alt+Tab): sonst springt die
-                // Lautstärke beim nächsten Öffnen zur Mausposition.
-                if with(|st| std::mem::replace(&mut st.dragging, false)) == Some(true) {
-                    ReleaseCapture();
-                }
-                KillTimer(hwnd, TIMER_POLL);
+                hide(hwnd);
             }
             0
         }
         WM_TIMER => {
+            // Unsichtbar (auf welchem Weg auch immer geschlossen): Takt aus.
+            if IsWindowVisible(hwnd) == 0 {
+                KillTimer(hwnd, TIMER_POLL);
+                return 0;
+            }
             if with(|st| st.dragging) != Some(true) {
                 let s = status::poll();
-                with(|st| st.status = Some(s));
-                InvalidateRect(hwnd, null(), 0);
+                // Nur bei Änderung neu zeichnen.
+                if with(|st| std::mem::replace(&mut st.status, Some(s.clone())) != Some(s)).unwrap_or(false) {
+                    InvalidateRect(hwnd, null(), 0);
+                }
             }
             0
         }
@@ -357,7 +371,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Some(Act::Wifi) => toggle_radio(RadioKind::WiFi),
                 Some(Act::Bluetooth) => toggle_radio(RadioKind::Bluetooth),
                 Some(Act::Project) => {
-                    ShowWindow(hwnd, SW_HIDE);
+                    hide(hwnd);
                     send_keys(&[(VK_LWIN, false), (b'P' as u16, false), (b'P' as u16, true), (VK_LWIN, true)]);
                 }
                 Some(Act::Mute) => {
@@ -366,11 +380,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     with(|st| st.status = Some(s));
                 }
                 Some(Act::Settings) => {
-                    ShowWindow(hwnd, SW_HIDE);
+                    hide(hwnd);
                     shell_open("ms-settings:", "", SW_SHOWNORMAL);
                 }
                 Some(Act::Battery) => {
-                    ShowWindow(hwnd, SW_HIDE);
+                    hide(hwnd);
                     shell_open("ms-settings:batterysaver", "", SW_SHOWNORMAL);
                 }
                 Some(Act::Slider) | None => {}
@@ -389,7 +403,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Some(Act::Battery) => "ms-settings:powersleep",
                 _ => return 0,
             };
-            ShowWindow(hwnd, SW_HIDE);
+            hide(hwnd);
             shell_open(uri, "", SW_SHOWNORMAL);
             0
         }
@@ -404,7 +418,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_KEYDOWN if wp as u16 == VK_ESCAPE => {
-            ShowWindow(hwnd, SW_HIDE);
+            hide(hwnd);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),

@@ -356,8 +356,10 @@ pub fn auto_path(app_id: &str) -> Option<PathBuf> {
 }
 
 type CacheKey = (SystemTime, u64, usize);
-type Cache = HashMap<PathBuf, (CacheKey, Arc<AutoList>)>;
+/// Je DestList-Datei, begrenzt auf die zuletzt gebrauchten.
+type Cache = crate::util::Lru<PathBuf, (CacheKey, Arc<AutoList>)>;
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+const CACHE_MAX: usize = 32;
 
 /// Automatische Liste der ersten Kennung, zu der es eine Datei gibt; je
 /// Abschnitt höchstens `limit` Einträge (angeheftete: alle, wie bei Windows).
@@ -366,13 +368,13 @@ pub fn load(app_ids: &[String], limit: usize) -> Option<Arc<AutoList>> {
     let (id, path) = app_ids.iter().filter_map(|id| Some((id, auto_path(id)?))).find(|(_, p)| p.exists())?;
     let meta = std::fs::metadata(&path).ok()?;
     let key: CacheKey = (meta.modified().ok()?, meta.len(), limit);
-    if let Some(hit) = CACHE.lock().ok()?.get_or_insert_with(HashMap::new).get(&path).filter(|(k, _)| *k == key) {
-        return Some(hit.1.clone());
+    if let Some(hit) = CACHE.lock().ok()?.get_or_insert_with(|| crate::util::Lru::new(CACHE_MAX)).get(&path).filter(|(k, _)| *k == key).map(|h| h.1.clone()) {
+        return Some(hit);
     }
     let bytes = std::fs::read(&path).ok()?;
     let list = Arc::new(unsafe { build(&bytes, id, limit, true) }?);
     if let Ok(mut c) = CACHE.lock() {
-        c.get_or_insert_with(HashMap::new).insert(path, (key, list.clone()));
+        c.get_or_insert_with(|| crate::util::Lru::new(CACHE_MAX)).insert(path, (key, list.clone()));
     }
     Some(list)
 }
