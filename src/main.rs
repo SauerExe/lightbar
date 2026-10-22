@@ -14,6 +14,7 @@ mod apps;
 mod bar;
 mod calendar;
 mod chat;
+mod destlist;
 mod display;
 mod glow;
 mod jumplist;
@@ -83,24 +84,15 @@ fn main() {
             }
             return;
         }
-        // Diagnose: Anzahl der Sprunglisten-Einträge einer App-Kennung (ohne Namen).
+        // Diagnose: Sprunglisten-Abschnitte (Namen, Anzahlen, Zeiten – keine
+        // Dateinamen) einer App-Kennung oder exe; ohne Argument alle Apps des
+        // Katalogs mit Sprungliste plus Abgleich mit Windows-Schnittstelle und
+        // Schnellzugriff. Ergebnis nach %APPDATA%\Lightbar\jumplist-test.txt.
         if std::env::args().nth(1).as_deref() == Some("--jumplist-test") {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            let id = std::env::args().nth(2).unwrap_or_default();
-            let n = apps::jump_list(&id, 8).len();
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let text = if args.is_empty() { jumplist::diagnose(None) } else { args.iter().map(|a| jumplist::diagnose(Some(a))).collect() };
             if let Some(dir) = util::data_dir() {
-                // Eigene Kategorien und Aufgaben: Titel und Ziel (nur lokal, zum Prüfen).
-                let cats = jumplist::load(&[id.clone()]);
-                let mut text = format!("{id}: {n} zuletzt/häufig, Datei {}
-", jumplist::app_id_hash(&id));
-                for c in &cats {
-                    text += &format!("[{}]
-", if c.name.is_empty() { "Aufgaben" } else { &c.name });
-                    for e in &c.entries {
-                        text += &format!("  {} -> {} {}
-", if e.title.is_empty() { "----" } else { &e.title }, e.target, e.args);
-                    }
-                }
                 let _ = std::fs::write(dir.join("jumplist-test.txt"), text);
             }
             return;
