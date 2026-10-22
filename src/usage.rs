@@ -193,16 +193,16 @@ fn https_get(host: &str, path: &str, headers: &[(&str, String)]) -> Result<(u32,
             None => Handle(WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null(), null(), 0)),
         };
         if session.0.is_null() {
-            return Err("WinHTTP nicht verfügbar".into());
+            return Err(t!("WinHTTP nicht verfügbar", "WinHTTP not available").into());
         }
         WinHttpSetTimeouts(session.0, 5000, 5000, 10000, 10000);
         let conn = Handle(WinHttpConnect(session.0, w16(host).as_ptr(), INTERNET_DEFAULT_HTTPS_PORT as u16, 0));
         if conn.0.is_null() {
-            return Err(format!("Keine Verbindung zu {host}"));
+            return Err(tf!("Keine Verbindung zu {host}", "No connection to {host}"));
         }
         let req = Handle(WinHttpOpenRequest(conn.0, w16("GET").as_ptr(), w16(path).as_ptr(), null(), null(), null(), WINHTTP_FLAG_SECURE));
         if req.0.is_null() {
-            return Err("Anfrage nicht möglich".into());
+            return Err(t!("Anfrage nicht möglich", "Request not possible").into());
         }
         // Keine Weiterleitungen folgen: WinHTTP schickte dabei den Authorization-
         // Header mit, das Token ginge so womöglich an einen anderen Host.
@@ -217,13 +217,13 @@ fn https_get(host: &str, path: &str, headers: &[(&str, String)]) -> Result<(u32,
                 }
             }
         }
-        let via = proxy.as_ref().map(|p| format!(" (über Proxy {})", p.server)).unwrap_or_default();
+        let via = proxy.as_ref().map(|p| tf!(" (über Proxy {})", " (via proxy {})", p.server)).unwrap_or_default();
         let header_text: String = headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
         let h = w16(&header_text);
         if WinHttpSendRequest(req.0, h.as_ptr(), (h.len() - 1) as u32, null(), 0, 0, 0) == 0
             || WinHttpReceiveResponse(req.0, null_mut()) == 0
         {
-            return Err(format!("{host} nicht erreichbar{via}"));
+            return Err(tf!("{host} nicht erreichbar{via}", "{host} not reachable{via}"));
         }
         let mut status: u32 = 0;
         let mut size = std::mem::size_of::<u32>() as u32;
@@ -561,15 +561,15 @@ fn auth_failure(message: String) -> Failure {
 /// einem Neustart): Lightbar erneuert keine Tokens – das macht das jeweilige
 /// CLI beim nächsten Start, und Lightbar fragt dann von selbst wieder.
 fn expired(service: &str, cli: &str) -> Failure {
-    auth_failure(format!("{service}: Anmeldung abgelaufen – die Anzeige aktualisiert sich, sobald {cli} wieder läuft"))
+    auth_failure(tf!("{service}: Anmeldung abgelaufen – die Anzeige aktualisiert sich, sobald {cli} wieder läuft", "{service}: sign-in expired - the display updates as soon as {cli} runs again"))
 }
 
 fn http_failure(service: &str, cli: &str, status: u32, retry_after: Option<i64>) -> Failure {
     match status {
         401 => expired(service, cli),
-        403 => auth_failure(format!("{service}: Login hat keine Berechtigung für die Usage-Abfrage (HTTP 403)")),
+        403 => auth_failure(tf!("{service}: Login hat keine Berechtigung für die Usage-Abfrage (HTTP 403)", "{service}: sign-in is not allowed to query usage (HTTP 403)")),
         429 => Failure {
-            message: format!("{service}: vom Server gedrosselt (HTTP 429) – Lightbar fragt höchstens alle 10 Minuten und wartet jetzt länger"),
+            message: tf!("{service}: vom Server gedrosselt (HTTP 429) – Lightbar fragt höchstens alle 10 Minuten und wartet jetzt länger", "{service}: rate limited by the server (HTTP 429) - Lightbar asks at most every 10 minutes and now waits longer"),
             kind: FailKind::RateLimited,
             retry_after,
         },
@@ -599,11 +599,11 @@ fn cred_path(i: usize) -> Option<PathBuf> {
 }
 
 fn fetch_claude() -> Result<Fetched, Failure> {
-    let path = cred_path(0).ok_or("kein Benutzerordner")?;
-    let text = std::fs::read_to_string(path).map_err(|_| auth_failure("Claude: nicht angemeldet".into()))?;
-    let creds: Value = serde_json::from_str(&text).map_err(|_| Failure::from("Claude: Login-Datei unlesbar"))?;
-    let oauth = creds.get("claudeAiOauth").ok_or("Claude: kein Abo-Login (API-Key-Nutzung hat keine Limits)")?;
-    let token = oauth.get("accessToken").and_then(Value::as_str).ok_or("Claude: kein Abo-Login (API-Key-Nutzung hat keine Limits)")?;
+    let path = cred_path(0).ok_or(t!("kein Benutzerordner", "no user folder"))?;
+    let text = std::fs::read_to_string(path).map_err(|_| auth_failure(t!("Claude: nicht angemeldet", "Claude: not signed in").into()))?;
+    let creds: Value = serde_json::from_str(&text).map_err(|_| Failure::from(t!("Claude: Login-Datei unlesbar", "Claude: sign-in file unreadable")))?;
+    let oauth = creds.get("claudeAiOauth").ok_or(t!("Claude: kein Abo-Login (API-Key-Nutzung hat keine Limits)", "Claude: no subscription sign-in (API key usage has no limits)"))?;
+    let token = oauth.get("accessToken").and_then(Value::as_str).ok_or(t!("Claude: kein Abo-Login (API-Key-Nutzung hat keine Limits)", "Claude: no subscription sign-in (API key usage has no limits)"))?;
     // Abgelaufenes Token gar nicht erst schicken: gibt nur 401 und zählt
     // womöglich gegen das Abfragelimit.
     if oauth.get("expiresAt").and_then(Value::as_i64).is_some_and(|ms| ms / 1000 <= now()) {
@@ -617,13 +617,13 @@ fn fetch_claude() -> Result<Fetched, Failure> {
     if status != 200 {
         return Err(http_failure("Claude", "Claude Code", status, retry));
     }
-    let v: Value = serde_json::from_str(&body).map_err(|_| Failure::from("Claude: Antwort unlesbar"))?;
+    let v: Value = serde_json::from_str(&body).map_err(|_| Failure::from(t!("Claude: Antwort unlesbar", "Claude: response unreadable")))?;
     let limits = Limits {
         five_hour: v.get("five_hour").and_then(claude_window),
         week: v.get("seven_day").and_then(claude_window),
     };
     if limits.five_hour.is_none() && limits.week.is_none() {
-        return Err("Claude: Antwortformat unbekannt".into());
+        return Err(t!("Claude: Antwortformat unbekannt", "Claude: unknown response format").into());
     }
     Ok(Fetched { limits, at: now(), local: false })
 }
@@ -631,13 +631,13 @@ fn fetch_claude() -> Result<Fetched, Failure> {
 /// Codex über die Usage-Schnittstelle – nur, wenn die lokalen Protokolle
 /// nichts hergeben.
 fn fetch_codex_http() -> Result<Fetched, Failure> {
-    let path = cred_path(1).ok_or("kein Benutzerordner")?;
-    let text = std::fs::read_to_string(path).map_err(|_| auth_failure("Codex: nicht angemeldet".into()))?;
-    let auth: Value = serde_json::from_str(&text).map_err(|_| Failure::from("Codex: Login-Datei unlesbar"))?;
+    let path = cred_path(1).ok_or(t!("kein Benutzerordner", "no user folder"))?;
+    let text = std::fs::read_to_string(path).map_err(|_| auth_failure(t!("Codex: nicht angemeldet", "Codex: not signed in").into()))?;
+    let auth: Value = serde_json::from_str(&text).map_err(|_| Failure::from(t!("Codex: Login-Datei unlesbar", "Codex: sign-in file unreadable")))?;
     let token = auth
         .pointer("/tokens/access_token")
         .and_then(Value::as_str)
-        .ok_or("Codex: kein ChatGPT-Login (API-Key-Nutzung hat keine Limits)")?;
+        .ok_or(t!("Codex: kein ChatGPT-Login (API-Key-Nutzung hat keine Limits)", "Codex: no ChatGPT sign-in (API key usage has no limits)"))?;
     if jwt_exp(token).is_some_and(|exp| exp <= now()) {
         return Err(expired("Codex", "Codex"));
     }
@@ -650,14 +650,14 @@ fn fetch_codex_http() -> Result<Fetched, Failure> {
     if status != 200 {
         return Err(http_failure("Codex", "Codex", status, retry));
     }
-    let v: Value = serde_json::from_str(&body).map_err(|_| Failure::from("Codex: Antwort unlesbar"))?;
-    let rl = v.get("rate_limit").ok_or("Codex: Antwortformat unbekannt")?;
+    let v: Value = serde_json::from_str(&body).map_err(|_| Failure::from(t!("Codex: Antwort unlesbar", "Codex: response unreadable")))?;
+    let rl = v.get("rate_limit").ok_or(t!("Codex: Antwortformat unbekannt", "Codex: unknown response format"))?;
     let limits = Limits {
         five_hour: rl.get("primary_window").and_then(|w| codex_window(w, fetched)),
         week: rl.get("secondary_window").and_then(|w| codex_window(w, fetched)),
     };
     if limits.five_hour.is_none() && limits.week.is_none() {
-        return Err("Codex: Antwortformat unbekannt".into());
+        return Err(t!("Codex: Antwortformat unbekannt", "Codex: unknown response format").into());
     }
     Ok(Fetched { limits, at: fetched, local: false })
 }
@@ -1081,7 +1081,7 @@ fn apply(slot: &mut Slot, result: Result<Fetched, Failure>, t: i64) {
             };
             slot.next_at = t + wait;
             let msg = if f.kind == FailKind::RateLimited {
-                format!("{} – nächster Versuch {}", f.message, until(slot.next_at))
+                tf!("{} – nächster Versuch {}", "{} - next attempt {}", f.message, until(slot.next_at))
             } else {
                 f.message
             };
@@ -1191,7 +1191,7 @@ pub fn current() -> Option<Usage> {
     let t = now();
     let value = |sl: &Slot| sl.value.as_ref().map(|r| r.as_ref().map(|l| limits_at(l, t)).map_err(Clone::clone));
     let label = |sl: &Slot| match sl.fail {
-        FailKind::Auth => Some("wartet auf Anmeldung"),
+        FailKind::Auth => Some(t!("wartet auf Anmeldung", "waiting for sign-in")),
         _ => None,
     };
     Some(Usage {
@@ -1331,20 +1331,20 @@ pub fn refresh_now(notify: impl Fn() + Send + 'static) {
 pub fn until(t: i64) -> String {
     let s = (t - now()).max(0);
     match s {
-        0..=59 => "gleich".into(),
-        60..=3599 => format!("in {} Min.", s / 60),
-        3600..=86399 => format!("in {} Std. {} Min.", s / 3600, (s % 3600) / 60),
-        _ => format!("in {} Tagen", (s + 43200) / 86400),
+        0..=59 => t!("gleich", "soon").into(),
+        60..=3599 => tf!("in {} Min.", "in {} min", s / 60),
+        3600..=86399 => tf!("in {} Std. {} Min.", "in {} h {} min", s / 3600, (s % 3600) / 60),
+        _ => tf!("in {} Tagen", "in {} days", (s + 43200) / 86400),
     }
 }
 
 /// "5 Min." / "3 Std." / "2 Tagen" – für "Stand vor …".
 fn age_text(s: i64) -> String {
     match s {
-        ..=3599 => format!("{} Min.", s / 60),
-        3600..=86399 => format!("{} Std.", s / 3600),
-        86400..=172799 => "1 Tag".into(),
-        _ => format!("{} Tagen", s / 86400),
+        ..=3599 => tf!("{} Min.", "{} min", s / 60),
+        3600..=86399 => tf!("{} Std.", "{} h", s / 3600),
+        86400..=172799 => t!("1 Tag", "1 day").into(),
+        _ => tf!("{} Tagen", "{} days", s / 86400),
     }
 }
 
@@ -1352,7 +1352,7 @@ fn age_text(s: i64) -> String {
 /// `note`: Grund, warum der Wert gerade nicht neu ist.
 pub fn describe(name: &str, r: &Option<Result<Limits, String>>, fetched_at: i64, local: bool, note: Option<&str>) -> String {
     match r {
-        None => format!("{name}: wird abgefragt …"),
+        None => tf!("{name}: wird abgefragt …", "{name}: checking ..."),
         Some(Err(e)) => e.clone(),
         Some(Ok(l)) => {
             // Fenster ohne Limit (z. B. kein Wochenlimit im Abo) erscheinen gar nicht.
@@ -1364,16 +1364,16 @@ pub fn describe(name: &str, r: &Option<Result<Limits, String>>, fetched_at: i64,
                 .unwrap_or_default()
             };
             let age = now() - fetched_at;
-            let src = if local { "letzte Codex-Sitzung" } else { "Stand" };
+            let src = if local { t!("letzte Codex-Sitzung", "last Codex session") } else { t!("Stand", "as of") };
             let stand = if fetched_at > 0 && age >= 120 {
-                format!(" ({src} vor {})", age_text(age))
+                tf!(" ({src} vor {})", " ({src} {} ago)", age_text(age))
             } else if local {
-                " (letzte Codex-Sitzung)".to_string()
+                t!(" (letzte Codex-Sitzung)", " (last Codex session)").to_string()
             } else {
                 String::new()
             };
             let note = note.map(|n| format!("\n  {n}")).unwrap_or_default();
-            format!("{name}{stand}{}{}{note}", line("5 Stunden", &l.five_hour), line("Woche", &l.week))
+            format!("{name}{stand}{}{}{note}", line(t!("5 Stunden", "5 hours"), &l.five_hour), line(t!("Woche", "Week"), &l.week))
         }
     }
 }

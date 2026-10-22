@@ -1066,14 +1066,14 @@ unsafe fn task_menu(hwnd: HWND, g: Group) {
         push_jump(&mut items, c, &c.name, &entry_labels, &mut n);
     }
     if !recent.is_empty() {
-        items.push(Item::Label("Zuletzt verwendet"));
+        items.push(Item::Label(t!("Zuletzt verwendet", "Recent")));
         for (i, label) in recent_labels.iter().enumerate() {
             items.push(Item::Cmd(100 + i, label));
         }
         items.push(Item::Sep);
     }
     for c in custom.iter().filter(|c| c.name.is_empty()) {
-        push_jump(&mut items, c, "Aufgaben", &entry_labels, &mut n);
+        push_jump(&mut items, c, t!("Aufgaben", "Tasks"), &entry_labels, &mut n);
     }
     if !title.is_empty() && title != name {
         items.push(Item::Label(&title));
@@ -1081,17 +1081,17 @@ unsafe fn task_menu(hwnd: HWND, g: Group) {
     }
     items.push(Item::Cmd(1, &name));
     if !g.key.starts_with("hwnd:") {
-        items.push(Item::Cmd(2, if pinned { "Von Taskleiste lösen" } else { "An Taskleiste anheften" }));
+        items.push(Item::Cmd(2, if pinned { t!("Von Taskleiste lösen", "Unpin from taskbar") } else { t!("An Taskleiste anheften", "Pin to taskbar") }));
     }
     match g.windows.len() {
         0 => {}
         1 => {
             items.push(Item::Sep);
-            items.push(Item::Cmd(3, "Fenster schließen"));
+            items.push(Item::Cmd(3, t!("Fenster schließen", "Close window")));
         }
         _ => {
             items.push(Item::Sep);
-            items.push(Item::Cmd(3, "Alle Fenster schließen"));
+            items.push(Item::Cmd(3, t!("Alle Fenster schließen", "Close all windows")));
         }
     }
     match menus::popup(hwnd, &items) {
@@ -1128,10 +1128,29 @@ unsafe fn more_menu(hwnd: HWND) {
     }
 }
 
+/// Sprache umschalten und sofort übernehmen: Startmenü-Zwischenspeicher neu,
+/// alle Leisten und offenen Popups dieses Threads neu zeichnen. Tooltips und
+/// Screenreader-Namen werden ohnehin bei Bedarf frisch erzeugt.
+unsafe fn set_language(l: crate::i18n::LangSetting) {
+    crate::i18n::apply(l);
+    crate::util::log(&format!("Sprache: {}", l.key()));
+    crate::tooltip::hide();
+    crate::start::language_changed();
+    for b in all_bars() {
+        InvalidateRect(b, null(), 0);
+    }
+    unsafe extern "system" fn redraw(h: HWND, _: LPARAM) -> BOOL {
+        InvalidateRect(h, null(), 0);
+        1
+    }
+    windows_sys::Win32::UI::WindowsAndMessaging::EnumThreadWindows(windows_sys::Win32::System::Threading::GetCurrentThreadId(), Some(redraw), 0);
+}
+
 /// Menü-IDs der Bildschirm-Auswahl (eine pro Bildschirm).
 const MONITOR_IDS: usize = 50;
 
 unsafe fn bar_menu(hwnd: HWND) {
+    use crate::i18n::LangSetting;
     use crate::settings::{GlowStyle, StartLogo};
     let s = crate::settings::get();
     let glow = |id, label, style| Item::Check(id, label, s.glow == style);
@@ -1144,41 +1163,49 @@ unsafe fn bar_menu(hwnd: HWND) {
         .map(|(n, m)| if m.primary { Item::Label(&m.label) } else { Item::Check(MONITOR_IDS + n, &m.label, crate::display::wanted(m)) })
         .collect();
     screens.push(Item::Sep);
-    screens.push(Item::Check(19, "Auf weiteren Bildschirmen anzeigen", crate::display::new_monitors()));
+    screens.push(Item::Check(19, t!("Auf weiteren Bildschirmen anzeigen", "Show on additional displays"), crate::display::new_monitors()));
     let secondary = hwnd != self::hwnd();
-    let last = if secondary { Item::Cmd(20, "Auf diesem Bildschirm ausblenden") } else { Item::Cmd(3, "Lightbar beenden") };
+    let last = if secondary { Item::Cmd(20, t!("Auf diesem Bildschirm ausblenden", "Hide on this display")) } else { Item::Cmd(3, t!("Lightbar beenden", "Quit Lightbar")) };
     let id = menus::popup(
         hwnd,
         &[
-            Item::Cmd(1, "Task-Manager"),
-            Item::Cmd(2, "Taskleisteneinstellungen"),
+            Item::Cmd(1, t!("Task-Manager", "Task Manager")),
+            Item::Cmd(2, t!("Taskleisteneinstellungen", "Taskbar settings")),
             Item::Sep,
             Item::Sub(
-                "Leuchtrand",
+                t!("Leuchtrand", "Glow edge"),
                 vec![
                     glow(10, "Aurora", GlowStyle::Aurora),
-                    glow(11, "Akzentfarbe", GlowStyle::Accent),
+                    glow(11, t!("Akzentfarbe", "Accent color"), GlowStyle::Accent),
                     glow(12, "Neon", GlowStyle::Neon),
                     Item::Sep,
-                    glow(13, "Aus", GlowStyle::Off),
+                    glow(13, t!("Aus", "Off"), GlowStyle::Off),
                 ],
             ),
             Item::Sub(
-                "Startsymbol",
+                t!("Startsymbol", "Start button"),
                 vec![
                     Item::Check(16, "Orb", s.start_logo == StartLogo::Orb),
-                    Item::Check(17, "Windows-Logo", s.start_logo == StartLogo::Windows),
+                    Item::Check(17, t!("Windows-Logo", "Windows logo"), s.start_logo == StartLogo::Windows),
                     Item::Check(21, "Tux", s.start_logo == StartLogo::Tux),
                 ],
             ),
-            Item::Sub("Startmenü", vec![Item::Check(22, "Profilbild anzeigen", s.start_avatar)]),
-            Item::Check(14, "Uhr mit Sekunden", clock_seconds()),
-            Item::Check(23, "Suche anzeigen", crate::display::search_mode() > 0),
-            Item::Check(24, "Aufgabenansicht anzeigen", crate::display::task_view_button()),
-            Item::Check(15, "Claude/Codex-Usage anzeigen", s.show_usage),
-            Item::Check(5, "Tray-Icons in Akzentfarbe", s.mono_tray),
-            Item::Check(18, "Präsentationsmodus", s.presentation),
-            Item::Sub("Bildschirme", screens),
+            Item::Sub(t!("Startmenü", "Start menu"), vec![Item::Check(22, t!("Profilbild anzeigen", "Show profile picture"), s.start_avatar)]),
+            Item::Check(14, t!("Uhr mit Sekunden", "Show seconds in clock"), clock_seconds()),
+            Item::Check(23, t!("Suche anzeigen", "Show search"), crate::display::search_mode() > 0),
+            Item::Check(24, t!("Aufgabenansicht anzeigen", "Show Task view"), crate::display::task_view_button()),
+            Item::Check(15, t!("Claude/Codex-Usage anzeigen", "Show Claude/Codex usage"), s.show_usage),
+            Item::Check(5, t!("Tray-Icons in Akzentfarbe", "Tray icons in accent color"), s.mono_tray),
+            Item::Check(18, t!("Präsentationsmodus", "Presentation mode"), s.presentation),
+            Item::Sub(t!("Bildschirme", "Displays"), screens),
+            Item::Sub(
+                t!("Sprache", "Language"),
+                vec![
+                    Item::Check(25, t!("Automatisch (Windows)", "Automatic (Windows)"), s.language == LangSetting::Auto),
+                    Item::Check(26, "Deutsch", s.language == LangSetting::De),
+                    Item::Check(27, "English", s.language == LangSetting::En),
+                ],
+            ),
             Item::Sep,
             last,
         ],
@@ -1216,6 +1243,9 @@ unsafe fn bar_menu(hwnd: HWND) {
         }),
         5 => crate::settings::update(|s| s.mono_tray = !s.mono_tray),
         18 => crate::settings::update(|s| s.presentation = !s.presentation),
+        25 => set_language(LangSetting::Auto),
+        26 => set_language(LangSetting::De),
+        27 => set_language(LangSetting::En),
         3 => {
             crate::util::log("Beenden über das Menü");
             DestroyWindow(hwnd);
@@ -1256,21 +1286,21 @@ unsafe fn tip_text(hit: Hit) -> String {
             None => String::new(),
         },
         Hit::Tray(i) => tray::tip(i),
-        Hit::Chevron => "Ausgeblendete Symbole anzeigen".into(),
-        Hit::More => "Weitere Apps".into(),
-        Hit::Search => "Suchen".into(),
-        Hit::TaskView => "Aufgabenansicht".into(),
+        Hit::Chevron => t!("Ausgeblendete Symbole anzeigen", "Show hidden icons").into(),
+        Hit::More => t!("Weitere Apps", "More apps").into(),
+        Hit::Search => t!("Suchen", "Search").into(),
+        Hit::TaskView => t!("Aufgabenansicht", "Task view").into(),
         Hit::Status => {
             let Some(s) = with(|s| s.status.clone()).flatten() else { return String::new() };
             let net = match &s.net {
-                status::Net::Wifi(_, ssid) => format!("WLAN: {ssid}"),
-                status::Net::Wired => "Netzwerk: Ethernet, Internetzugriff".into(),
-                status::Net::Offline => "Nicht verbunden".into(),
+                status::Net::Wifi(_, ssid) => tf!("WLAN: {ssid}", "Wi-Fi: {ssid}"),
+                status::Net::Wired => t!("Netzwerk: Ethernet, Internetzugriff", "Network: Ethernet, Internet access").into(),
+                status::Net::Offline => t!("Nicht verbunden", "Not connected").into(),
             };
-            let vol = if s.muted { "Lautsprecher: stumm".into() } else { format!("Lautsprecher: {} %", (s.volume * 100.0).round()) };
+            let vol = if s.muted { t!("Lautsprecher: stumm", "Speakers: muted").into() } else { tf!("Lautsprecher: {} %", "Speakers: {}%", (s.volume * 100.0).round()) };
             let mut lines = vec![net, vol];
             if let Some((p, charging)) = s.battery {
-                lines.push(format!("Akku: {p} %{}", if charging { ", wird geladen" } else { "" }));
+                lines.push(tf!("Akku: {p} %{}", "Battery: {p}%{}", if charging { t!(", wird geladen", ", charging") } else { "" }));
             }
             lines.join("\n")
         }
@@ -1279,12 +1309,20 @@ unsafe fn tip_text(hit: Hit) -> String {
             GetLocalTime(&mut st);
             const DAYS: [&str; 7] = ["Sonntag", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag"];
             const MONTHS: [&str; 12] = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
-            format!("{}, {}. {} {}", DAYS[st.wDayOfWeek as usize % 7], st.wDay, MONTHS[(st.wMonth as usize + 11) % 12], st.wYear)
+            const DAYS_EN: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+            const MONTHS_EN: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+            let (wd, mo) = (st.wDayOfWeek as usize % 7, (st.wMonth as usize + 11) % 12);
+            if crate::i18n::en() {
+                // Englisch: "Thursday, October 22, 2026".
+                format!("{}, {} {}, {}", DAYS_EN[wd], MONTHS_EN[mo], st.wDay, st.wYear)
+            } else {
+                format!("{}, {}. {} {}", DAYS[wd], st.wDay, MONTHS[mo], st.wYear)
+            }
         }
-        Hit::Desktop => "Desktop anzeigen".into(),
+        Hit::Desktop => t!("Desktop anzeigen", "Show desktop").into(),
         Hit::TaskMgr => {
             let (cpu, ram) = with(|s| (s.cpu, s.ram)).unwrap_or((0.0, 0.0));
-            format!("Task-Manager\nCPU {:.0} %  ·  Arbeitsspeicher {:.0} %", cpu, ram)
+            tf!("Task-Manager\nCPU {:.0} %  ·  Arbeitsspeicher {:.0} %", "Task Manager\nCPU {:.0}%  ·  Memory {:.0}%", cpu, ram)
         }
         Hit::Usage => {
             let u = crate::usage::current().unwrap_or_default();
@@ -1296,7 +1334,7 @@ unsafe fn tip_text(hit: Hit) -> String {
             if s.usage_codex {
                 parts.push(crate::usage::describe("Codex", &u.codex, u.codex_at, u.codex_local, u.codex_note.as_deref()));
             }
-            parts.push("Klicken zum Aktualisieren, Rechtsklick für Anmelden und Auswahl".into());
+            parts.push(t!("Klicken zum Aktualisieren, Rechtsklick für Anmelden und Auswahl", "Click to refresh, right-click to sign in or choose services").into());
             parts.join("
 
 ")
@@ -1359,7 +1397,7 @@ unsafe fn wheel_volume(hwnd: HWND, delta: i32) {
     let v = (current.volume + delta as f32 / 120.0 * 0.02).clamp(0.0, 1.0);
     status::set_volume(v);
     let s = status::poll();
-    let label = format!("Lautstärke: {} %", (s.volume * 100.0).round());
+    let label = tf!("Lautstärke: {} %", "Volume: {}%", (s.volume * 100.0).round());
     with(|st| st.status = Some(s));
     InvalidateRect(hwnd, null(), 0);
     if let Some(r) = rect_of(hwnd, Hit::Status) {
@@ -1508,15 +1546,15 @@ unsafe fn usage_menu(hwnd: HWND) {
     let id = menus::popup(
         hwnd,
         &[
-            Item::Cmd(1, "Jetzt aktualisieren"),
+            Item::Cmd(1, t!("Jetzt aktualisieren", "Refresh now")),
             Item::Sep,
-            Item::Cmd(2, "Bei Claude anmelden …"),
-            Item::Cmd(3, "Bei Codex anmelden …"),
+            Item::Cmd(2, t!("Bei Claude anmelden …", "Sign in to Claude …")),
+            Item::Cmd(3, t!("Bei Codex anmelden …", "Sign in to Codex …")),
             Item::Sep,
-            Item::Check(5, "Claude anzeigen", s.usage_claude),
-            Item::Check(6, "Codex anzeigen", s.usage_codex),
+            Item::Check(5, t!("Claude anzeigen", "Show Claude"), s.usage_claude),
+            Item::Check(6, t!("Codex anzeigen", "Show Codex"), s.usage_codex),
             Item::Sep,
-            Item::Cmd(4, "Usage-Anzeige ausblenden"),
+            Item::Cmd(4, t!("Usage-Anzeige ausblenden", "Hide usage display")),
         ],
     );
     match id {
@@ -1540,10 +1578,10 @@ unsafe fn status_menu(hwnd: HWND) {
     let id = menus::popup(
         hwnd,
         &[
-            Item::Cmd(1, "Netzwerk- und Interneteinstellungen"),
-            Item::Cmd(2, "Soundeinstellungen"),
-            Item::Cmd(3, "Lautstärkemixer"),
-            Item::Cmd(4, "Energieeinstellungen"),
+            Item::Cmd(1, t!("Netzwerk- und Interneteinstellungen", "Network and Internet settings")),
+            Item::Cmd(2, t!("Soundeinstellungen", "Sound settings")),
+            Item::Cmd(3, t!("Lautstärkemixer", "Volume mixer")),
+            Item::Cmd(4, t!("Energieeinstellungen", "Power settings")),
         ],
     );
     let uri = match id {
@@ -1559,7 +1597,7 @@ unsafe fn status_menu(hwnd: HWND) {
 unsafe fn clock_menu(hwnd: HWND) {
     let id = menus::popup(
         hwnd,
-        &[Item::Cmd(1, "Datum und Uhrzeit anpassen"), Item::Cmd(2, "Benachrichtigungseinstellungen")],
+        &[Item::Cmd(1, t!("Datum und Uhrzeit anpassen", "Adjust date and time")), Item::Cmd(2, t!("Benachrichtigungseinstellungen", "Notification settings"))],
     );
     match id {
         1 => shell_open("ms-settings:dateandtime", "", SW_SHOWNORMAL),
@@ -1654,41 +1692,41 @@ pub fn ui_elements() -> Vec<UiElement> {
             out.push(UiElement { id, name, help: help.to_string(), rect: screen(rect), hit });
         };
         if l.show_usage {
-            push(Hit::Usage, "usage".into(), tip_text(Hit::Usage).replace('\n', ", "), "Claude- und Codex-Nutzung, klicken zum Aktualisieren", l.usage);
+            push(Hit::Usage, "usage".into(), tip_text(Hit::Usage).replace('\n', ", "), t!("Claude- und Codex-Nutzung, klicken zum Aktualisieren", "Claude and Codex usage, click to refresh"), l.usage);
         }
-        push(Hit::TaskMgr, "taskmgr".into(), tip_text(Hit::TaskMgr).replace('\n', ", "), "Task-Manager öffnen", l.taskmgr);
-        push(Hit::Start, "start".into(), "Start".into(), "Startmenü öffnen", l.start);
+        push(Hit::TaskMgr, "taskmgr".into(), tip_text(Hit::TaskMgr).replace('\n', ", "), t!("Task-Manager öffnen", "Open Task Manager"), l.taskmgr);
+        push(Hit::Start, "start".into(), "Start".into(), t!("Startmenü öffnen", "Open Start menu"), l.start);
         if l.search.right > l.search.left {
-            push(Hit::Search, "search".into(), "Suchen".into(), "Apps, Einstellungen und Dateien suchen", l.search);
+            push(Hit::Search, "search".into(), t!("Suchen", "Search").into(), t!("Apps, Einstellungen und Dateien suchen", "Search apps, settings and files"), l.search);
         }
         if l.taskview.right > l.taskview.left {
-            push(Hit::TaskView, "taskview".into(), "Aufgabenansicht".into(), "Fenster und Desktops anzeigen", l.taskview);
+            push(Hit::TaskView, "taskview".into(), t!("Aufgabenansicht", "Task view").into(), t!("Fenster und Desktops anzeigen", "Show windows and desktops"), l.taskview);
         }
         for (i, g) in groups.iter().enumerate() {
             let Some(&r) = l.tasks.get(i) else { continue };
             let state = match g.windows.len() {
-                0 => "angeheftet, nicht geöffnet".to_string(),
-                1 if g.windows[0] == fg => "aktiv".to_string(),
+                0 => t!("angeheftet, nicht geöffnet", "pinned, not open").to_string(),
+                1 if g.windows[0] == fg => t!("aktiv", "active").to_string(),
                 1 => window_title(g.windows[0]),
-                n => format!("{n} Fenster"),
+                n => tf!("{n} Fenster", "{n} windows"),
             };
             push(Hit::Task(i), format!("app:{}", g.slot), group_name(g), &state, r);
         }
         if let Some(r) = l.more {
-            push(Hit::More, "more".into(), "Weitere Apps".into(), "Apps, die in der Leiste keinen Platz haben", r);
+            push(Hit::More, "more".into(), t!("Weitere Apps", "More apps").into(), t!("Apps, die in der Leiste keinen Platz haben", "Apps that do not fit on the taskbar"), r);
         }
         if let Some(r) = l.chevron {
-            push(Hit::Chevron, "overflow".into(), "Ausgeblendete Symbole anzeigen".into(), "Infobereich", r);
+            push(Hit::Chevron, "overflow".into(), t!("Ausgeblendete Symbole anzeigen", "Show hidden icons").into(), t!("Infobereich", "Notification area"), r);
         }
         for (n, &(index, _)) in tray.iter().enumerate() {
             let name = tray::tip(index);
-            let name = if name.is_empty() { "Infobereich-Symbol".to_string() } else { name };
-            push(Hit::Tray(index), format!("tray:{index}"), name, "Infobereich", l.tray[n]);
+            let name = if name.is_empty() { t!("Infobereich-Symbol", "Notification area icon").to_string() } else { name };
+            push(Hit::Tray(index), format!("tray:{index}"), name, t!("Infobereich", "Notification area"), l.tray[n]);
         }
-        push(Hit::Status, "status".into(), tip_text(Hit::Status).replace('\n', ", "), "Schnelleinstellungen öffnen", l.status);
-        push(Hit::Clock, "clock".into(), tip_text(Hit::Clock), "Kalender öffnen", l.clock);
+        push(Hit::Status, "status".into(), tip_text(Hit::Status).replace('\n', ", "), t!("Schnelleinstellungen öffnen", "Open Quick Settings"), l.status);
+        push(Hit::Clock, "clock".into(), tip_text(Hit::Clock), t!("Kalender öffnen", "Open calendar"), l.clock);
         if crate::display::desktop_corner() {
-            push(Hit::Desktop, "desktop".into(), "Desktop anzeigen".into(), "Alle Fenster minimieren", l.desktop);
+            push(Hit::Desktop, "desktop".into(), t!("Desktop anzeigen", "Show desktop").into(), t!("Alle Fenster minimieren", "Minimize all windows"), l.desktop);
         }
         out
     }
@@ -2220,18 +2258,18 @@ unsafe fn draw_usage(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
                 }
                 let pct = |w: Option<f32>| w.map(|p| format!("{:.0} %", p)).unwrap_or_else(|| "–".into());
                 let label = match l.week {
-                    Some(w) => format!("{} · Wo. {:.0} %", pct(five), w.used),
+                    Some(w) => tf!("{} · Wo. {:.0} %", "{} · Wk. {:.0}%", pct(five), w.used),
                     None => pct(five),
                 };
                 text(dc, &label, &RECT { left: track.right + px(dpi, 8), ..rest }, font, TEXT, line);
             }
             // Ohne Wert, aber vom Server gedrosselt (429): sagen, bis wann – damit es
             // nicht wie ein Fehler von Lightbar aussieht. Details im Tooltip.
-            _ if paused > 0 => text(dc, &format!("gedrosselt bis {}", clock_of(paused)), &rest, font, DIM, line),
+            _ if paused > 0 => text(dc, &tf!("gedrosselt bis {}", "throttled until {}", clock_of(paused)), &rest, font, DIM, line),
             // Abgelaufener Login: kein Fehler, das CLI erneuert ihn beim nächsten Start.
             Some(Err(_)) if label.is_some() => text(dc, label.unwrap_or_default(), &rest, font, DIM, line),
-            Some(Err(_)) => text(dc, "nicht verfügbar", &rest, font, DIM, line),
-            None => text(dc, "wird abgefragt …", &rest, font, DIM, line),
+            Some(Err(_)) => text(dc, t!("nicht verfügbar", "unavailable"), &rest, font, DIM, line),
+            None => text(dc, t!("wird abgefragt …", "loading …"), &rest, font, DIM, line),
         }
     }
 }
@@ -3126,7 +3164,13 @@ unsafe fn draw_clock(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
         format!("{:02}:{:02}", st.wHour, st.wMinute)
     };
     text(dc, &time, &RECT { bottom: mid, ..cr }, font, TEXT, flags | DT_BOTTOM);
-    let date = if narrow { format!("{:02}.{:02}.", st.wDay, st.wMonth) } else { format!("{:02}.{:02}.{}", st.wDay, st.wMonth, st.wYear) };
+    // Englisch im US-Format wie Windows (M/D/YYYY), sonst TT.MM.JJJJ.
+    let date = match (crate::i18n::en(), narrow) {
+        (true, true) => format!("{}/{}", st.wMonth, st.wDay),
+        (true, false) => format!("{}/{}/{}", st.wMonth, st.wDay, st.wYear),
+        (false, true) => format!("{:02}.{:02}.", st.wDay, st.wMonth),
+        (false, false) => format!("{:02}.{:02}.{}", st.wDay, st.wMonth, st.wYear),
+    };
     text(dc, &date, &RECT { top: mid, ..cr }, font, TEXT, flags | DT_TOP);
 }
 
@@ -3223,12 +3267,12 @@ unsafe fn paint(hwnd: HWND) {
                 let field = RECT { top: r.top + px(dpi, 4), bottom: r.bottom - px(dpi, 4), ..r };
                 round(dc, &field, mix(rgb(45, 45, 45), HOVER, hv("search")), (field.bottom - field.top) / 2);
                 text(dc, "\u{E721}", &RECT { left: field.left + px(dpi, 12), right: field.left + px(dpi, 32), ..field }, icons, DIM, DT_CENTER | line);
-                text(dc, "Suchen", &RECT { left: field.left + px(dpi, 38), ..field }, font, DIM, DT_LEFT | line | DT_END_ELLIPSIS);
+                text(dc, t!("Suchen", "Search"), &RECT { left: field.left + px(dpi, 38), ..field }, font, DIM, DT_LEFT | line | DT_END_ELLIPSIS);
             } else {
                 hover_bg(dc, &r, hv("search"));
                 if l.search_mode == 3 {
                     text(dc, "\u{E721}", &RECT { left: r.left + px(dpi, 8), right: r.left + px(dpi, 30), ..r }, icons, TEXT, DT_CENTER | line);
-                    text(dc, "Suchen", &RECT { left: r.left + px(dpi, 34), ..r }, font, TEXT, DT_LEFT | line | DT_END_ELLIPSIS);
+                    text(dc, t!("Suchen", "Search"), &RECT { left: r.left + px(dpi, 34), ..r }, font, TEXT, DT_LEFT | line | DT_END_ELLIPSIS);
                 } else {
                     text(dc, "\u{E721}", &r, icons, TEXT, DT_CENTER | line);
                 }

@@ -27,9 +27,22 @@ const HEAD: i32 = 92;
 const FOOT: i32 = 52;
 const H: i32 = HEAD + 40 + 28 + 6 * CELL + 8 + FOOT;
 
-const DAYS: [&str; 7] = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"];
-const DAY_NAMES: [&str; 7] = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"];
-const MONTHS: [&str; 12] = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
+const DAYS_DE: [&str; 7] = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"];
+const DAY_NAMES_DE: [&str; 7] = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"];
+const MONTHS_DE: [&str; 12] = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
+const DAYS_EN: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+const DAY_NAMES_EN: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const MONTHS_EN: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+fn days() -> &'static [&'static str; 7] {
+    if crate::i18n::en() { &DAYS_EN } else { &DAYS_DE }
+}
+fn day_names() -> &'static [&'static str; 7] {
+    if crate::i18n::en() { &DAY_NAMES_EN } else { &DAY_NAMES_DE }
+}
+fn months() -> &'static [&'static str; 12] {
+    if crate::i18n::en() { &MONTHS_EN } else { &MONTHS_DE }
+}
 
 static HWND_CAL: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
@@ -122,9 +135,10 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
 
     // Kopf: heutiges Datum groß
     let head = RECT { left: pad, top: px(d, 14), right: w - pad, bottom: px(d, 50) };
-    text(dc, &format!("{}, {}. {}", DAY_NAMES[weekday(ty, tm, td) as usize], td, MONTHS[(tm - 1) as usize]), &head, big, TEXT, LINE);
+    let (day, month) = (day_names()[weekday(ty, tm, td) as usize], months()[(tm - 1) as usize]);
+    text(dc, &tf!("{day}, {td}. {month}", "{day}, {month} {td}"), &head, big, TEXT, LINE);
     let sub = RECT { left: pad, top: px(d, 50), right: w - pad, bottom: px(d, 74) };
-    text(dc, &format!("Kalenderwoche {}", iso_week(ty, tm, td)), &sub, small, SUBTEXT, LINE);
+    text(dc, &tf!("Kalenderwoche {}", "Week {}", iso_week(ty, tm, td)), &sub, small, SUBTEXT, LINE);
     fill(dc, &RECT { left: 0, top: px(d, HEAD - 6), right: w, bottom: px(d, HEAD - 5) }, BORDER);
 
     // Monatszeile mit Pfeilen
@@ -134,7 +148,7 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     if !is_now && inside(&title, st.mouse.0, st.mouse.1) {
         round(dc, &title, HOVER, px(d, 6));
     }
-    text(dc, &format!("{} {}", MONTHS[(st.month - 1) as usize], st.year), &RECT { left: title.left + px(d, 8), ..title }, normal, TEXT, LINE);
+    text(dc, &format!("{} {}", months()[(st.month - 1) as usize], st.year), &RECT { left: title.left + px(d, 8), ..title }, normal, TEXT, LINE);
     st.hits.push((title, Act::Today));
     for (i, (glyph, act)) in [("\u{E70E}", Act::Prev), ("\u{E70D}", Act::Next)].into_iter().enumerate() {
         let r = RECT { left: row.right - px(d, 76) + i as i32 * px(d, 40), top: row.top + px(d, 2), right: row.right - px(d, 40) + i as i32 * px(d, 40), bottom: row.bottom - px(d, 2) };
@@ -150,7 +164,7 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     let grid_left = pad + px(d, 30);
     let cw = (w - grid_left - pad) / 7;
     let wd_top = row.bottom + px(d, 4);
-    for (i, name) in DAYS.iter().enumerate() {
+    for (i, name) in days().iter().enumerate() {
         let r = RECT { left: grid_left + i as i32 * cw, top: wd_top, right: grid_left + (i as i32 + 1) * cw, bottom: wd_top + px(d, 24) };
         text(dc, name, &r, small, SUBTEXT, CENTER);
     }
@@ -208,7 +222,7 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     fill(dc, &foot, PANEL);
     fill(dc, &RECT { bottom: foot.top + 1, ..foot }, BORDER);
     let half = w / 2;
-    for (i, (label, act)) in [("Benachrichtigungen", Act::Notifications), ("Datum & Uhrzeit", Act::Settings)].into_iter().enumerate() {
+    for (i, (label, act)) in [(t!("Benachrichtigungen", "Notifications"), Act::Notifications), (t!("Datum & Uhrzeit", "Date & time"), Act::Settings)].into_iter().enumerate() {
         let r = RECT {
             left: if i == 0 { pad - px(d, 6) } else { half + px(d, 4) },
             top: foot.top + px(d, 10),
@@ -364,7 +378,7 @@ pub unsafe fn create(inst: HINSTANCE) {
     let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
         class.as_ptr(),
-        w16("Kalender").as_ptr(),
+        w16(t!("Kalender", "Calendar")).as_ptr(),
         WS_POPUP,
         0,
         0,
