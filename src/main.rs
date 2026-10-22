@@ -6,6 +6,7 @@
 #![windows_subsystem = "windows"]
 
 mod ai;
+mod ai_tools;
 mod anim;
 mod apps;
 mod bar;
@@ -108,26 +109,41 @@ fn main() {
             }
             return;
         }
-        // Diagnose: eine Frage stellen, Antwort nach %APPDATA%\Lightbar\ai-test.txt.
+        // Diagnose: eine Frage stellen, Antwort nach %APPDATA%\Lightbar\ai-test.txt
+        // (oder `--ai-test <frage> <name>.txt`).
+        // Werkzeuge, die etwas verändern (Apps öffnen, Lautstärke …), laufen
+        // dabei nur als Testlauf; lesende (Systeminfo, Dateisuche) wirklich.
         if std::env::args().nth(1).as_deref() == Some("--ai-test") {
+            ai_tools::set_dry_run(true);
             let q = std::env::args().nth(2).unwrap_or_else(|| "Sag kurz Hallo.".into());
             let (tx, rx) = std::sync::mpsc::channel();
             ai::ask(q, move || {
                 let _ = tx.send(());
             });
             let t0 = std::time::Instant::now();
-            while t0.elapsed() < std::time::Duration::from_secs(180) {
+            while t0.elapsed() < std::time::Duration::from_secs(600) {
                 let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
                 if ai::current().is_some_and(|a| a.done) {
                     break;
                 }
             }
             let text = match ai::current() {
-                Some(a) => format!("nach {} ms, fertig={}, fehler={:?}\n{}", t0.elapsed().as_millis(), a.done, a.error, a.text),
+                Some(a) => format!(
+                    "Frage: {}\nnach {} ms, fertig={}, fehler={:?}\n{}{}\n{}",
+                    a.question,
+                    t0.elapsed().as_millis(),
+                    a.done,
+                    a.error,
+                    a.steps.iter().map(|s| format!("Schritt: {s}\n")).collect::<String>(),
+                    a.trace.iter().map(|s| format!("Werkzeug: {s}\n")).collect::<String>(),
+                    a.text
+                ),
                 None => "nicht eingerichtet".into(),
             };
             if let Some(dir) = util::data_dir() {
-                let _ = std::fs::write(dir.join("ai-test.txt"), text);
+                // Optional eigener Dateiname (nur Name, kein Pfad), z. B. für parallele Tests.
+                let name = std::env::args().nth(3).filter(|n| n.ends_with(".txt") && !n.contains(['/', '\\', ':'])).unwrap_or_else(|| "ai-test.txt".into());
+                let _ = std::fs::write(dir.join(name), text);
             }
             return;
         }

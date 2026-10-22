@@ -684,7 +684,7 @@ unsafe fn hit_at(hwnd: HWND, x: i32, y: i32) -> Hit {
 
 // ------------------------------------------------------------ Fensterliste
 
-unsafe fn is_task_window(h: HWND) -> bool {
+pub(crate) unsafe fn is_task_window(h: HWND) -> bool {
     if IsWindowVisible(h) == 0 {
         return false;
     }
@@ -717,7 +717,7 @@ unsafe extern "system" fn enum_cb(h: HWND, lp: LPARAM) -> BOOL {
     1
 }
 
-unsafe fn exe_of(h: HWND) -> Option<String> {
+pub(crate) unsafe fn exe_of(h: HWND) -> Option<String> {
     let mut pid = 0u32;
     GetWindowThreadProcessId(h, &mut pid);
     let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);

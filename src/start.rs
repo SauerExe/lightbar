@@ -180,7 +180,7 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 
 // --------------------------------------------------------------- Daten
 
-const SETTINGS: &[(&str, &str, &str)] = &[
+pub(crate) const SETTINGS: &[(&str, &str, &str)] = &[
     ("Einstellungen", "ms-settings:", "settings einstellungen"),
     ("Bluetooth & Geräte", "ms-settings:bluetooth", "bluetooth geräte maus tastatur kopfhörer"),
     ("WLAN", "ms-settings:network-wifi", "wlan wifi netzwerk internet"),
@@ -818,7 +818,12 @@ unsafe fn draw_answer(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bott
     text(dc, &a.question, &head, f.bold, TEXT, LINE);
     pill(st, dc, f, "Zurück", "\u{E76B}", true, w - px(d, PAD), top, Act::ShowHome);
     let copy = a.done && a.error.is_none() && !a.text.is_empty();
-    let area = RECT { left: px(d, PAD + 12), top: top + px(d, 44), right: w - px(d, PAD + 12), bottom: bottom - if copy { px(d, 40) } else { 0 } };
+    let mut area = RECT { left: px(d, PAD + 12), top: top + px(d, 44), right: w - px(d, PAD + 12), bottom: bottom - if copy { px(d, 40) } else { 0 } };
+    // Was die KI am PC getan hat ("Suche Dateien: …"), gedimmt über der Antwort.
+    for s in a.steps.iter().rev().take(5).rev() {
+        text(dc, s, &RECT { bottom: area.top + px(d, 22), ..area }, f.small, SUBTEXT, LINE);
+        area.top += px(d, 22);
+    }
     let body = if let Some(e) = &a.error {
         format!("{}\n\n{e}", a.text)
     } else if a.thinking {
