@@ -3842,7 +3842,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             update_status(hwnd);
             if msg == WM_POWERBROADCAST {
+                // Nach dem Standby kann Windows den Tastaturhook still entfernt haben.
+                if hwnd == self::hwnd() && matches!(wp as u32, PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND) {
+                    crate::keyhook::reinstall();
+                }
                 return 1;
+            }
+            0
+        }
+        // Sitzung entsperrt: Tastaturhook vorsichtshalber neu setzen.
+        WM_WTSSESSION_CHANGE => {
+            if hwnd == self::hwnd() && wp as u32 == WTS_SESSION_UNLOCK {
+                crate::keyhook::reinstall();
             }
             0
         }
@@ -4132,6 +4143,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             crate::shell::restore();
             KillTimer(hwnd, TIMER_TICK);
             DeregisterShellHookWindow(hwnd);
+            windows_sys::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification(hwnd);
             let mut abd = appbar_data(hwnd);
             SHAppBarMessage(ABM_REMOVE, &mut abd);
             with(|s| {
@@ -4203,6 +4215,10 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
     SHAppBarMessage(ABM_NEW, &mut abd);
     set_pos(hwnd);
     RegisterShellHookWindow(hwnd);
+    // Entsperren melden lassen (Tastaturhook neu setzen, siehe keyhook).
+    if windows_sys::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(hwnd, windows_sys::Win32::System::RemoteDesktop::NOTIFY_FOR_THIS_SESSION) == 0 {
+        crate::util::log("Sitzungsmeldungen (Entsperren) nicht verfügbar");
+    }
     schedule_clock(hwnd);
     SetTimer(hwnd, TIMER_CPU, 2000, None);
     SetTimer(hwnd, TIMER_SLOW, 30_000, None);

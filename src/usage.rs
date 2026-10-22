@@ -465,6 +465,32 @@ fn collect_rollouts(dir: &std::path::Path, since: i64, out: &mut Vec<(i64, u64, 
 type MemoEntry = (PathBuf, i64, u64, Option<Snapshot>);
 static ROLLOUT_MEMO: Mutex<Vec<MemoEntry>> = Mutex::new(Vec::new());
 
+/// Vom Protokoll wird nur das Ende gelesen: Das aktive wächst auf viele MB und
+/// ändert sich nach jeder Antwort; der letzte Limit-Stand steht ganz hinten.
+const ROLLOUT_TAIL: u64 = 256 * 1024;
+
+/// Die letzten `max` Bytes einer Datei, ab der ersten vollständigen Zeile.
+fn read_tail(path: &std::path::Path, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(max);
+    // Ein Byte davor mitlesen: Ist es ein Zeilenende, beginnt bei `start` eine
+    // ganze Zeile.
+    let from = start.saturating_sub(1);
+    f.seek(SeekFrom::Start(from))?;
+    let mut buf = Vec::with_capacity((len - from) as usize);
+    f.take(len - from).read_to_end(&mut buf)?;
+    if start == 0 {
+        return Ok(buf);
+    }
+    // Angeschnittene erste Zeile verwerfen.
+    match buf.iter().position(|&b| b == b'\n') {
+        Some(n) => Ok(buf.split_off(n + 1)),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// Neuester Limit-Stand aus den lokalen Codex-Protokollen.
 fn local_codex() -> Option<Snapshot> {
     let base = codex_home()?;
@@ -486,7 +512,7 @@ fn local_codex() -> Option<Snapshot> {
         let snap = match cached {
             Some(s) => s,
             None => {
-                let s = std::fs::read(&path).ok().and_then(|b| parse_rollout(&String::from_utf8_lossy(&b)));
+                let s = read_tail(&path, ROLLOUT_TAIL).ok().and_then(|b| parse_rollout(&String::from_utf8_lossy(&b)));
                 memo.retain(|m| m.0 != path);
                 memo.push((path, modified, len, s.clone()));
                 s
@@ -511,13 +537,16 @@ enum FailKind {
     Auth,
     /// HTTP 429: Pause einlegen (ggf. so lange, wie der Server verlangt).
     RateLimited,
+    /// Codex-CLI nicht installiert: kein Fehler des App-Servers, die
+    /// Schnittstelle übernimmt.
+    NotFound,
 }
 
 impl FailKind {
     fn key(self) -> Option<&'static str> {
         match self {
             FailKind::None => None,
-            FailKind::Other => Some("other"),
+            FailKind::Other | FailKind::NotFound => Some("other"),
             FailKind::Auth => Some("auth"),
             FailKind::RateLimited => Some("rate"),
         }
@@ -898,7 +927,11 @@ fn fetch_codex_app_server() -> Result<Fetched, Failure> {
     use std::process::{Command, Stdio};
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let cli = codex_cli().ok_or(t!("Codex: Codex-CLI nicht gefunden", "Codex: Codex CLI not found"))?;
+    let cli = codex_cli().ok_or_else(|| Failure {
+        message: t!("Codex: Codex-CLI nicht gefunden", "Codex: Codex CLI not found").into(),
+        kind: FailKind::NotFound,
+        retry_after: None,
+    })?;
     let mut child = Command::new(&cli.program)
         .args(&cli.prefix)
         .args(["-s", "read-only", "-a", "never", "app-server"])
@@ -910,9 +943,13 @@ fn fetch_codex_app_server() -> Result<Fetched, Failure> {
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| Failure::from(format!("Codex: App-Server startet nicht ({e})")))?;
+    // Codex startet je nach Installation weitere Prozesse (node → codex.exe),
+    // die die Ausgabe-Pipe erben. `kill()` träfe nur den ersten; alle zusammen
+    // kommen in ein Job-Objekt, das beim Schließen den ganzen Baum beendet.
+    let job = KillJob::for_child(&child);
     let deadline = std::time::Instant::now() + APP_SERVER_TIMEOUT;
     let (tx, rx) = std::sync::mpsc::channel();
-    if let Some(out) = child.stdout.take() {
+    let reader = child.stdout.take().map(|out| {
         std::thread::spawn(move || {
             for line in std::io::BufReader::new(out).lines() {
                 let Ok(line) = line else { break };
@@ -920,8 +957,8 @@ fn fetch_codex_app_server() -> Result<Fetched, Failure> {
                     break;
                 }
             }
-        });
-    }
+        })
+    });
     let mut stdin = child.stdin.take();
     let result = (|| {
         let mut send = |msg: Value| -> Result<(), Failure> {
@@ -946,13 +983,71 @@ fn fetch_codex_app_server() -> Result<Fetched, Failure> {
             Ok(Some(_)) => break,
             Ok(None) if std::time::Instant::now() < quit => std::thread::sleep(Duration::from_millis(50)),
             _ => {
+                if let Some(j) = &job {
+                    j.terminate();
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 break;
             }
         }
     }
+    // Übrig gebliebene Kindprozesse beenden (Job schließen) – erst dann schließt
+    // sich die Pipe und der Lese-Thread endet.
+    drop(job);
+    drop(rx);
+    if let Some(reader) = reader {
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while !reader.is_finished() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if reader.is_finished() {
+            let _ = reader.join();
+        } else {
+            crate::util::log("Codex-App-Server: Lese-Thread endet nicht (Pipe noch offen)");
+        }
+    }
     result
+}
+
+/// Job-Objekt, das beim Schließen alle zugeordneten Prozesse beendet
+/// (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE).
+struct KillJob(windows_sys::Win32::Foundation::HANDLE);
+
+impl KillJob {
+    /// Job anlegen und `child` zuordnen; Prozesse, die es danach startet,
+    /// gehören automatisch dazu. `None`, wenn das nicht geht (dann bleibt `kill()`).
+    fn for_child(child: &std::process::Child) -> Option<KillJob> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::*;
+        unsafe {
+            let h = CreateJobObjectW(null(), null());
+            if h.is_null() {
+                return None;
+            }
+            let job = KillJob(h);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as _,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0
+                && AssignProcessToJobObject(h, child.as_raw_handle() as _) != 0;
+            ok.then_some(job)
+        }
+    }
+
+    fn terminate(&self) {
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1) };
+    }
+}
+
+impl Drop for KillJob {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
 }
 
 /// Nur so junge Protokolle gelten als aktuell; ältere zeigt die Leiste zwar
@@ -966,14 +1061,21 @@ const LOCAL_FRESH: i64 = 15 * 60;
 /// Codex dabei womöglich gerade erneuert hat).
 static APP_SERVER_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-fn fetch_codex_remote() -> Result<Fetched, Failure> {
+/// Darf der App-Server jetzt (`t`) starten? Zeitpunkt in der Zukunft (Uhr
+/// zurückgestellt) gilt als fällig. Nur wer den Zeitstempel per
+/// compare_exchange setzt, startet ihn – zwei Threads nie gleichzeitig.
+fn claim_app_server(t: i64) -> bool {
     use std::sync::atomic::Ordering;
-    let t = now();
-    let app = if t - APP_SERVER_AT.load(Ordering::Relaxed) >= INTERVAL {
-        APP_SERVER_AT.store(t, Ordering::Relaxed);
+    let last = APP_SERVER_AT.load(Ordering::Acquire);
+    let due = last > t || t - last >= INTERVAL;
+    due && APP_SERVER_AT.compare_exchange(last, t, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+fn fetch_codex_remote() -> Result<Fetched, Failure> {
+    let app = if claim_app_server(now()) {
         match fetch_codex_app_server() {
             Ok(f) => return Ok(f),
-            Err(e) if e.message.contains("nicht gefunden") => None,
+            Err(e) if e.kind == FailKind::NotFound => None,
             Err(e) => Some(e),
         }
     } else {
@@ -1031,10 +1133,22 @@ struct Slot {
     note: Option<String>,
     /// Wert stammt aus den lokalen Codex-Protokollen.
     local: bool,
+    /// Eine Abfrage läuft gerade (nicht gespeichert): kein zweiter Thread
+    /// fragt denselben Dienst parallel.
+    in_flight: bool,
 }
 
-const EMPTY_SLOT: Slot =
-    Slot { value: None, fetched_at: 0, next_at: 0, backoff: 0, fail: FailKind::None, failed_at: 0, note: None, local: false };
+const EMPTY_SLOT: Slot = Slot {
+    value: None,
+    fetched_at: 0,
+    next_at: 0,
+    backoff: 0,
+    fail: FailKind::None,
+    failed_at: 0,
+    note: None,
+    local: false,
+    in_flight: false,
+};
 
 /// Index 0 = Claude, 1 = Codex.
 static SLOTS: Mutex<[Slot; 2]> = Mutex::new([EMPTY_SLOT, EMPTY_SLOT]);
@@ -1049,6 +1163,7 @@ fn fetch_slot(i: usize) -> Result<Fetched, Failure> {
 
 /// Ergebnis einer Abfrage in den Zeitplan einarbeiten.
 fn apply(slot: &mut Slot, result: Result<Fetched, Failure>, t: i64) {
+    slot.in_flight = false;
     match result {
         Ok(f) => {
             slot.value = Some(Ok(f.limits));
@@ -1106,15 +1221,38 @@ fn login_changed(slot: &Slot, cred_mtime: i64) -> bool {
 /// Ist ein Dienst jetzt fällig? `manual`: auf Klick, aber nicht öfter als
 /// einmal pro Minute und nie während einer 429-Pause.
 fn is_due(slot: &Slot, t: i64, manual: bool, cred_mtime: i64) -> bool {
+    // Wanduhr: Zeitpunkte in der Zukunft (Uhr zurückgestellt, Cache von einem
+    // Rechner mit falscher Uhr) gelten als "nie" – sonst stünde die Anzeige
+    // tagelang. `next_at` begrenzt `claim_due` bzw. `slot_from`.
+    let past = |x: i64| if x > t { 0 } else { x };
+    let (fetched_at, failed_at) = (past(slot.fetched_at), past(slot.failed_at));
     // Nach neuem Login sofort – aber nicht öfter als einmal pro Minute.
-    if login_changed(slot, cred_mtime) && t - slot.failed_at >= MIN_MANUAL {
+    let login_changed = matches!(slot.fail, FailKind::Auth | FailKind::RateLimited) && cred_mtime > failed_at;
+    if login_changed && t - failed_at >= MIN_MANUAL {
         return true;
     }
     if manual {
-        slot.backoff == 0 && t - slot.fetched_at >= MIN_MANUAL && t - slot.failed_at >= MIN_MANUAL
+        slot.backoff == 0 && t - fetched_at >= MIN_MANUAL && t - failed_at >= MIN_MANUAL
     } else {
         t >= slot.next_at
     }
+}
+
+/// Fällige Dienste bestimmen und (unter der Sperre der Slots) als laufend
+/// belegen; `apply` gibt sie wieder frei. Läuft schon eine Abfrage (Klick
+/// während des Takts, mehrere Klicks), wird nicht parallel ein zweites Mal
+/// gefragt.
+fn claim_due(s: &mut [Slot; 2], wanted: [bool; 2], t: i64, manual: bool, cred_mtimes: [i64; 2]) -> Vec<usize> {
+    // Uhr zurückgestellt: nächster Versuch höchstens MAX_BACKOFF entfernt –
+    // gespeichert, sonst schöbe sich die Grenze mit jedem Durchlauf mit.
+    for sl in s.iter_mut() {
+        sl.next_at = sl.next_at.min(t + MAX_BACKOFF);
+    }
+    let due: Vec<usize> = (0..2).filter(|&i| wanted[i] && !s[i].in_flight && is_due(&s[i], t, manual, cred_mtimes[i])).collect();
+    for &i in &due {
+        s[i].in_flight = true;
+    }
+    due
 }
 
 /// Fällige Dienste abfragen.
@@ -1138,7 +1276,10 @@ fn run_due(manual: bool) -> bool {
                 let has_value = matches!(sl.value, Some(Ok(_)));
                 if snap.at >= t - LOCAL_FRESH {
                     if !(sl.local && sl.fetched_at == snap.at && has_value) {
+                        // Eine laufende Abfrage bleibt belegt (sie ruft selbst `apply`).
+                        let busy = sl.in_flight;
                         apply(sl, Ok(Fetched { limits: snap.limits.clone(), at: snap.at, local: true }), t);
+                        sl.in_flight = busy;
                         changed = true;
                     }
                 } else if !has_value || snap.at > sl.fetched_at {
@@ -1153,11 +1294,8 @@ fn run_due(manual: bool) -> bool {
                     changed = true;
                 }
             }
-            (0..2)
-                .filter(|&i| enabled[i])
-                .filter(|&i| !(i == 1 && local.as_ref().is_some_and(|l| l.at >= t - LOCAL_FRESH)))
-                .filter(|&i| is_due(&s[i], t, manual, cred_mtimes[i]))
-                .collect()
+            let wanted = [enabled[0], enabled[1] && !local.as_ref().is_some_and(|l| l.at >= t - LOCAL_FRESH)];
+            claim_due(&mut s, wanted, t, manual, cred_mtimes)
         }
         Err(_) => return false,
     };
@@ -1240,8 +1378,9 @@ fn slot_json(s: &Slot) -> Value {
     })
 }
 
-/// Cache-Eintrag → Slot. `cred_mtime`: Änderungszeit der Login-Datei jetzt.
-fn slot_from(e: &Value, cred_mtime: i64) -> Slot {
+/// Cache-Eintrag → Slot. `cred_mtime`: Änderungszeit der Login-Datei jetzt,
+/// `t`: jetzt (Zeitpunkte in der Zukunft gelten als "nie", siehe `is_due`).
+fn slot_from(e: &Value, cred_mtime: i64, t: i64) -> Slot {
     let num = |k: &str| e.get(k).and_then(Value::as_i64).unwrap_or(0);
     let mut s = Slot::default();
     let limits = Limits { five_hour: e.get("five_hour").and_then(window_from), week: e.get("week").and_then(window_from) };
@@ -1271,7 +1410,11 @@ fn slot_from(e: &Value, cred_mtime: i64) -> Slot {
         s.backoff = num("backoff");
     }
     // Nach einem Neustart frühestens zum geplanten Zeitpunkt wieder fragen …
-    s.next_at = num("next_at").max(fetched_at + INTERVAL);
+    // Nie weiter als die längste Pause entfernt (Uhr zurückgestellt).
+    s.next_at = num("next_at").max(fetched_at + INTERVAL).min(t + MAX_BACKOFF);
+    if s.failed_at > t {
+        s.failed_at = 0;
+    }
     // … außer der gespeicherte 401/429 ist durch einen neuen Login überholt.
     if login_changed(&s, cred_mtime) {
         s.next_at = 0;
@@ -1287,7 +1430,13 @@ fn save_cache(slots: &[Slot; 2]) {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(p, doc.to_string());
+        // Atomar: erst eine Nebendatei schreiben, dann ersetzen (rename = MoveFileExW
+        // mit MOVEFILE_REPLACE_EXISTING). Ein Absturz mittendrin hinterlässt so nie
+        // eine halbe Datei.
+        let tmp = p.with_extension("json.tmp");
+        if std::fs::write(&tmp, doc.to_string()).is_ok() && std::fs::rename(&tmp, &p).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -1297,7 +1446,7 @@ fn load_cache() {
     let Ok(mut s) = SLOTS.lock() else { return };
     for (i, key) in ["claude", "codex"].into_iter().enumerate() {
         let Some(e) = doc.get(key) else { continue };
-        s[i] = slot_from(e, cred_path(i).map_or(0, |p| mtime(&p)));
+        s[i] = slot_from(e, cred_path(i).map_or(0, |p| mtime(&p)), now());
     }
 }
 
@@ -1536,7 +1685,7 @@ mod usage_tests {
             r#"{"fetched_at":0,"next_at":5000,"backoff":3600,"five_hour":null,"week":null,"error":"Claude: Login abgelaufen – Claude einmal starten (HTTP 401)"}"#,
         )
         .unwrap();
-        let s = slot_from(&legacy, 4000);
+        let s = slot_from(&legacy, 4000, 10_000);
         assert_eq!(s.fail, FailKind::Auth);
         assert_eq!((s.backoff, s.next_at), (0, 0));
 
@@ -1545,11 +1694,75 @@ mod usage_tests {
             r#"{"fetched_at":0,"next_at":2600,"backoff":600,"error":"x","fail":"rate","failed_at":2000}"#,
         )
         .unwrap();
-        let s = slot_from(&rate, 1500);
+        let s = slot_from(&rate, 1500, 10_000);
         assert_eq!((s.backoff, s.next_at), (600, 2600));
         // … nach neuem Login (Datei jünger als der Fehler) sofort wieder.
-        let s = slot_from(&rate, 2500);
+        let s = slot_from(&rate, 2500, 10_000);
         assert_eq!((s.backoff, s.next_at), (0, 0));
+    }
+
+    #[test]
+    fn in_flight_slot_is_not_claimed_twice() {
+        let mut s = [Slot::default(), Slot::default()];
+        let t = 100_000;
+        assert_eq!(claim_due(&mut s, [true, true], t, true, [0, 0]), [0, 1]);
+        // Zweiter Klick, während beide noch laufen: nichts.
+        assert!(claim_due(&mut s, [true, true], t + 1, false, [0, 0]).is_empty());
+        // Ergebnis eingearbeitet → wieder frei (und dann im Takt fällig).
+        apply(&mut s[0], Err(failed(FailKind::Other)), t + 2);
+        assert!(!s[0].in_flight);
+        assert!(s[1].in_flight);
+        assert_eq!(claim_due(&mut s, [true, true], t + 2 + INTERVAL, false, [0, 0]), [0]);
+    }
+
+    #[test]
+    fn future_timestamps_do_not_block() {
+        let t = 1_000_000;
+        // Wert und Fehlschlag "aus der Zukunft" (Uhr zurückgestellt).
+        let s = Slot { fetched_at: t + 86_400, failed_at: t + 86_400, next_at: t + 30 * 86_400, ..Slot::default() };
+        assert!(is_due(&s, t, true, 0));
+        let mut slots = [s.clone(), Slot::default()];
+        assert!(claim_due(&mut slots, [true, false], t, false, [0, 0]).is_empty());
+        assert_eq!(slots[0].next_at, t + MAX_BACKOFF);
+        assert!(claim_due(&mut slots, [true, false], t + 1800, false, [0, 0]).is_empty());
+        assert_eq!(claim_due(&mut slots, [true, false], t + MAX_BACKOFF, false, [0, 0]), [0]);
+        // Cache: nächster Versuch höchstens MAX_BACKOFF entfernt.
+        let e: Value = serde_json::from_str(&format!(r#"{{"fetched_at":{},"next_at":{},"failed_at":{},"fail":"other","error":"x"}}"#, t + 9_999_999, t + 9_999_999, t + 50)).unwrap();
+        let s = slot_from(&e, 0, t);
+        assert_eq!(s.next_at, t + MAX_BACKOFF);
+        assert_eq!(s.failed_at, 0);
+    }
+
+    #[test]
+    fn app_server_claimed_once() {
+        use std::sync::atomic::Ordering;
+        let t = 2_000_000_000;
+        APP_SERVER_AT.store(t + 5000, Ordering::Relaxed); // Zukunft → fällig
+        assert!(claim_app_server(t));
+        assert!(!claim_app_server(t + 1));
+        assert!(claim_app_server(t + INTERVAL));
+    }
+
+    #[test]
+    fn tail_drops_partial_first_line() {
+        let dir = std::env::temp_dir().join(format!("lightbar-tail-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("rollout.jsonl");
+        std::fs::write(&p, "aaaa\nbbbb\ncccc\n").unwrap();
+        let whole = read_tail(&p, 1000).unwrap();
+        let mid = read_tail(&p, 7).unwrap(); // "b\ncccc\n" → angeschnitten
+        let edge = read_tail(&p, 10).unwrap(); // "bbbb\ncccc\n" → beginnt mit ganzer Zeile
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(whole, b"aaaa\nbbbb\ncccc\n");
+        assert_eq!(mid, b"cccc\n");
+        assert_eq!(edge, b"bbbb\ncccc\n");
+    }
+
+    #[test]
+    fn missing_cli_is_its_own_kind() {
+        // Nicht mehr an den übersetzten Text gebunden.
+        assert_eq!(FailKind::NotFound.key(), Some("other"));
+        assert_ne!(FailKind::NotFound, FailKind::Other);
     }
 
     #[test]

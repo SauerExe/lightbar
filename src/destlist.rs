@@ -94,17 +94,25 @@ impl<'a> Cfb<'a> {
             mini: Vec::new(),
             streams: Vec::new(),
         };
-        // FAT-Sektoren: 109 im Kopf, weitere in der DIFAT-Kette.
-        let fat_count = u32_at(b, 0x2C)? as usize;
+        // FAT-Sektoren: 109 im Kopf, weitere in der DIFAT-Kette. Alles durch die
+        // Dateigröße begrenzt: mehr Sektoren als die Datei hat, gibt es nicht
+        // (manipulierte Köpfe dürfen weder riesige Speichermengen anfordern
+        // noch endlos laufen).
+        let max = c.max_sectors();
+        let fat_count = (u32_at(b, 0x2C)? as usize).min(max);
         let mut fat_sectors: Vec<u32> = (0..109).filter_map(|i| u32_at(b, 0x4C + i * 4)).filter(|&s| s <= MAX_REGULAR).collect();
         let mut difat = u32_at(b, 0x44)?;
         let per = c.sector / 4 - 1;
-        let mut guard = 0;
-        while difat <= MAX_REGULAR && fat_sectors.len() < fat_count && guard < 10_000 {
+        let mut seen = vec![false; max];
+        while difat <= MAX_REGULAR && fat_sectors.len() < fat_count {
+            // Zyklus in der DIFAT-Kette oder Sektor hinter dem Dateiende: kaputt.
+            let slot = seen.get_mut(difat as usize)?;
+            if std::mem::replace(slot, true) {
+                return None;
+            }
             let s = c.sector_bytes(difat)?;
             fat_sectors.extend((0..per).filter_map(|i| u32_at(s, i * 4)).filter(|&x| x <= MAX_REGULAR));
             difat = u32_at(s, per * 4)?;
-            guard += 1;
         }
         fat_sectors.truncate(fat_count);
         for s in fat_sectors {
@@ -140,18 +148,29 @@ impl<'a> Cfb<'a> {
         Some(c)
     }
 
+    /// Höchstzahl Sektoren, die in der Datei Platz haben (Kopf mitgezählt).
+    fn max_sectors(&self) -> usize {
+        self.b.len() / self.sector + 1
+    }
+
     fn sector_bytes(&self, s: u32) -> Option<&'a [u8]> {
         let at = (s as usize + 1).checked_mul(self.sector)?;
-        self.b.get(at..at + self.sector).or_else(|| self.b.get(at..)).filter(|x| !x.is_empty())
+        self.b.get(at..at.checked_add(self.sector)?).or_else(|| self.b.get(at..)).filter(|x| !x.is_empty())
     }
 
     /// Sektorkette ab `start` aneinanderhängen (optional auf `size` gekürzt).
+    /// Zyklen, zu lange Ketten und Sektoren hinter dem Dateiende → None.
     fn chain(&self, start: u32, size: Option<u64>) -> Option<Vec<u8>> {
+        let max = self.max_sectors();
+        let mut seen = vec![false; max];
         let mut out = Vec::new();
         let mut s = start;
         let mut steps = 0usize;
         while s != ENDOFCHAIN {
-            if s > MAX_REGULAR || steps > self.fat.len() {
+            if s > MAX_REGULAR || steps >= max || out.len() > self.b.len() {
+                return None;
+            }
+            if std::mem::replace(seen.get_mut(s as usize)?, true) {
                 return None;
             }
             out.extend_from_slice(self.sector_bytes(s)?);
@@ -162,25 +181,30 @@ impl<'a> Cfb<'a> {
             }
         }
         if let Some(n) = size {
-            out.truncate(n as usize);
+            out.truncate(n.min(out.len() as u64) as usize);
         }
         Some(out)
     }
 
     fn mini_chain(&self, start: u32, size: u64) -> Option<Vec<u8>> {
+        let max = self.mini.len() / self.mini_sector + 1;
+        let mut seen = vec![false; max];
         let mut out = Vec::new();
         let mut s = start;
         let mut steps = 0usize;
         while s != ENDOFCHAIN && (out.len() as u64) < size {
-            if s > MAX_REGULAR || steps > self.minifat.len() {
+            if s > MAX_REGULAR || steps >= max || out.len() > self.mini.len() {
                 return None;
             }
-            let at = s as usize * self.mini_sector;
-            out.extend_from_slice(self.mini.get(at..at + self.mini_sector)?);
+            if std::mem::replace(seen.get_mut(s as usize)?, true) {
+                return None;
+            }
+            let at = (s as usize).checked_mul(self.mini_sector)?;
+            out.extend_from_slice(self.mini.get(at..at.checked_add(self.mini_sector)?)?);
             s = *self.minifat.get(s as usize)?;
             steps += 1;
         }
-        out.truncate(size as usize);
+        out.truncate(size.min(out.len() as u64) as usize);
         Some(out)
     }
 
@@ -272,7 +296,8 @@ pub fn parse_destlist(b: &[u8]) -> Option<DestList> {
     let mut entries = Vec::new();
     let mut pos = 32;
     for _ in 0..count.min(10_000) {
-        let e = b.get(pos..)?;
+        // Abgeschnittenes Ende: die vollständigen Einträge davor behalten.
+        let Some(e) = b.get(pos..) else { break };
         let Some(len) = u16_at(e, l.path) else { break };
         let end = l.path + 2 + len as usize * 2;
         let Some(raw) = e.get(l.path + 2..end) else { break };
@@ -437,6 +462,21 @@ unsafe fn dest_of(item: &windows::Win32::UI::Shell::IShellItem, pidl: Vec<u8>, f
     Some(Dest { name, parsing, pidl })
 }
 
+/// UNC-Pfad (`\\server\…`, auch `\\?\UNC\…`) oder Laufwerk, das Windows als
+/// Netzlaufwerk kennt. Geräte-Pfade (`\\?\C:\…`, `\\.\…`) zählen nicht.
+fn is_network_path(path: &str) -> bool {
+    if let Some(rest) = path.strip_prefix(r"\\") {
+        return !(rest.starts_with(r"?\") || rest.starts_with(r".\")) || rest.to_ascii_uppercase().starts_with(r"?\UNC\");
+    }
+    // Nur Laufwerkspfade prüfen ("::{GUID}" u. Ä. sind keine Dateipfade).
+    let b = path.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        let w = crate::util::w16(path);
+        return unsafe { windows_sys::Win32::UI::Shell::PathIsNetworkPathW(w.as_ptr()) } != 0;
+    }
+    false
+}
+
 /// Verknüpfung des Eintrags laden und als Shell-Element auflösen; ohne
 /// Verknüpfung über den Pfad aus der DestList.
 unsafe fn resolve(cfb: &Cfb, e: &DestEntry) -> Option<Dest> {
@@ -452,6 +492,21 @@ unsafe fn resolve(cfb: &Cfb, e: &DestEntry) -> Option<Dest> {
         let pidl = link.GetIDList().ok()?;
         (!pidl.is_null()).then_some(pidl)
     };
+    // Netzwerkpfade (\\NAS\…, verbundene Laufwerke): kein Shell-Element bilden –
+    // Parsen und Anzeigename würden den Server fragen und auf einem nicht
+    // erreichbaren NAS den UI-Thread blockieren. Name und Pfad aus der DestList;
+    // die Element-ID-Liste der Verknüpfung (rein lokal geladen) zum Öffnen.
+    if is_network_path(&e.path) {
+        let name = e.path.trim_end_matches('\\').rsplit('\\').next().filter(|n| !n.is_empty()).unwrap_or(&e.path).to_string();
+        let pidl = from_link()
+            .map(|p| {
+                let bytes = std::slice::from_raw_parts(p as *const u8, ILGetSize(Some(p)) as usize).to_vec();
+                CoTaskMemFree(Some(p as _));
+                bytes
+            })
+            .unwrap_or_default();
+        return Some(Dest { name, parsing: e.path.clone(), pidl });
+    }
     let pidl = from_link().or_else(|| {
         let mut p: *mut ITEMIDLIST = std::ptr::null_mut();
         SHParseDisplayName(&HSTRING::from(e.path.as_str()), None, &mut p, 0, None).ok()?;
@@ -697,6 +752,97 @@ mod tests {
         assert_eq!(cfb.stream("1").unwrap(), small);
         assert!(cfb.stream("2").is_none());
         assert!(Cfb::parse(&file[..100]).is_none());
+    }
+
+    /// Kopf eines Verbunddokuments mit 512-Byte-Sektoren; Verzeichnis ab
+    /// Sektor `dir`, keine FAT-Sektoren im Kopf, keine DIFAT-/MiniFAT-Kette.
+    fn header(fat_count: u32, difat: u32, dir: u32) -> Vec<u8> {
+        let mut h = vec![0u8; 512];
+        h[..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        h[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+        h[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+        h[0x2C..0x30].copy_from_slice(&fat_count.to_le_bytes());
+        h[0x30..0x34].copy_from_slice(&dir.to_le_bytes());
+        h[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
+        h[0x3C..0x40].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
+        h[0x44..0x48].copy_from_slice(&difat.to_le_bytes());
+        for i in 0..109 {
+            h[0x4C + i * 4..0x50 + i * 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        }
+        h
+    }
+
+    fn sector_of(values: &[u32]) -> Vec<u8> {
+        let mut v = values.to_vec();
+        v.resize(128, 0xFFFF_FFFF);
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn cfb_huge_fat_count_is_bounded() {
+        // Kopf behauptet 4 Mrd. FAT-Sektoren, die DIFAT-Kette nennt Sektor 0
+        // (FAT-Sektor) viele Male – die FAT darf nicht größer als die Datei werden.
+        let mut file = header(u32::MAX, 1, ENDOFCHAIN);
+        file[0x4C..0x50].copy_from_slice(&0u32.to_le_bytes());
+        file.extend(sector_of(&[0xFFFF_FFFD, 0xFFFF_FFFC]));
+        let mut difat = vec![0u32; 127];
+        difat.push(ENDOFCHAIN);
+        file.extend(sector_of(&difat));
+        let t = std::time::Instant::now();
+        let c = Cfb::parse(&file);
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert!(c.is_none_or(|c| c.fat.len() * 4 <= file.len() + 512));
+    }
+
+    #[test]
+    fn cfb_self_referencing_difat() {
+        // DIFAT-Sektor 0 verweist auf sich selbst.
+        let mut file = header(u32::MAX, 0, ENDOFCHAIN);
+        let mut difat = vec![0xFFFF_FFFFu32; 127];
+        difat.push(0);
+        file.extend(sector_of(&difat));
+        let t = std::time::Instant::now();
+        assert!(Cfb::parse(&file).is_none());
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cfb_fat_cycle() {
+        // Verzeichniskette 1 → 2 → 1.
+        let mut file = header(1, ENDOFCHAIN, 1);
+        file[0x4C..0x50].copy_from_slice(&0u32.to_le_bytes());
+        file.extend(sector_of(&[0xFFFF_FFFD, 2, 1]));
+        file.extend(vec![0u8; 1024]);
+        let t = std::time::Instant::now();
+        assert!(Cfb::parse(&file).is_none());
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        // Verweis hinter das Dateiende.
+        let mut file = header(1, ENDOFCHAIN, 1);
+        file[0x4C..0x50].copy_from_slice(&0u32.to_le_bytes());
+        file.extend(sector_of(&[0xFFFF_FFFD, 0x00FF_FFFF]));
+        file.extend(vec![0u8; 512]);
+        assert!(Cfb::parse(&file).is_none());
+    }
+
+    #[test]
+    fn truncated_tail_keeps_entries() {
+        // Zweiter Eintrag fehlt, vom ersten fehlen die letzten 2 Byte des Anhangs.
+        let mut b = destlist(6, &[entry(6, 1, 1.0, 1, -1, "C:\\x")], 0);
+        b[4..8].copy_from_slice(&2u32.to_le_bytes());
+        b.truncate(b.len() - 2);
+        let dl = parse_destlist(&b).unwrap();
+        assert_eq!(dl.entries.len(), 1);
+        assert_eq!(dl.entries[0].path, "C:\\x");
+    }
+
+    #[test]
+    fn network_paths() {
+        assert!(is_network_path(r"\\nas\share\datei.txt"));
+        assert!(is_network_path(r"\\?\UNC\nas\share"));
+        assert!(!is_network_path(r"\\?\C:\lokal"));
+        assert!(!is_network_path(r"\\.\pipe\x"));
+        assert!(!is_network_path("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"));
+        assert!(!is_network_path(""));
     }
 
     #[test]

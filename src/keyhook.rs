@@ -12,10 +12,11 @@
 
 use std::mem::zeroed;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -33,6 +34,8 @@ static COMBO: AtomicBool = AtomicBool::new(false);
 /// Eine Kombi-Taste wurde von uns geschluckt – Windows hat dann nur Win
 /// gesehen und würde beim Loslassen sein Startmenü öffnen.
 static SWALLOWED: AtomicBool = AtomicBool::new(false);
+/// Gerade gehaltene, geschluckte Kombi-Taste (0 = keine) – gegen Tastenwiederholung.
+static SWALLOWED_VK: AtomicU16 = AtomicU16::new(0);
 
 /// Tatsächlicher Zustand vor dem aktuellen Ereignis (im LL-Hook verlässlich).
 unsafe fn win_physically_down() -> bool {
@@ -50,6 +53,11 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         let down = wp as u32 == WM_KEYDOWN || wp as u32 == WM_SYSKEYDOWN;
         let vk = k.vkCode as u16;
         if !injected {
+            // Losgelassene Kombi-Taste (egal in welchem Zweig, auch nach der
+            // Win-Taste): der nächste Druck zählt wieder als neuer.
+            if !down {
+                let _ = SWALLOWED_VK.compare_exchange(vk, 0, Ordering::Relaxed, Ordering::Relaxed);
+            }
             if vk == VK_LWIN || vk == VK_RWIN {
                 if down {
                     // Neuer Druck – auch wenn wir das letzte Loslassen verpasst haben
@@ -59,6 +67,7 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                     if !WIN_DOWN.swap(true, Ordering::Relaxed) || !win_physically_down() {
                         COMBO.store(false, Ordering::Relaxed);
                         SWALLOWED.store(false, Ordering::Relaxed);
+                        SWALLOWED_VK.store(0, Ordering::Relaxed);
                     }
                 } else {
                     WIN_DOWN.store(false, Ordering::Relaxed);
@@ -91,7 +100,10 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                     0x31..=0x39 => (bar::hwnd(), bar::WM_BAR_NUM, (vk - 0x31) as usize),
                     _ => return CallNextHookEx(null_mut(), code, wp, lp),
                 };
-                if down {
+                // Nur beim ersten Druck auslösen: Tastenwiederholung beim
+                // Festhalten (Win+S gedrückt) würde sonst wiederholt umschalten.
+                // Geschluckt wird trotzdem jedes Ereignis.
+                if down && SWALLOWED_VK.swap(vk, Ordering::Relaxed) != vk {
                     PostMessageW(target, msg, wp, 0);
                 }
                 SWALLOWED.store(true, Ordering::Relaxed);
@@ -102,11 +114,49 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     CallNextHookEx(null_mut(), code, wp, lp)
 }
 
+/// Thread-Nachricht an den Hook-Thread: Hook neu setzen.
+const WM_HOOK_REINSTALL: u32 = WM_APP + 1;
+/// Thread-ID des Hook-Threads (0 = läuft noch nicht).
+static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
+
+unsafe fn install() -> HHOOK {
+    let h = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), GetModuleHandleW(null()), 0);
+    if h.is_null() {
+        crate::util::log(&format!("Tastaturhook konnte nicht gesetzt werden (Fehler {})", GetLastError()));
+    }
+    h
+}
+
 pub fn spawn() {
     std::thread::spawn(|| unsafe {
-        let h = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), GetModuleHandleW(null()), 0);
         let mut msg: MSG = zeroed();
-        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {}
-        UnhookWindowsHookEx(h);
+        // Nachrichtenschlange anlegen, bevor andere Threads hierher posten.
+        PeekMessageW(&mut msg, null_mut(), 0, 0, PM_NOREMOVE);
+        HOOK_THREAD.store(GetCurrentThreadId(), Ordering::Release);
+        let mut h = install();
+        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            if msg.hwnd.is_null() && msg.message == WM_HOOK_REINSTALL {
+                // Windows entfernt LL-Hooks still (Zeitüberschreitung, Sperre,
+                // Standby). Neu setzen ist harmlos, wenn er noch da war.
+                if !h.is_null() {
+                    UnhookWindowsHookEx(h);
+                }
+                h = install();
+                // Zustand zurücksetzen: Loslassen kann verpasst worden sein.
+                WIN_DOWN.store(false, Ordering::Relaxed);
+                SWALLOWED_VK.store(0, Ordering::Relaxed);
+            }
+        }
+        if !h.is_null() {
+            UnhookWindowsHookEx(h);
+        }
     });
+}
+
+/// Hook neu setzen lassen (nach Entsperren oder Standby; aus `bar`).
+pub fn reinstall() {
+    let tid = HOOK_THREAD.load(Ordering::Acquire);
+    if tid != 0 {
+        unsafe { PostThreadMessageW(tid, WM_HOOK_REINSTALL, 0, 0) };
+    }
 }
