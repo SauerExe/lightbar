@@ -2,9 +2,10 @@
 //! unten links.
 //!
 //! Codex: bevorzugt der letzte Limit-Stand aus Codex' eigenen
-//! Sitzungsprotokollen (`~/.codex/sessions`) – ohne Netz und ohne Token. Nur
-//! wenn dort nichts steht (z. B. bei Codex Desktop), wie bei Claude die
-//! Usage-Schnittstelle, die auch `/usage` in Claude Code und Codex nutzt.
+//! Sitzungsprotokollen (`~/.codex/sessions`) – ohne Netz und ohne Token. Sind
+//! sie älter als 15 Minuten oder leer (Codex Desktop), fragt Lightbar den
+//! App-Server des offiziellen Codex-CLI (wie CodexBar), zuletzt wie bei
+//! Claude die Usage-Schnittstelle, die auch `/usage` in Claude Code und Codex nutzt.
 //! Die Zugangsdaten kommen bei jeder Abfrage frisch aus den lokalen
 //! Login-Dateien der beiden Tools; sie werden nirgends gespeichert, geloggt
 //! oder an andere Hosts geschickt. Lightbar erneuert Tokens nie selbst (das
@@ -661,11 +662,343 @@ fn fetch_codex_http() -> Result<Fetched, Failure> {
     Ok(Fetched { limits, at: fetched, local: false })
 }
 
-/// Codex: zuerst die lokalen Protokolle, sonst die Schnittstelle.
+// ------------------------------------------------- Codex: App-Server
+//
+// Wie CodexBar: das offizielle Codex-CLI kurz als App-Server starten
+// (`codex -s read-only -a never app-server`, JSON-RPC zeilenweise über
+// stdin/stdout) und nach den Limits fragen:
+//
+//   → {"id":1,"method":"initialize","params":{"clientInfo":{…}}}
+//   ← {"id":1,"result":{…}}
+//   → {"method":"initialized"}
+//   → {"id":2,"method":"account/rateLimits/read","params":{…}}
+//   ← {"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,
+//      "windowDurationMins":300,"resetsAt":1792000000},"secondary":{…}},
+//      "rateLimitsByLimitId":{"codex":{…}}}}
+//
+// Danach stdin schließen; Codex beendet sich dann selbst (sonst wird es
+// beendet). Codex erneuert dabei bei Bedarf sein eigenes Token – das macht
+// Codex selbst, Lightbar fasst `auth.json` nicht an. Gestartet wird ohne
+// Fenster (CREATE_NO_WINDOW), nur im Hintergrund-Thread.
+
+/// Paketfamilie von Codex Desktop (Microsoft Store / MSIX).
+const CODEX_DESKTOP_FAMILY: &str = "OpenAI.Codex_2p2nqsd0c76g0";
+/// Höchstdauer einer App-Server-Abfrage insgesamt.
+const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
+/// Nicht gefundenes CLI erst nach dieser Zeit erneut suchen.
+const CODEX_SEARCH_RETRY: i64 = 3600;
+
+/// Wie das Codex-CLI gestartet wird: Programm und vorangestellte Argumente
+/// (bei der npm-Installation ohne native Datei: `node codex.js`).
+#[derive(Clone, Debug)]
+struct CodexCli {
+    program: PathBuf,
+    prefix: Vec<PathBuf>,
+}
+
+impl CodexCli {
+    fn exe(p: PathBuf) -> Self {
+        CodexCli { program: p, prefix: Vec::new() }
+    }
+
+    /// Existiert noch (z. B. nach einem Update von Codex Desktop liegt es woanders).
+    fn exists(&self) -> bool {
+        self.program.is_file() && self.prefix.iter().all(|p| p.is_file())
+    }
+}
+
+/// Datei `name` unter `dir` suchen (höchstens `depth` Ebenen tief).
+fn find_file(dir: &std::path::Path, name: &str, depth: u32) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut subdirs = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            subdirs.push(path);
+        } else if e.file_name().to_string_lossy().eq_ignore_ascii_case(name) {
+            return Some(path);
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+    subdirs.into_iter().find_map(|d| find_file(&d, name, depth - 1))
+}
+
+/// `node.exe` im Ordner `dir` oder auf dem PATH.
+fn find_node(dir: &std::path::Path) -> Option<PathBuf> {
+    let local = dir.join("node.exe");
+    if local.is_file() {
+        return Some(local);
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join("node.exe")).find(|p| p.is_file())
+}
+
+/// npm-Installation im Ordner `dir` (dort liegt `codex.cmd`): bevorzugt die
+/// mitgelieferte `codex.exe`, sonst `node …\bin\codex.js` – nie das .cmd
+/// selbst (das bräuchte cmd.exe).
+fn npm_codex(dir: &std::path::Path) -> Option<CodexCli> {
+    let openai = dir.join("node_modules").join("@openai");
+    if !openai.is_dir() {
+        return None;
+    }
+    if let Some(exe) = find_file(&openai, "codex.exe", 6) {
+        return Some(CodexCli::exe(exe));
+    }
+    let script = openai.join("codex").join("bin").join("codex.js");
+    if !script.is_file() {
+        return None;
+    }
+    Some(CodexCli { program: find_node(dir)?, prefix: vec![script] })
+}
+
+/// Installationsordner von Codex Desktop (MSIX) über die Paket-API – der
+/// Ordner unter `WindowsApps` wechselt mit jeder Version und ist nicht lesbar.
+fn codex_desktop_dir() -> Option<PathBuf> {
+    use windows_sys::Win32::Storage::Packaging::Appx::{GetPackagePathByFullName, GetPackagesByPackageFamily};
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    let family = w16(CODEX_DESKTOP_FAMILY);
+    unsafe {
+        let (mut count, mut len) = (0u32, 0u32);
+        let r = GetPackagesByPackageFamily(family.as_ptr(), &mut count, null_mut(), &mut len, null_mut());
+        if r != ERROR_INSUFFICIENT_BUFFER || count == 0 {
+            return None;
+        }
+        let mut names = vec![null_mut::<u16>(); count as usize];
+        let mut buf = vec![0u16; len as usize];
+        if GetPackagesByPackageFamily(family.as_ptr(), &mut count, names.as_mut_ptr(), &mut len, buf.as_mut_ptr()) != 0 {
+            return None;
+        }
+        // Mehrere Einträge (z. B. mitten im Update): der erste mit vorhandenem CLI.
+        names.iter().take(count as usize).find_map(|&name| {
+            let mut plen = 0u32;
+            if GetPackagePathByFullName(name, &mut plen, null_mut()) != ERROR_INSUFFICIENT_BUFFER {
+                return None;
+            }
+            let mut path = vec![0u16; plen as usize];
+            if GetPackagePathByFullName(name, &mut plen, path.as_mut_ptr()) != 0 {
+                return None;
+            }
+            let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+            let dir = PathBuf::from(String::from_utf16_lossy(&path[..end]));
+            dir.join("app").join("resources").join("codex.exe").is_file().then_some(dir)
+        })
+    }
+}
+
+/// Codex-CLI suchen: PATH (codex.exe oder npm-`codex.cmd`), npm global,
+/// Codex Desktop (MSIX), Codex Desktop als normale Installation.
+fn find_codex_cli() -> Option<CodexCli> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let exe = dir.join("codex.exe");
+            if exe.is_file() {
+                return Some(CodexCli::exe(exe));
+            }
+            if dir.join("codex.cmd").is_file() {
+                if let Some(c) = npm_codex(&dir) {
+                    return Some(c);
+                }
+            }
+        }
+    }
+    if let Some(c) = std::env::var_os("APPDATA").and_then(|a| npm_codex(&PathBuf::from(a).join("npm"))) {
+        return Some(c);
+    }
+    if let Some(dir) = codex_desktop_dir() {
+        return Some(CodexCli::exe(dir.join("app").join("resources").join("codex.exe")));
+    }
+    let programs = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Programs");
+    ["Codex", "codex", "OpenAI Codex"]
+        .into_iter()
+        .map(|d| programs.join(d).join("resources").join("codex.exe"))
+        .find(|p| p.is_file())
+        .map(CodexCli::exe)
+}
+
+/// Gefundenes CLI (mit Zeitpunkt der Suche), damit nicht jedes Mal gesucht wird.
+static CODEX_CLI: Mutex<Option<(i64, Option<CodexCli>)>> = Mutex::new(None);
+
+fn codex_cli() -> Option<CodexCli> {
+    let t = now();
+    let mut cache = CODEX_CLI.lock().ok()?;
+    let stale = match &*cache {
+        None => true,
+        Some((_, Some(c))) => !c.exists(),
+        Some((at, None)) => t - at >= CODEX_SEARCH_RETRY,
+    };
+    if stale {
+        *cache = Some((t, find_codex_cli()));
+    }
+    cache.as_ref()?.1.clone()
+}
+
+/// `account/rateLimits/read`-Ergebnis → Limits. Bevorzugt der Eintrag `codex`
+/// aus `rateLimitsByLimitId`, sonst `rateLimits`; Fenster wie in den
+/// Sitzungsprotokollen, nur in camelCase.
+fn parse_app_server_limits(result: &Value, at: i64) -> Option<Limits> {
+    let snap = result.pointer("/rateLimitsByLimitId/codex").filter(|v| v.is_object()).or_else(|| result.get("rateLimits"))?;
+    let window = |w: &Value| -> Value {
+        if !w.is_object() {
+            return Value::Null;
+        }
+        serde_json::json!({
+            "used_percent": w.get("usedPercent"),
+            "window_minutes": w.get("windowDurationMins"),
+            "resets_at": w.get("resetsAt"),
+        })
+    };
+    let rl = serde_json::json!({
+        "limit_id": snap.get("limitId"),
+        "primary": snap.get("primary").map(window),
+        "secondary": snap.get("secondary").map(window),
+    });
+    parse_rate_limits(&rl, at)
+}
+
+/// Antwort mit der Kennung `id` abwarten (Benachrichtigungen dazwischen
+/// werden übergangen): Ergebnis oder Fehlermeldung des Servers.
+fn rpc_wait(rx: &std::sync::mpsc::Receiver<String>, id: i64, deadline: std::time::Instant) -> Result<Value, Failure> {
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let line = match rx.recv_timeout(left) {
+            Ok(l) => l,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err("Codex: App-Server antwortet nicht (Zeitüberschreitung)".into()),
+            Err(_) => return Err("Codex: App-Server unerwartet beendet".into()),
+        };
+        if let Some(r) = rpc_response(&line, id) {
+            return r;
+        }
+    }
+}
+
+/// Eine Zeile vom App-Server: Antwort auf `id`? (`None` = andere Nachricht.)
+fn rpc_response(line: &str, id: i64) -> Option<Result<Value, Failure>> {
+    let mut v = serde_json::from_str::<Value>(line).ok()?;
+    if v.get("id").and_then(Value::as_i64) != Some(id) {
+        return None;
+    }
+    if let Some(e) = v.get("error") {
+        let msg = e.get("message").and_then(Value::as_str).unwrap_or("unbekannter Fehler");
+        let lower = msg.to_ascii_lowercase();
+        let text = format!("Codex: App-Server meldet „{}“", msg.chars().take(160).collect::<String>());
+        return Some(Err(if lower.contains("auth") || lower.contains("login") || lower.contains("logged") {
+            auth_failure(text)
+        } else {
+            text.into()
+        }));
+    }
+    Some(v.get_mut("result").map(Value::take).ok_or_else(|| "Codex: App-Server-Antwort unlesbar".into()))
+}
+
+/// Codex' Limits über den App-Server des offiziellen CLI.
+fn fetch_codex_app_server() -> Result<Fetched, Failure> {
+    use std::io::{BufRead, Write};
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let cli = codex_cli().ok_or("Codex: Codex-CLI nicht gefunden")?;
+    let mut child = Command::new(&cli.program)
+        .args(&cli.prefix)
+        .args(["-s", "read-only", "-a", "never", "app-server"])
+        // Kein Projektordner: keine projektbezogene Codex-Konfiguration.
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| Failure::from(format!("Codex: App-Server startet nicht ({e})")))?;
+    let deadline = std::time::Instant::now() + APP_SERVER_TIMEOUT;
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(out) = child.stdout.take() {
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let mut stdin = child.stdin.take();
+    let result = (|| {
+        let mut send = |msg: Value| -> Result<(), Failure> {
+            let w = stdin.as_mut().ok_or("Codex: App-Server nicht erreichbar")?;
+            writeln!(w, "{msg}").and_then(|_| w.flush()).map_err(|_| Failure::from("Codex: App-Server unerwartet beendet"))
+        };
+        let version = env!("CARGO_PKG_VERSION");
+        send(serde_json::json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "lightbar", "title": "Lightbar", "version": version}}}))?;
+        rpc_wait(&rx, 1, deadline)?;
+        send(serde_json::json!({"method": "initialized"}))?;
+        send(serde_json::json!({"id": 2, "method": "account/rateLimits/read", "params": {"excludeResetCreditDetails": true}}))?;
+        let fetched = now();
+        let r = rpc_wait(&rx, 2, deadline)?;
+        let limits = parse_app_server_limits(&r, fetched).ok_or("Codex: App-Server-Antwort ohne Limits")?;
+        Ok(Fetched { limits, at: fetched, local: false })
+    })();
+    // stdin schließen → Codex beendet sich; sonst nach kurzer Frist beenden.
+    drop(stdin);
+    let quit = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < quit => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// Nur so junge Protokolle gelten als aktuell; ältere zeigt die Leiste zwar
+/// an, fragt aber trotzdem den App-Server.
+const LOCAL_FRESH: i64 = 15 * 60;
+
+/// Codex ohne frische lokale Protokolle: App-Server, sonst als letzter
+/// Ausweg die Usage-Schnittstelle mit dem gespeicherten Token.
+/// Den App-Server höchstens alle 10 Minuten starten, auch bei Fehlschlägen
+/// und Klicks – dazwischen bleibt die Schnittstelle (mit dem Token, das
+/// Codex dabei womöglich gerade erneuert hat).
+static APP_SERVER_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn fetch_codex_remote() -> Result<Fetched, Failure> {
+    use std::sync::atomic::Ordering;
+    let t = now();
+    let app = if t - APP_SERVER_AT.load(Ordering::Relaxed) >= INTERVAL {
+        APP_SERVER_AT.store(t, Ordering::Relaxed);
+        match fetch_codex_app_server() {
+            Ok(f) => return Ok(f),
+            Err(e) if e.message.contains("nicht gefunden") => None,
+            Err(e) => Some(e),
+        }
+    } else {
+        None
+    };
+    match fetch_codex_http() {
+        Ok(f) => Ok(f),
+        // App-Server nicht gefragt (kein CLI, gerade erst): Fehler der Schnittstelle.
+        Err(http) => match app {
+            None => Err(http),
+            // Abgelaufener Login: ruhig warten (wie bisher), Grund des App-Servers dazu.
+            Some(app) if http.kind == FailKind::Auth => {
+                let why = app.message.trim_start_matches("Codex: ");
+                Err(Failure { message: format!("{} ({why})", http.message), ..http })
+            }
+            Some(app) => Err(app),
+        },
+    }
+}
+
+/// Codex: zuerst frische lokale Protokolle, dann App-Server, dann Schnittstelle.
 fn fetch_codex() -> Result<Fetched, Failure> {
     match local_codex() {
-        Some(s) => Ok(Fetched { limits: s.limits, at: s.at, local: true }),
-        None => fetch_codex_http(),
+        Some(s) if s.at >= now() - LOCAL_FRESH => Ok(Fetched { limits: s.limits, at: s.at, local: true }),
+        _ => fetch_codex_remote(),
     }
 }
 
@@ -710,7 +1043,7 @@ fn fetch_slot(i: usize) -> Result<Fetched, Failure> {
     if i == 0 {
         fetch_claude()
     } else {
-        fetch_codex_http()
+        fetch_codex_remote()
     }
 }
 
@@ -802,14 +1135,27 @@ fn run_due(manual: bool) -> bool {
         Ok(mut s) => {
             if let Some(snap) = &local {
                 let sl = &mut s[1];
-                if !(sl.local && sl.fetched_at == snap.at && matches!(sl.value, Some(Ok(_)))) {
-                    apply(sl, Ok(Fetched { limits: snap.limits.clone(), at: snap.at, local: true }), t);
+                let has_value = matches!(sl.value, Some(Ok(_)));
+                if snap.at >= t - LOCAL_FRESH {
+                    if !(sl.local && sl.fetched_at == snap.at && has_value) {
+                        apply(sl, Ok(Fetched { limits: snap.limits.clone(), at: snap.at, local: true }), t);
+                        changed = true;
+                    }
+                } else if !has_value || snap.at > sl.fetched_at {
+                    // Älterer Stand: anzeigen, solange nichts Neueres da ist, den
+                    // Zeitplan für den App-Server aber nicht anfassen.
+                    if let Some(Err(e)) = sl.value.take() {
+                        sl.note = Some(e);
+                    }
+                    sl.value = Some(Ok(snap.limits.clone()));
+                    sl.fetched_at = snap.at;
+                    sl.local = true;
                     changed = true;
                 }
             }
             (0..2)
                 .filter(|&i| enabled[i])
-                .filter(|&i| !(i == 1 && local.is_some()))
+                .filter(|&i| !(i == 1 && local.as_ref().is_some_and(|l| l.at >= t - LOCAL_FRESH)))
                 .filter(|&i| is_due(&s[i], t, manual, cred_mtimes[i]))
                 .collect()
         }
@@ -1229,5 +1575,69 @@ mod usage_tests {
         let text = describe("Codex", &Some(Ok(l)), now() - 3 * 3600, true, None);
         assert!(text.starts_with("Codex (letzte Codex-Sitzung vor 3 Std.)"), "{text}");
         assert!(text.contains("5 Stunden: 12 %"));
+    }
+}
+
+#[cfg(test)]
+mod app_server_tests {
+    use super::*;
+
+    // Gekürzte Antworten im Format von `account/rateLimits/read` (Codex-CLI 0.163).
+    const RESULT: &str = r#"{"id":2,"result":{"ordinaryUsageAllowed":true,"accountId":null,"rateLimitResetCredits":{"availableCount":0,"credits":null},"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":7,"windowDurationMins":300,"resetsAt":1792667924},"secondary":{"usedPercent":41,"windowDurationMins":10080,"resetsAt":1793254724},"credits":null,"planType":"team"},"rateLimitsByLimitId":{"codex":{"limitId":"codex","primary":{"usedPercent":8,"windowDurationMins":300,"resetsAt":1792667924},"secondary":{"usedPercent":42,"windowDurationMins":10080,"resetsAt":1793254724}},"codex_spark":{"limitId":"codex_spark","primary":{"usedPercent":99,"windowDurationMins":300,"resetsAt":1792667924},"secondary":null}}}}"#;
+    const ONLY_SINGLE: &str = r#"{"id":2,"result":{"rateLimits":{"limitId":null,"primary":{"usedPercent":12,"windowDurationMins":10080,"resetsAt":null},"secondary":null},"rateLimitsByLimitId":null}}"#;
+
+    fn result_of(line: &str) -> Value {
+        rpc_response(line, 2).expect("Antwort auf id 2").expect("kein Fehler")
+    }
+
+    #[test]
+    fn prefers_codex_bucket() {
+        let l = parse_app_server_limits(&result_of(RESULT), 1_792_000_000).unwrap();
+        let (f, w) = (l.five_hour.unwrap(), l.week.unwrap());
+        assert_eq!((f.used, f.resets_at), (8.0, Some(1792667924)));
+        assert_eq!((w.used, w.resets_at), (42.0, Some(1793254724)));
+    }
+
+    #[test]
+    fn falls_back_to_single_bucket_by_window_length() {
+        let l = parse_app_server_limits(&result_of(ONLY_SINGLE), 1_792_000_000).unwrap();
+        assert!(l.five_hour.is_none());
+        assert_eq!(l.week.map(|w| (w.used, w.resets_at)), Some((12.0, None)));
+    }
+
+    #[test]
+    fn no_windows_means_no_limits() {
+        let r = result_of(r#"{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":null,"secondary":null}}}"#);
+        assert!(parse_app_server_limits(&r, 0).is_none());
+    }
+
+    #[test]
+    fn skips_notifications_and_other_ids() {
+        assert!(rpc_response(r#"{"method":"remoteControl/status/changed","params":{"status":"off"}}"#, 2).is_none());
+        assert!(rpc_response(r#"{"id":1,"result":{"userAgent":"x"}}"#, 2).is_none());
+        assert!(rpc_response("keine JSON-Zeile", 2).is_none());
+    }
+
+    #[test]
+    fn server_errors_are_classified() {
+        let e = rpc_response(r#"{"id":2,"error":{"code":-32600,"message":"codex account authentication required to read rate limits"}}"#, 2).unwrap().unwrap_err();
+        assert_eq!(e.kind, FailKind::Auth);
+        let e = rpc_response(r#"{"id":2,"error":{"code":-32601,"message":"method not found"}}"#, 2).unwrap().unwrap_err();
+        assert_eq!(e.kind, FailKind::Other);
+        assert!(e.message.contains("method not found"));
+    }
+}
+
+/// Echte Abfrage über den App-Server: `cargo test live_app_server -- --ignored --nocapture`
+/// (gibt nur Pfad und Prozentwerte aus).
+#[cfg(test)]
+#[test]
+#[ignore]
+fn live_app_server() {
+    println!("CLI: {:?}", codex_cli());
+    let started = std::time::Instant::now();
+    match fetch_codex_app_server() {
+        Ok(f) => println!("ok nach {:?}: 5h {:?} · Woche {:?}", started.elapsed(), f.limits.five_hour, f.limits.week),
+        Err(e) => panic!("{}", e.message),
     }
 }
