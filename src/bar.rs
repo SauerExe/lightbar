@@ -182,7 +182,46 @@ struct Group {
     icon: HICON,
     /// Selbst erzeugt und damit unser – muss mit DestroyIcon freigegeben werden.
     owned: bool,
+    /// Schlüssel ist eine ausdrücklich am Fenster gesetzte AUMID.
+    explicit: bool,
 }
+
+/// Was über ein Fenster bekannt ist.
+#[derive(Clone)]
+struct WinInfo {
+    exe: Option<String>,
+    /// AUMID aus der Paket-Identität des Prozesses (Terminal, neues Outlook,
+    /// Teams …) – hängt am Prozess, ändert sich also nie.
+    package: Option<String>,
+    /// Ausdrücklich am Fenster gesetzte AUMID; manche Apps setzen sie erst
+    /// nach dem Öffnen, deshalb bei jedem Einlesen frisch.
+    explicit: Option<String>,
+}
+
+/// Gruppenschlüssel wie bei Windows: ausdrückliche AUMID, sonst die des
+/// Pakets, sonst die exe.
+fn key_of(explicit: Option<&str>, package: Option<&str>, exe: Option<&str>) -> Option<String> {
+    explicit.or(package).map(|id| format!("aumid:{id}")).or_else(|| exe.map(exe_key))
+}
+
+/// Aufmerksamkeit eines Fensters: Stärke des Pulsierens 0..1, nach etwa
+/// sieben Pulsen dauerhaft 1 (wie Windows: erst blinken, dann leuchten).
+fn attention_level(elapsed: f32) -> f32 {
+    if attention_pulsing(elapsed) {
+        0.5 - 0.5 * (elapsed * std::f32::consts::TAU / FLASH_PERIOD).cos()
+    } else {
+        1.0
+    }
+}
+
+/// Pulst das Blinken noch (dann muss animiert werden)?
+fn attention_pulsing(elapsed: f32) -> bool {
+    elapsed < FLASH_PULSES * FLASH_PERIOD
+}
+
+const FLASH_PULSES: f32 = 7.0;
+/// Dauer eines Pulses in Sekunden.
+const FLASH_PERIOD: f32 = 1.0;
 
 struct State {
     dpi: u32,
@@ -191,9 +230,14 @@ struct State {
     shell_msg: u32,
     created_msg: u32,
     groups: Vec<Group>,
-    /// Je Fenster: (exe, Gruppenschlüssel) – einmal ermittelt, dann gecacht.
-    info: HashMap<usize, (Option<String>, String)>,
+    /// Je Fenster: exe und Paket-AUMID (einmal ermittelt), ausdrückliche AUMID
+    /// (bei jedem Einlesen frisch).
+    info: HashMap<usize, WinInfo>,
     pins: Vec<String>,
+    /// Start-exe zu AUMID-Anheftungen (für Apps außerhalb des App-Katalogs).
+    pin_exe: HashMap<String, String>,
+    /// Vor Win+T aktives Fenster: Esc gibt ihm den Fokus zurück.
+    focus_return: HWND,
     /// Vom Nutzer per Ziehen festgelegte Reihenfolge (Platz-Schlüssel).
     order: Vec<String>,
     /// Laufendes Ziehen eines Buttons.
@@ -216,11 +260,19 @@ struct State {
     ram: f32,
     cpu_times: (u64, u64),
     taskmgr_icon: HICON,
-    /// Fenster, die blinken (Aufmerksamkeit wollen), bis sie aktiviert werden.
-    attention: Vec<HWND>,
+    /// Fenster, die blinken (Aufmerksamkeit wollen), mit Beginn des Blinkens –
+    /// bis sie aktiviert werden oder das Blinken beenden.
+    attention: Vec<(HWND, Instant)>,
     start: Instant,
     font: HFONT,
     icons: HFONT,
+}
+
+impl State {
+    /// Sekunden, seit eines der Fenster blinkt (das am längsten blinkende).
+    fn attention_of(&self, windows: &[HWND]) -> Option<f32> {
+        self.attention.iter().filter(|(w, _)| windows.contains(w)).map(|(_, t)| t.elapsed().as_secs_f32()).reduce(f32::max)
+    }
 }
 
 thread_local! {
@@ -248,32 +300,153 @@ fn pins_path() -> Option<PathBuf> {
     Some(crate::util::data_dir()?.join("taskbar.txt"))
 }
 
-/// Angeheftete Gruppenschlüssel. Ältere Dateien enthalten nackte exe-Pfade.
-fn load_pins() -> Vec<String> {
-    pins_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| {
-            t.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(|l| if l.starts_with("exe:") || l.starts_with("aumid:") { l.to_string() } else { exe_key(l) })
-                .collect()
+/// Angeheftete Gruppenschlüssel und je Schlüssel optional eine exe zum Starten
+/// (bei AUMID-Anheftungen, deren App nicht im App-Katalog steht).
+fn load_pins() -> (Vec<String>, HashMap<String, String>) {
+    pins_path().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| parse_pins(&t)).unwrap_or_default()
+}
+
+/// Ein Anheft-Schlüssel in heutiger Form. Ältere Dateien enthalten nackte
+/// exe-Pfade oder exe-Schlüssel mit Versionsordnern (Store-Apps).
+fn normalize_pin(line: &str) -> String {
+    if line.starts_with("aumid:") {
+        line.to_string()
+    } else {
+        exe_key(line.strip_prefix("exe:").unwrap_or(line))
+    }
+}
+
+/// Dateiformat: eine Zeile je Anheftung, `schlüssel` oder `schlüssel<TAB>exe`.
+fn parse_pins(text: &str) -> (Vec<String>, HashMap<String, String>) {
+    let mut pins: Vec<String> = Vec::new();
+    let mut hints = HashMap::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let (key, hint) = match line.split_once('\t') {
+            Some((k, h)) => (k.trim(), Some(h.trim())),
+            None => (line, None),
+        };
+        let key = normalize_pin(key);
+        if pins.contains(&key) {
+            continue;
+        }
+        if let Some(h) = hint.filter(|h| !h.is_empty() && key.starts_with("aumid:")) {
+            hints.insert(key.clone(), normalize_exe(h));
+        }
+        pins.push(key);
+    }
+    (pins, hints)
+}
+
+fn format_pins(pins: &[String], hints: &HashMap<String, String>) -> String {
+    pins.iter()
+        .map(|p| match hints.get(p) {
+            Some(h) => format!("{p}\t{h}"),
+            None => p.clone(),
         })
-        .unwrap_or_default()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn exe_key(exe: &str) -> String {
     format!("exe:{}", normalize_exe(exe))
 }
 
-/// Kleinschreibung und Squirrel-Versionsordner entfernen: Discord, Slack & Co.
-/// liegen in …\discord\app-1.0.9264\discord.exe; als Schlüssel zählt
-/// …\discord\discord.exe, damit Anheften Updates überlebt.
+/// Kleinschreibung und Versionsordner entfernen, damit Anheften Updates
+/// überlebt: Squirrel-Apps (Discord, Slack & Co.) liegen in
+/// …\discord\app-1.0.9264\discord.exe, als Schlüssel zählt …\discord\discord.exe.
+/// Store-Apps liegen in …\windowsapps\<Name>_<Version>_<Arch>_<Ressource>_<Herausgeber>\;
+/// als Schlüssel zählt die Paketfamilie …\windowsapps\<Name>_<Herausgeber>\.
 pub fn normalize_exe(exe: &str) -> String {
     let lower = exe.to_lowercase();
     let parts: Vec<&str> = lower.split('\\').collect();
     let is_version_dir = |p: &str| p.strip_prefix("app-").is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.'));
-    parts.iter().filter(|p| !is_version_dir(p)).copied().collect::<Vec<_>>().join("\\")
+    let mut out: Vec<String> = Vec::with_capacity(parts.len());
+    for (i, p) in parts.iter().enumerate() {
+        if is_version_dir(p) {
+            continue;
+        }
+        let after_windowsapps = i > 0 && parts[i - 1] == "windowsapps";
+        match package_family(p).filter(|_| after_windowsapps) {
+            Some(family) => out.push(family),
+            None => out.push(p.to_string()),
+        }
+    }
+    out.join("\\")
+}
+
+/// Paketfamilie aus einem vollen Paketnamen
+/// (`microsoft.windowsterminal_1.21.2361.0_x64__8wekyb3d8bbwe` →
+/// `microsoft.windowsterminal_8wekyb3d8bbwe`). Paketnamen enthalten keinen
+/// Unterstrich, die Version nur Ziffern und Punkte.
+fn package_family(full: &str) -> Option<String> {
+    let f: Vec<&str> = full.split('_').collect();
+    let version_ok = |v: &str| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.');
+    (f.len() == 5 && !f[0].is_empty() && version_ok(f[1]) && !f[4].is_empty()).then(|| format!("{}_{}", f[0], f[4]))
+}
+
+/// Liegt die exe in einem Store-/MSIX-Paket? Solche exe startet man nicht
+/// direkt, sondern über die Paket-Aktivierung (AUMID).
+fn is_packaged_exe(exe: &str) -> bool {
+    exe.to_lowercase().contains("\\windowsapps\\")
+}
+
+/// Paketfamilie einer (normalisierten oder versionierten) WindowsApps-exe.
+fn family_of_exe(exe: &str) -> Option<String> {
+    let norm = normalize_exe(exe);
+    let mut it = norm.split('\\');
+    it.by_ref().find(|p| *p == "windowsapps")?;
+    it.next().filter(|f| f.contains('_')).map(String::from)
+}
+
+/// Alte exe-Anheftungen von Store-Apps auf deren AUMID umstellen, sobald sie
+/// sich eindeutig zuordnen lassen (`ids`: AUMIDs aus dem App-Katalog). Bei
+/// mehreren Apps im selben Paket bleibt der exe-Schlüssel; den stellt die
+/// Leiste um, sobald die App läuft.
+fn migrate_packaged_pins(pins: &mut [String], ids: &[String]) -> bool {
+    let mut changed = false;
+    for pin in pins.iter_mut() {
+        let Some(exe) = pin.strip_prefix("exe:") else { continue };
+        let Some(family) = family_of_exe(exe) else { continue };
+        let prefix = format!("{family}!");
+        let mut found = ids.iter().filter(|id| id.to_lowercase().starts_with(&prefix));
+        if let (Some(id), None) = (found.next(), found.next()) {
+            *pin = format!("aumid:{id}");
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Gehört der Anheft-Eintrag `pin` zur Gruppe mit Schlüssel `key`?
+/// Ausdrücklich am Fenster gesetzte AUMIDs zählen nur über den Schlüssel –
+/// so bleiben z. B. Chrome-PWAs von Chrome getrennt. Bei exe-Gruppen und
+/// Paket-Apps (deren AUMID aus der exe folgt) zählt auch die exe.
+fn pin_matches(pin: &str, key: &str, exe: Option<&str>, explicit: bool) -> bool {
+    if pin.eq_ignore_ascii_case(key) {
+        return true;
+    }
+    if explicit || key.starts_with("hwnd:") || !pin.starts_with("exe:") {
+        return false;
+    }
+    exe.is_some_and(|e| exe_key(e) == pin)
+}
+
+/// Anheftung, die zu einer exe gehört (direkt oder über die Start-exe einer
+/// AUMID-Anheftung) – für das Startmenü.
+fn pin_for_exe(pins: &[String], hints: &HashMap<String, String>, exe: &str) -> Option<String> {
+    let key = exe_key(exe);
+    pins.iter().find(|p| **p == key || hints.get(*p).is_some_and(|h| exe_key(h) == key)).cloned()
+}
+
+/// Platz für eine neue Anheftung in der selbst sortierten Reihenfolge: hinter
+/// der letzten angehefteten App, nicht hinter den nur laufenden.
+fn insert_pinned_slot(order: &mut Vec<String>, pins: &[String], slot: &str, old_slot: Option<&str>) {
+    if order.is_empty() {
+        return;
+    }
+    order.retain(|s| s != slot && Some(s.as_str()) != old_slot);
+    let at = order.iter().rposition(|s| pins.contains(s)).map_or(0, |i| i + 1);
+    order.insert(at, slot.to_string());
 }
 
 /// Startbare Form eines (normalisierten) exe-Pfads. Bei Squirrel-Apps: der
@@ -310,35 +483,60 @@ fn icon_source(exe: &str) -> Option<String> {
     }
 }
 
-fn save_pins(pins: &[String]) {
+fn save_pins(pins: &[String], hints: &HashMap<String, String>) {
     if let Some(p) = pins_path() {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(p, pins.join("\n"));
+        let _ = std::fs::write(p, format_pins(pins, hints));
     }
 }
 
-unsafe fn toggle_key(key: &str) {
+/// Anheften oder lösen. Neu Angeheftetes kommt ans Ende der angehefteten
+/// Apps (auch in einer selbst sortierten Reihenfolge); `hint` ist die exe zum
+/// Starten einer AUMID-Anheftung, `old_slot` der bisherige Platz der Gruppe.
+unsafe fn toggle_key(key: &str, hint: Option<String>, old_slot: Option<&str>) {
     with(|s| {
         if let Some(i) = s.pins.iter().position(|p| p == key) {
             s.pins.remove(i);
+            s.pin_exe.remove(key);
         } else {
+            insert_pinned_slot(&mut s.order, &s.pins, key, old_slot);
             s.pins.push(key.to_string());
+            if let Some(h) = hint.filter(|_| key.starts_with("aumid:")) {
+                s.pin_exe.insert(key.to_string(), normalize_exe(&h));
+            }
         }
-        save_pins(&s.pins);
+        save_pins(&s.pins, &s.pin_exe);
     });
     refresh(hwnd(), None);
 }
 
 /// Von außen (Startmenü) eine exe an die Taskleiste heften oder lösen.
 pub unsafe fn toggle_pin(exe: &str) {
-    toggle_key(&exe_key(exe));
+    let existing = with(|s| pin_for_exe(&s.pins, &s.pin_exe, exe)).flatten();
+    toggle_key(&existing.unwrap_or_else(|| exe_key(exe)), None, None);
 }
 
 pub fn is_pinned(exe: &str) -> bool {
-    let key = exe_key(exe);
-    with(|s| s.pins.contains(&key)).unwrap_or(false)
+    with(|s| pin_for_exe(&s.pins, &s.pin_exe, exe).is_some()).unwrap_or(false)
+}
+
+/// Store-Apps, die noch mit versioniertem exe-Pfad angeheftet sind, einmalig
+/// auf ihre AUMID umstellen (der App-Katalog wird nur dann gelesen).
+unsafe fn migrate_pins_on_start() {
+    let needed = with(|s| s.pins.iter().any(|p| p.strip_prefix("exe:").is_some_and(is_packaged_exe))).unwrap_or(false);
+    if !needed {
+        return;
+    }
+    let ids: Vec<String> = crate::apps::enumerate().into_iter().map(|a| a.id).filter(|id| id.contains('!')).collect();
+    with(|s| {
+        if migrate_packaged_pins(&mut s.pins, &ids) {
+            let mut seen = std::collections::HashSet::new();
+            s.pins.retain(|p| seen.insert(p.clone()));
+            save_pins(&s.pins, &s.pin_exe);
+        }
+    });
 }
 
 // ---------------------------------------------------------------- Layout
@@ -742,7 +940,10 @@ pub(crate) unsafe fn is_task_window(h: HWND) -> bool {
     if class == "Progman" || class == "WorkerW" {
         return false;
     }
-    GetWindowTextLengthW(h) > 0
+    // Per ITaskbarList::DeleteTab ausgeblendet (die Markierung setzt das
+    // TaskbarList-Objekt selbst am Fenster, siehe taskband). Einen Titel
+    // verlangt Windows nicht – manche Apps setzen ihn erst später.
+    !crate::taskband::is_deleted(h)
 }
 
 unsafe extern "system" fn enum_cb(h: HWND, lp: LPARAM) -> BOOL {
@@ -753,17 +954,40 @@ unsafe extern "system" fn enum_cb(h: HWND, lp: LPARAM) -> BOOL {
 }
 
 pub(crate) unsafe fn exe_of(h: HWND) -> Option<String> {
+    process_info(h).0
+}
+
+/// exe (kleingeschrieben) und Paket-AUMID des Prozesses hinter einem Fenster –
+/// mit einem einzigen OpenProcess.
+unsafe fn process_info(h: HWND) -> (Option<String>, Option<String>) {
+    use windows_sys::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
     let mut pid = 0u32;
     GetWindowThreadProcessId(h, &mut pid);
     let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
     if proc.is_null() {
-        return None;
+        return (None, None);
     }
     let mut buf = vec![0u16; 1024];
     let mut len = buf.len() as u32;
     let ok = QueryFullProcessImageNameW(proc, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len);
+    let exe = (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]).to_lowercase());
+    // Nur Prozesse mit Paket-Identität haben eine (APPMODEL_ERROR_NO_APPLICATION sonst).
+    let mut id = vec![0u16; 256];
+    let mut id_len = id.len() as u32;
+    let package = (GetApplicationUserModelId(proc, &mut id_len, id.as_mut_ptr()) == 0)
+        .then(|| String::from_utf16_lossy(&id[..(id_len as usize).saturating_sub(1)]))
+        .filter(|s| !s.is_empty());
     CloseHandle(proc);
-    (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]).to_lowercase())
+    (exe, package)
+}
+
+/// Steht eine AUMID im App-Katalog (dann startet die Shell sie samt Argumenten
+/// der Verknüpfung, wie Windows es beim Anheften tut)?
+unsafe fn in_apps_folder(id: &str) -> bool {
+    use windows::Win32::System::Com::IBindCtx;
+    use windows::Win32::UI::Shell::{IShellItem, SHCreateItemFromParsingName};
+    let p = windows::core::HSTRING::from(format!("shell:AppsFolder\\{id}"));
+    SHCreateItemFromParsingName::<_, _, IShellItem>(&p, None::<&IBindCtx>).is_ok()
 }
 
 /// Icon einer exe in exakt `size` Pixeln (scharf statt hochskaliert).
@@ -795,15 +1019,9 @@ unsafe fn window_icon(h: HWND) -> HICON {
     LoadIconW(null_mut(), IDI_APPLICATION)
 }
 
-/// Gruppenschlüssel eines Fensters: AppUserModelID wie bei Windows, sonst exe.
-unsafe fn window_key(h: HWND, exe: Option<&str>) -> String {
-    if let Some(id) = crate::apps::window_app_id(h) {
-        return format!("aumid:{id}");
-    }
-    match exe {
-        Some(e) => exe_key(e),
-        None => format!("hwnd:{}", h as usize),
-    }
+/// Gruppenschlüssel eines Fensters (siehe `key_of`), notfalls das Fenster selbst.
+fn window_key(h: HWND, i: &WinInfo) -> String {
+    key_of(i.explicit.as_deref(), i.package.as_deref(), i.exe.as_deref()).unwrap_or_else(|| format!("hwnd:{}", h as usize))
 }
 
 /// Icon einer Gruppe in exakt `size` Pixeln. Rückgabe: (Icon, gehört uns).
@@ -864,13 +1082,13 @@ unsafe fn refresh_inner(hwnd: HWND, refetch: Option<HWND>) {
     let mut found: Vec<HWND> = Vec::new();
     EnumWindows(Some(enum_cb), &mut found as *mut _ as LPARAM);
     found.reverse();
-    let Some((mut old, size, cached_size, pins, mut info, user_order)) = with(|s| {
+    let Some((mut old, size, cached_size, mut pins, mut info, user_order, hints)) = with(|s| {
         let size = px(s.dpi, ICON);
         let cached = s.icon_px;
         s.icon_px = size;
         // Kopie statt take: Icon-Abfragen können Nachrichten pumpen, ein Paint
         // dazwischen soll weiter die alte Liste zeichnen statt einer leeren.
-        (s.groups.clone(), size, cached, s.pins.clone(), s.info.clone(), s.order.clone())
+        (s.groups.clone(), size, cached, s.pins.clone(), s.info.clone(), s.order.clone(), s.pin_exe.clone())
     }) else {
         return;
     };
@@ -886,43 +1104,113 @@ unsafe fn refresh_inner(hwnd: HWND, refetch: Option<HWND>) {
     }
     info.retain(|h, _| found.contains(&(*h as HWND)));
     for &h in &order {
-        info.entry(h as usize).or_insert_with(|| {
-            let exe = exe_of(h);
-            let key = window_key(h, exe.as_deref());
-            (exe, key)
+        let e = info.entry(h as usize).or_insert_with(|| {
+            let (exe, package) = process_info(h);
+            WinInfo { exe, package, explicit: None }
         });
+        // Ausdrückliche AUMID frisch lesen (nur die Fenster-Eigenschaft, kein
+        // Prozesszugriff): Apps wie Chrome-PWAs setzen sie erst nach dem Öffnen.
+        e.explicit = crate::apps::window_app_id(h);
     }
 
     // Nach Schlüssel gruppieren, Gruppen in bisheriger Reihenfolge halten.
-    let mut grouped: Vec<(String, Option<String>, Vec<HWND>)> = Vec::new();
+    // (Schlüssel, exe, ausdrückliche AUMID, Fenster)
+    let mut grouped: Vec<(String, Option<String>, bool, Vec<HWND>)> = Vec::new();
     for &h in &order {
-        let (exe, key) = info[&(h as usize)].clone();
+        let i = &info[&(h as usize)];
+        let key = window_key(h, i);
         match grouped.iter_mut().find(|g| g.0 == key) {
-            Some(g) => g.2.push(h),
-            None => grouped.push((key, exe, vec![h])),
+            Some(g) => g.3.push(h),
+            None => grouped.push((key, i.exe.clone(), i.explicit.is_some(), vec![h])),
         }
     }
     grouped.sort_by_key(|g| old.iter().position(|o| o.key == g.0).unwrap_or(usize::MAX));
 
-    // (Platz, Schlüssel, exe, Fenster): angeheftete zuerst, dann der Rest.
-    let mut ordered = Vec::with_capacity(grouped.len() + pins.len());
-    for pin in &pins {
-        match grouped.iter().position(|g| &g.0 == pin || g.1.as_deref().map(exe_key).as_ref() == Some(pin)) {
-            Some(i) => {
-                let (key, exe, windows) = grouped.remove(i);
-                ordered.push((pin.clone(), key, exe, windows));
-            }
-            None => ordered.push((pin.clone(), pin.clone(), pin.strip_prefix("exe:").map(String::from), Vec::new())),
+    // Anheftungen den Gruppen zuordnen: erst genau über den Schlüssel, dann
+    // (für exe-Gruppen und Paket-Apps) über die exe, zuletzt alte exe-Anheftungen
+    // von Apps mit ausdrücklicher AUMID, wenn Windows dieselbe AUMID für die exe
+    // kennt (Verknüpfung im Startmenü).
+    let mut claimed: Vec<Option<usize>> = vec![None; pins.len()];
+    let taken = |claimed: &[Option<usize>], gi: usize| claimed.contains(&Some(gi));
+    for (pi, pin) in pins.iter().enumerate() {
+        claimed[pi] = (0..grouped.len()).find(|&gi| !taken(&claimed, gi) && pin.eq_ignore_ascii_case(&grouped[gi].0));
+    }
+    for (pi, pin) in pins.iter().enumerate() {
+        if claimed[pi].is_none() {
+            claimed[pi] = (0..grouped.len()).find(|&gi| !taken(&claimed, gi) && pin_matches(pin, &grouped[gi].0, grouped[gi].1.as_deref(), grouped[gi].2));
         }
     }
-    ordered.extend(grouped.into_iter().map(|(key, exe, windows)| (key.clone(), key, exe, windows)));
+    for (pi, pin) in pins.iter().enumerate() {
+        let Some(pin_exe) = pin.strip_prefix("exe:").filter(|_| claimed[pi].is_none()) else { continue };
+        claimed[pi] = (0..grouped.len()).find(|&gi| {
+            let g = &grouped[gi];
+            !taken(&claimed, gi)
+                && g.2
+                && g.1.as_deref().is_some_and(|e| normalize_exe(e) == pin_exe)
+                && g.0.strip_prefix("aumid:").is_some_and(|id| {
+                    crate::jumplist::app_ids(None, &[pin_exe.to_string()], crate::start::app_id_for_exe).iter().any(|x| x.eq_ignore_ascii_case(id))
+                })
+        });
+    }
+    // Über die exe gefundene Anheftungen auf den AUMID-Schlüssel umstellen:
+    // Store-Apps überleben so Updates, Apps mit eigener AUMID bleiben eindeutig.
+    let mut renamed: Vec<(String, String, Option<String>)> = Vec::new();
+    for (pi, gi) in claimed.iter().enumerate() {
+        let Some(gi) = *gi else { continue };
+        let (key, exe) = (&grouped[gi].0, &grouped[gi].1);
+        if key.starts_with("aumid:") && pins[pi] != *key && !pins.contains(key) {
+            let hint = exe.as_deref().filter(|e| !is_packaged_exe(e) && !e.ends_with("applicationframehost.exe")).map(normalize_exe);
+            renamed.push((pins[pi].clone(), key.clone(), hint));
+            pins[pi] = key.clone();
+        }
+    }
+
+    // (Platz, Schlüssel, exe, ausdrücklich, Fenster): angeheftete zuerst, dann der Rest.
+    let mut ordered = Vec::with_capacity(grouped.len() + pins.len());
+    let mut used = vec![false; grouped.len()];
+    for (pi, pin) in pins.iter().enumerate() {
+        match claimed[pi] {
+            Some(gi) => {
+                used[gi] = true;
+                let (key, exe, explicit, windows) = grouped[gi].clone();
+                ordered.push((pin.clone(), key, exe, explicit, windows));
+            }
+            None => {
+                let exe = pin.strip_prefix("exe:").map(String::from).or_else(|| hints.get(pin).cloned());
+                ordered.push((pin.clone(), pin.clone(), exe, false, Vec::new()));
+            }
+        }
+    }
+    ordered.extend(grouped.into_iter().zip(used).filter(|(_, u)| !u).map(|((key, exe, explicit, windows), _)| (key.clone(), key, exe, explicit, windows)));
     // Selbst sortierte Reihenfolge hat Vorrang; Neues kommt ans Ende.
+    let mut user_order = user_order;
+    for (from, to, _) in &renamed {
+        for s in user_order.iter_mut().filter(|s| *s == from) {
+            *s = to.clone();
+        }
+    }
     if !user_order.is_empty() {
         ordered.sort_by_key(|g| user_order.iter().position(|s| *s == g.0).unwrap_or(usize::MAX));
     }
+    if !renamed.is_empty() {
+        with(|s| {
+            for (from, to, hint) in &renamed {
+                for p in s.pins.iter_mut().filter(|p| *p == from) {
+                    *p = to.clone();
+                }
+                for o in s.order.iter_mut().filter(|o| *o == from) {
+                    *o = to.clone();
+                }
+                if let Some(h) = hint {
+                    s.pin_exe.insert(to.clone(), h.clone());
+                }
+            }
+            save_pins(&s.pins, &s.pin_exe);
+        });
+    }
 
     let mut groups = Vec::with_capacity(ordered.len());
-    for (slot, key, exe, windows) in ordered {
+    for (slot, key, exe, explicit, windows) in ordered {
         let reuse = cached_size == size && !refetch.is_some_and(|r| windows.contains(&r));
         let cached = if reuse { old.iter().position(|g| g.key == key) } else { None };
         let (icon, owned) = match cached {
@@ -932,7 +1220,7 @@ unsafe fn refresh_inner(hwnd: HWND, refetch: Option<HWND>) {
             }
             None => group_icon(&key, exe.as_deref(), windows.first().copied(), size),
         };
-        groups.push(Group { slot, key, exe, windows, icon, owned });
+        groups.push(Group { slot, key, exe, windows, icon, owned, explicit });
     }
     // Alles, was nicht übernommen wurde, ist weg oder ersetzt.
     for g in old {
@@ -956,6 +1244,10 @@ unsafe fn refresh_inner(hwnd: HWND, refetch: Option<HWND>) {
     }
 }
 
+// Ziehen und Ablegen von Dateien auf App-Buttons (OLE-Ablageziel).
+#[path = "dragdrop.rs"]
+mod dragdrop;
+
 // ---------------------------------------------------------------- Aktionen
 
 unsafe fn activate(h: HWND) {
@@ -975,22 +1267,93 @@ unsafe fn by_z_order(windows: &[HWND]) -> Vec<HWND> {
 
 /// Neue Instanz bzw. angeheftete App starten.
 unsafe fn launch(g: &Group) {
-    // Bekannte exe zuerst: Bei Squirrel-Apps über deren Starter, sonst direkt.
-    if let Some(exe) = g.exe.as_deref().filter(|e| !e.ends_with("applicationframehost.exe")) {
-        match resolve_launch(exe) {
-            Some(LaunchTarget::Squirrel { update, exe_name, .. }) => {
-                shell_open(&update, &format!("--processStart \"{exe_name}\""), SW_SHOWNORMAL);
-                return;
-            }
-            Some(LaunchTarget::Exe(p)) => {
-                shell_open(&p, "", SW_SHOWNORMAL);
-                return;
-            }
-            None => {}
-        }
+    launch_with(g, false, &[]);
+}
+
+/// Wie gestartet wird: über die Paket-/Shell-Aktivierung der AUMID oder die exe.
+#[derive(Debug, PartialEq)]
+enum LaunchVia {
+    Aumid,
+    Exe,
+}
+
+/// Startweg einer Gruppe. Store-Apps (exe in WindowsApps oder unbekannt) immer
+/// über ihre AUMID – so überlebt eine Anheftung Updates; Apps mit eigener
+/// AUMID über den App-Katalog, wenn sie dort steht (dann mit den Argumenten
+/// der Verknüpfung, z. B. Chrome-PWAs), sonst über die exe.
+fn launch_via(key: &str, exe: Option<&str>, in_catalog: impl FnOnce(&str) -> bool) -> Option<LaunchVia> {
+    let exe = exe.filter(|e| !e.ends_with("applicationframehost.exe") && !is_packaged_exe(e));
+    match (key.strip_prefix("aumid:"), exe) {
+        (Some(_), None) => Some(LaunchVia::Aumid),
+        (Some(id), Some(_)) if in_catalog(id) => Some(LaunchVia::Aumid),
+        (_, Some(_)) => Some(LaunchVia::Exe),
+        (None, None) => None,
     }
-    if let Some(id) = g.key.strip_prefix("aumid:") {
-        crate::apps::launch(id);
+}
+
+/// Argumente für Dateien (in Anführungszeichen, durch Leerzeichen getrennt).
+fn quote_args(files: &[String]) -> String {
+    files.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(" ")
+}
+
+/// App starten – `admin` als Administrator ("runas"), `files` zum Öffnen.
+unsafe fn launch_with(g: &Group, admin: bool, files: &[String]) {
+    let verb = if admin { "runas" } else { "open" };
+    let exe = g.exe.as_deref();
+    match launch_via(&g.key, exe, |id| in_apps_folder(id)) {
+        Some(LaunchVia::Aumid) => {
+            let id = g.key.strip_prefix("aumid:").unwrap_or_default();
+            if !files.is_empty() {
+                activate_for_files(id, files);
+            } else if admin {
+                shell_exec("runas", &format!("shell:AppsFolder\\{id}"), "");
+            } else {
+                crate::apps::launch(id);
+            }
+        }
+        Some(LaunchVia::Exe) => {
+            let args = quote_args(files);
+            match exe.and_then(resolve_launch) {
+                Some(LaunchTarget::Squirrel { update, exe_name, .. }) => {
+                    let mut a = format!("--processStart \"{exe_name}\"");
+                    if !files.is_empty() {
+                        a += &format!(" --process-start-args \"{}\"", args.replace('"', "\\\""));
+                    }
+                    shell_exec(verb, &update, &a);
+                }
+                Some(LaunchTarget::Exe(p)) => {
+                    shell_exec(verb, &p, &args);
+                }
+                None => {
+                    // exe nicht (mehr) da: notfalls über die AUMID.
+                    if let Some(id) = g.key.strip_prefix("aumid:") {
+                        crate::apps::launch(id);
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+}
+
+/// Dateien mit einer Paket-App öffnen (IApplicationActivationManager).
+unsafe fn activate_for_files(id: &str, files: &[String]) {
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::*;
+    let pidls: Vec<*mut ITEMIDLIST> = files.iter().map(|f| ILCreateFromPathW(&windows::core::HSTRING::from(f.as_str()))).filter(|p| !p.is_null()).collect();
+    let consts: Vec<*const ITEMIDLIST> = pidls.iter().map(|p| *p as *const _).collect();
+    let result = (|| -> windows::core::Result<()> {
+        let items = SHCreateShellItemArrayFromIDLists(&consts)?;
+        let mgr: IApplicationActivationManager = CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
+        mgr.ActivateForFile(&windows::core::HSTRING::from(id), &items, windows::core::w!("open"))?;
+        Ok(())
+    })();
+    for p in pidls {
+        ILFree(Some(p));
+    }
+    if let Err(e) = result {
+        log(&format!("Dateien nicht mit {id} geöffnet: {e:?}"));
     }
 }
 
@@ -1068,19 +1431,39 @@ fn shorten(s: &str, max: usize) -> String {
     }
 }
 
-/// Anheft-Eintrag, der zu dieser Gruppe gehört (Schlüssel oder exe).
+/// Anheft-Eintrag, der zu dieser Gruppe gehört (Platz, Schlüssel oder – bei
+/// exe-Gruppen und Paket-Apps – exe).
 fn pin_of(g: &Group) -> Option<String> {
-    let exe = g.exe.as_deref().map(exe_key);
-    with(|s| s.pins.iter().find(|p| **p == g.key || exe.as_ref() == Some(*p)).cloned()).flatten()
+    with(|s| s.pins.iter().find(|p| **p == g.slot || pin_matches(p, &g.key, g.exe.as_deref(), g.explicit)).cloned()).flatten()
 }
 
-/// Anheften bevorzugt über die exe (stabil, auch ohne laufendes Fenster
-/// startbar); nur Store-Apps ohne eigene exe über ihre App-Kennung.
-fn pin_key_for(g: &Group) -> String {
-    match g.exe.as_deref().filter(|e| !e.ends_with("applicationframehost.exe")) {
-        Some(exe) => exe_key(exe),
-        None => g.key.clone(),
+/// Anheft-Schlüssel einer Gruppe: Apps mit AUMID (eigene oder aus dem Paket)
+/// über die AUMID – Store-Apps überleben so Updates, Chrome-PWAs bleiben
+/// eigene Buttons; sonst über die exe.
+fn pin_key_for(key: &str, exe: Option<&str>) -> String {
+    if key.starts_with("aumid:") {
+        return key.to_string();
     }
+    match exe.filter(|e| !e.ends_with("applicationframehost.exe")) {
+        Some(exe) => exe_key(exe),
+        None => key.to_string(),
+    }
+}
+
+/// Start-exe, die zu einer AUMID-Anheftung gemerkt wird (nicht bei Store-Apps).
+fn pin_hint_for(g: &Group) -> Option<String> {
+    g.exe.clone().filter(|e| g.key.starts_with("aumid:") && !is_packaged_exe(e) && !e.ends_with("applicationframehost.exe"))
+}
+
+/// Liegt eines der Fenster vorne – auch über ein eigenes Dialogfenster davor
+/// (Besitzer-Kette bis zur Wurzel, wie Windows)?
+unsafe fn front_window_of(windows: &[HWND]) -> Option<HWND> {
+    let fg = GetForegroundWindow();
+    if fg.is_null() {
+        return None;
+    }
+    let root = GetAncestor(fg, GA_ROOTOWNER);
+    windows.iter().copied().find(|&w| w == fg || w == root)
 }
 
 /// Klick auf einen Gruppen-Button wie bei Windows: starten, aktivieren,
@@ -1090,7 +1473,7 @@ unsafe fn click_group(g: &Group) {
         0 => launch(g),
         1 => {
             let h = g.windows[0];
-            if GetForegroundWindow() == h && IsIconic(h) == 0 {
+            if front_window_of(&g.windows).is_some() && IsIconic(h) == 0 {
                 ShowWindowAsync(h, SW_MINIMIZE);
             } else {
                 activate(h);
@@ -1098,9 +1481,8 @@ unsafe fn click_group(g: &Group) {
         }
         _ => {
             let z = by_z_order(&g.windows);
-            let fg = GetForegroundWindow();
             // Ist schon eins vorne, das unterste holen – so rotiert man durch alle.
-            let next = if z.contains(&fg) { z.last() } else { z.first() };
+            let next = if front_window_of(&z).is_some() { z.last() } else { z.first() };
             if let Some(&h) = next {
                 activate(h);
             }
@@ -1168,7 +1550,10 @@ unsafe fn task_menu(hwnd: HWND, g: Group) {
     }
     match menus::popup(hwnd, &items) {
         1 => launch(&g),
-        2 => toggle_key(&pin.unwrap_or_else(|| pin_key_for(&g))),
+        2 => match pin {
+            Some(p) => toggle_key(&p, None, None),
+            None => toggle_key(&pin_key_for(&g.key, g.exe.as_deref()), pin_hint_for(&g), Some(&g.slot)),
+        },
         id @ 100..=999 => match actions.get(id - 100) {
             Some((JumpAction::Dest(d), _)) => crate::destlist::open(d),
             Some((JumpAction::Entry(e), _)) => crate::jumplist::launch(e),
@@ -1494,8 +1879,7 @@ unsafe fn cycle_group(g: &Group, forward: bool) {
         return;
     }
     let z = by_z_order(&g.windows);
-    let fg = GetForegroundWindow();
-    let next = match z.iter().position(|&w| w == fg) {
+    let next = match front_window_of(&z) {
         // Vorwärts: unterstes holen (rotiert), rückwärts: zweitoberstes.
         Some(_) if forward => z.last(),
         Some(_) => z.get(1),
@@ -1871,7 +2255,10 @@ pub fn ui_set_focus(index: usize) {
         }
         let index = index.min(n - 1);
         with(|s| s.kb_focus = Some(index));
-        if GetForegroundWindow() != h {
+        let fg = GetForegroundWindow();
+        if fg != h {
+            // Merken, wem der Fokus gehörte: Esc gibt ihn zurück (wie Windows).
+            with(|s| s.focus_return = fg);
             force_foreground(h);
         }
         SetFocus(h);
@@ -1911,12 +2298,26 @@ unsafe fn focus_key(hwnd: HWND, vk: u16) -> bool {
         VK_RETURN | VK_SPACE => click_element(hwnd, cur, WM_LBUTTONUP),
         VK_APPS | VK_F10 => click_element(hwnd, cur, WM_RBUTTONUP),
         VK_ESCAPE => {
-            with(|s| s.kb_focus = None);
+            let back = with(|s| {
+                s.kb_focus = None;
+                std::mem::replace(&mut s.focus_return, null_mut())
+            })
+            .unwrap_or(null_mut());
             InvalidateRect(hwnd, null(), 0);
+            // Zurück zum Fenster, das vor Win+T aktiv war.
+            if !back.is_null() && IsWindow(back) != 0 && !is_bar(back) {
+                force_foreground(back);
+            }
         }
         _ => return false,
     }
     true
+}
+
+/// Win+T bei Fokus in der Leiste: nächster App-Button nach `cur`, am Ende
+/// wieder der erste. `tasks`: Element-Indizes der App-Buttons.
+fn next_task_focus(tasks: &[usize], cur: usize) -> Option<usize> {
+    tasks.iter().copied().find(|&i| i > cur).or_else(|| tasks.first().copied())
 }
 
 /// Fokusrahmen in Client-Koordinaten (für das Zeichnen).
@@ -2060,7 +2461,7 @@ unsafe fn drag_end(hwnd: HWND) -> bool {
             }
         }
         s.pins = pins;
-        save_pins(&s.pins);
+        save_pins(&s.pins, &s.pin_exe);
     });
     kick(hwnd);
     InvalidateRect(hwnd, null(), 0);
@@ -2122,10 +2523,10 @@ unsafe fn step_anim(hwnd: HWND) -> bool {
                 s.anim.press = None;
             }
         }
-        // Aufmerksamkeit pulsiert dauerhaft – aber nur für Fenster mit Button
-        // (z. B. nicht für ein blinkendes Fenster auf einem anderen Desktop).
-        s.attention.retain(|&w| IsWindow(w) != 0);
-        if s.groups.iter().any(|g| g.windows.iter().any(|w| s.attention.contains(w))) {
+        // Aufmerksamkeit pulsiert etwa sieben Mal, danach leuchtet sie ruhig –
+        // nur für Fenster mit Button (z. B. nicht auf einem anderen Desktop).
+        s.attention.retain(|&(w, _)| IsWindow(w) != 0);
+        if s.groups.iter().any(|g| s.attention_of(&g.windows).is_some_and(attention_pulsing)) {
             moving = true;
         }
         (moving, new_buttons)
@@ -2153,12 +2554,12 @@ unsafe fn sync_glow(hwnd: HWND) {
     let hover_hit = with(|s| if s.hover_hwnd == hwnd { s.hover } else { Hit::None }).unwrap_or(Hit::None);
     let hover = rect_of(hwnd, hover_hit).map(|r| origin + mid(vertical, &r));
     let Some(attention) = with(|s| {
-        s.attention.retain(|&w| IsWindow(w) != 0);
+        s.attention.retain(|&(w, _)| IsWindow(w) != 0);
         let attention = s
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, g)| g.windows.iter().any(|w| s.attention.contains(w)))
+            .filter(|(_, g)| s.attention_of(&g.windows).is_some())
             .filter_map(|(i, _)| l.tasks.get(i).map(|r| origin + mid(vertical, r)))
             .collect::<Vec<i32>>();
         attention
@@ -2241,6 +2642,11 @@ unsafe fn foreground_fullscreen(bar: HWND) -> bool {
     if pid == windows_sys::Win32::System::Threading::GetCurrentProcessId() {
         return false;
     }
+    // Per ITaskbarList2::MarkFullscreenWindow als Vollbild gemeldet (auch ohne
+    // den ganzen Monitor zu bedecken), ggf. über ein Dialogfenster davor.
+    if crate::taskband::marked_fullscreen(fg) || crate::taskband::marked_fullscreen(GetAncestor(fg, GA_ROOTOWNER)) {
+        return true;
+    }
     let mut class = [0u16; 32];
     let n = GetClassNameW(fg, class.as_mut_ptr(), class.len() as i32) as usize;
     let class = String::from_utf16_lossy(&class[..n]);
@@ -2254,6 +2660,17 @@ unsafe fn foreground_fullscreen(bar: HWND) -> bool {
     GetWindowRect(fg, &mut r);
     let m = mi.rcMonitor;
     r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+}
+
+/// Eine App hat per MarkFullscreenWindow ihren Vollbild-Zustand gemeldet.
+pub unsafe fn fullscreen_marks_changed() {
+    update_fullscreen(hwnd());
+    tick_secondaries();
+}
+
+/// Fensterliste gebündelt neu einlesen (z. B. nach ITaskbarList::AddTab/DeleteTab).
+pub unsafe fn schedule_refresh() {
+    SetTimer(hwnd(), TIMER_REFRESH, 50, None);
 }
 
 /// Bei Vollbild ausblenden, danach wieder zeigen – wie die Windows-Leiste.
@@ -2827,7 +3244,7 @@ unsafe fn wants_shown(hwnd: HWND) -> bool {
             || (me && s.kb_focus.is_some())
             || (s.hover_hwnd == hwnd && crate::preview::visible())
             // Eine App blinkt (nur Fenster mit Button, wie beim Pulsieren).
-            || s.groups.iter().any(|g| g.windows.iter().any(|w| s.attention.contains(w)))
+            || s.groups.iter().any(|g| s.attention_of(&g.windows).is_some())
     })
     .unwrap_or(false)
 }
@@ -3167,6 +3584,7 @@ unsafe fn create_secondary(inst: HINSTANCE, rect: RECT) -> Option<HWND> {
     set_pos_secondary(hwnd);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     ensure_work_area(hwnd);
+    dragdrop::register(hwnd);
     Some(hwnd)
 }
 
@@ -3400,10 +3818,10 @@ unsafe fn paint(hwnd: HWND) {
         return;
     }
     let snapshot = with(|s| {
-        let groups: Vec<(String, Vec<HWND>, HICON, bool)> = s
+        let groups: Vec<(String, Vec<HWND>, HICON, Option<f32>)> = s
             .groups
             .iter()
-            .map(|g| (format!("g:{}", g.key), g.windows.clone(), g.icon, g.windows.iter().any(|w| s.attention.contains(w))))
+            .map(|g| (format!("g:{}", g.key), g.windows.clone(), g.icon, s.attention_of(&g.windows).map(attention_level)))
             .collect();
         let dragged = s.drag.as_ref().filter(|d| d.active).and_then(|d| s.groups.iter().find(|g| g.slot == d.slot).map(|g| (format!("g:{}", g.key), d.pos)));
         (s.dpi, s.font, s.icons, s.status.clone(), groups, s.anim.clone(), s.start.elapsed().as_secs_f32(), s.taskmgr_icon, s.cpu, dragged, s.hover_hwnd == hwnd)
@@ -3482,8 +3900,7 @@ unsafe fn paint(hwnd: HWND) {
                 round(dc, &r, mix(ACTIVE, rgb(72, 72, 72), 0.6), radius);
             }
             let active = windows.iter().any(|w| *w == fg);
-            if *attention {
-                let pulse = 0.5 + 0.5 * (t * 6.0).sin();
+            if let Some(pulse) = *attention {
                 round(dc, &r, mix(rgb(92, 58, 18), rgb(160, 96, 20), pulse), radius);
             } else if active {
                 round(dc, &r, mix(ACTIVE, rgb(66, 66, 66), hv(id)), radius);
@@ -3660,11 +4077,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         match wp as u32 {
             // "Blinken von Apps" in Windows abgeschaltet: nicht pulsieren.
             0x8006 if crate::display::flashing() => {
-                with(|s| if !s.attention.contains(&target) { s.attention.push(target) });
+                // Wiederholte Meldungen desselben Blinkens zählen nicht neu.
+                with(|s| if !s.attention.iter().any(|(w, _)| *w == target) { s.attention.push((target, Instant::now())) });
             }
-            // 0x8004 = HSHELL_RUDEAPPACTIVATED (fehlt in windows-sys)
-            HSHELL_WINDOWACTIVATED | 0x8004 => {
-                with(|s| s.attention.retain(|&w| w != target));
+            // 0x8004 = HSHELL_RUDEAPPACTIVATED (fehlt in windows-sys).
+            // HSHELL_REDRAW ohne 0x8000: Die App blinkt nicht mehr (FlashWindowEx
+            // mit FLASHW_STOP) – wie Windows die Hervorhebung beenden.
+            HSHELL_WINDOWACTIVATED | 0x8004 | HSHELL_REDRAW => {
+                let had = with(|s| {
+                    let n = s.attention.len();
+                    s.attention.retain(|(w, _)| *w != target);
+                    n != s.attention.len()
+                })
+                .unwrap_or(false);
+                if had {
+                    sync_glow(hwnd);
+                    kick(hwnd);
+                }
             }
             _ => {}
         }
@@ -3688,6 +4117,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 update_fullscreen(hwnd);
                 sync_glow(hwnd);
                 kick(hwnd);
+            }
+            // Unbekanntes Fenster, das inzwischen auf die Leiste gehört (spät
+            // sichtbar/freigegeben): gebündelt neu einlesen.
+            HSHELL_REDRAW if !is_known(target) && is_task_window(target) => {
+                SetTimer(hwnd, TIMER_REFRESH, 150, None);
             }
             HSHELL_REDRAW if wp & 0x8000 != 0 => kick(hwnd), // Blinken (Aufmerksamkeit)
             _ => {}
@@ -3731,6 +4165,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_ERASEBKGND => 1,
         // Klicks dürfen den Fokus nicht klauen, sonst funktioniert Minimieren per Klick nicht.
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        // Dateien über einer App verweilt: deren Fenster holen.
+        WM_TIMER if dragdrop::on_timer(hwnd, wp) => 0,
         WM_TIMER if wp == TIMER_ANIM => {
             if !step_anim(hwnd) {
                 KillTimer(hwnd, TIMER_ANIM);
@@ -3766,15 +4202,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_BAR_FOCUS => {
-            // Win+T: auf die erste App, sonst auf Start.
+            // Win+T: auf die erste App, sonst auf Start. Liegt der Fokus schon
+            // in der Leiste, weiter zur nächsten App (wie Windows).
             let els = ui_elements();
-            let first = els.iter().position(|e| matches!(e.hit, Hit::Task(_))).or_else(|| els.iter().position(|e| e.hit == Hit::Start));
-            ui_set_focus(first.unwrap_or(0));
+            let tasks: Vec<usize> = els.iter().enumerate().filter(|(_, e)| matches!(e.hit, Hit::Task(_))).map(|(i, _)| i).collect();
+            let cur = ui_focus().filter(|_| GetForegroundWindow() == hwnd);
+            let target = match cur {
+                Some(c) => next_task_focus(&tasks, c),
+                None => tasks.first().copied(),
+            };
+            let target = target.or_else(|| cur).or_else(|| els.iter().position(|e| e.hit == Hit::Start));
+            ui_set_focus(target.unwrap_or(0));
             0
         }
         WM_KEYDOWN | WM_SYSKEYDOWN if focus_key(hwnd, wp as u16) => 0,
         WM_KILLFOCUS => {
-            if with(|s| s.kb_focus.take().is_some()).unwrap_or(false) {
+            // Fokus ging woandershin: nichts mehr zurückzugeben.
+            if with(|s| {
+                s.focus_return = null_mut();
+                s.kb_focus.take().is_some()
+            })
+            .unwrap_or(false)
+            {
                 InvalidateRect(hwnd, null(), 0);
             }
             0
@@ -4073,7 +4522,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Hit::Tray(i) => tray_click(hwnd, i, Click::Left),
                 Hit::Task(i) => {
                     if let Some(g) = with(|s| s.groups.get(i).cloned()).flatten() {
-                        click_group(&g);
+                        // Wie Windows: Umschalt = neue Instanz, Strg+Umschalt = als
+                        // Administrator, Strg = durch die Fenster der App blättern.
+                        let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
+                        let shift = GetKeyState(VK_SHIFT as i32) < 0;
+                        match (ctrl, shift) {
+                            (true, true) => launch_with(&g, true, &[]),
+                            (false, true) => launch(&g),
+                            (true, false) if g.windows.len() > 1 => cycle_group(&g, true),
+                            _ => click_group(&g),
+                        }
                     }
                 }
                 Hit::More => more_menu(hwnd),
@@ -4196,6 +4654,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DESTROY if hwnd != self::hwnd() => {
             // Zweitleiste: nur ihren Platz freigeben.
+            dragdrop::revoke(hwnd);
             let mut abd = appbar_data(hwnd);
             SHAppBarMessage(ABM_REMOVE, &mut abd);
             release_work_area(hwnd);
@@ -4210,6 +4669,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DESTROY => {
             crate::util::log("Beendet");
+            dragdrop::revoke(hwnd);
             // Zweitleisten zuerst schließen (Liste vorher leeren: ihr WM_DESTROY räumt sonst mit).
             let others = secondaries();
             if let Ok(mut v) = SECONDARY.lock() {
@@ -4259,6 +4719,7 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
     }
     BAR_HWND.store(hwnd, Ordering::Relaxed);
     let shell_msg = RegisterWindowMessageW(w16("SHELLHOOK").as_ptr());
+    let (pins, pin_exe) = load_pins();
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
             dpi: 96,
@@ -4267,7 +4728,9 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
             created_msg: RegisterWindowMessageW(w16("TaskbarCreated").as_ptr()),
             groups: Vec::new(),
             info: HashMap::new(),
-            pins: load_pins(),
+            pins,
+            pin_exe,
+            focus_return: null_mut(),
             order: Vec::new(),
             drag: None,
             kb_focus: None,
@@ -4304,7 +4767,10 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
     SetTimer(hwnd, TIMER_KBD, KBD_POLL_MS, None);
     status::watch(hwnd);
     install_win_events();
+    migrate_pins_on_start();
     refresh(hwnd, None);
+    // Dateien auf App-Buttons ziehen (OLE).
+    dragdrop::register(hwnd);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     // set_pos lief noch unsichtbar – jetzt den Arbeitsbereich prüfen.
     ensure_work_area(hwnd);
@@ -4325,6 +4791,129 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TERMINAL_OLD: &str = r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.21.2361.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe";
+    const TERMINAL_NEW: &str = r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.22.10352.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe";
+
+    #[test]
+    fn packaged_exe_normalizes_to_family() {
+        assert_eq!(normalize_exe(TERMINAL_OLD), normalize_exe(TERMINAL_NEW));
+        assert_eq!(normalize_exe(TERMINAL_OLD), r"c:\program files\windowsapps\microsoft.windowsterminal_8wekyb3d8bbwe\windowsterminal.exe");
+        // Squirrel bleibt wie gehabt, gewöhnliche Pfade unverändert.
+        assert_eq!(normalize_exe(r"C:\Users\x\AppData\Local\Discord\app-1.0.9264\Discord.exe"), r"c:\users\x\appdata\local\discord\discord.exe");
+        assert_eq!(normalize_exe(r"C:\Tools\my_app_1.2_x_y\a.exe"), r"c:\tools\my_app_1.2_x_y\a.exe");
+        assert_eq!(package_family("microsoft.outlookforwindows_1.2024.1.0_x64__8wekyb3d8bbwe").as_deref(), Some("microsoft.outlookforwindows_8wekyb3d8bbwe"));
+        assert_eq!(package_family("notapackage"), None);
+        assert_eq!(family_of_exe(TERMINAL_NEW).as_deref(), Some("microsoft.windowsterminal_8wekyb3d8bbwe"));
+        assert!(is_packaged_exe(TERMINAL_NEW));
+    }
+
+    #[test]
+    fn old_pins_file_migrates() {
+        let text = format!("C:\\Windows\\notepad.exe\nexe:{}\naumid:Chrome._crx_abc\tC:\\Chrome\\chrome.exe\nexe:{}\n\n", TERMINAL_OLD.to_lowercase(), TERMINAL_NEW.to_lowercase());
+        let (pins, hints) = parse_pins(&text);
+        // Beide Terminal-Versionen fallen auf denselben Schlüssel (Duplikat weg).
+        assert_eq!(pins.len(), 3);
+        assert_eq!(pins[0], r"exe:c:\windows\notepad.exe");
+        assert_eq!(pins[1], format!("exe:{}", normalize_exe(TERMINAL_OLD)));
+        assert_eq!(hints.get("aumid:Chrome._crx_abc").map(String::as_str), Some(r"c:\chrome\chrome.exe"));
+        // Rundreise durchs Dateiformat.
+        assert_eq!(parse_pins(&format_pins(&pins, &hints)), (pins.clone(), hints.clone()));
+
+        let mut pins = pins;
+        let ids = vec!["Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_string(), "Other_x!App".to_string()];
+        assert!(migrate_packaged_pins(&mut pins, &ids));
+        assert_eq!(pins[1], "aumid:Microsoft.WindowsTerminal_8wekyb3d8bbwe!App");
+        // Mehrdeutig (zwei Apps im Paket): bleibt beim exe-Schlüssel.
+        let mut amb = vec![format!("exe:{}", normalize_exe(TERMINAL_OLD))];
+        let two = vec!["Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_string(), "Microsoft.WindowsTerminal_8wekyb3d8bbwe!Preview".to_string()];
+        assert!(!migrate_packaged_pins(&mut amb, &two));
+    }
+
+    #[test]
+    fn group_keys_follow_windows() {
+        let chrome = Some(r"c:\chrome\chrome.exe");
+        assert_eq!(key_of(Some("Chrome._crx_abc"), None, chrome).as_deref(), Some("aumid:Chrome._crx_abc"));
+        assert_eq!(key_of(None, Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"), Some(TERMINAL_NEW)).as_deref(), Some("aumid:Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"));
+        assert_eq!(key_of(None, None, chrome).as_deref(), Some(r"exe:c:\chrome\chrome.exe"));
+        assert_eq!(key_of(None, None, None), None);
+    }
+
+    #[test]
+    fn pins_match_by_key_for_explicit_aumid() {
+        let chrome = Some(r"c:\chrome\chrome.exe");
+        let chrome_pin = r"exe:c:\chrome\chrome.exe";
+        // exe-Gruppe: exe zählt.
+        assert!(pin_matches(chrome_pin, chrome_pin, chrome, false));
+        // PWA mit eigener AUMID: nicht über Chromes exe-Anheftung.
+        assert!(!pin_matches(chrome_pin, "aumid:Chrome._crx_abc", chrome, true));
+        assert!(pin_matches("aumid:chrome._crx_abc", "aumid:Chrome._crx_abc", chrome, true));
+        // Paket-App: alte exe-Anheftung (andere Version) passt über die Familie.
+        let old_pin = exe_key(TERMINAL_OLD);
+        assert!(pin_matches(&old_pin, "aumid:Microsoft.WindowsTerminal_8wekyb3d8bbwe!App", Some(&TERMINAL_NEW.to_lowercase()), false));
+        // AUMID-Anheftung passt nie über die exe.
+        assert!(!pin_matches("aumid:X", r"exe:c:\x.exe", Some(r"c:\x.exe"), false));
+        assert!(!pin_matches(chrome_pin, "hwnd:42", chrome, false));
+    }
+
+    #[test]
+    fn pin_keys_and_launch_paths() {
+        let term = TERMINAL_NEW.to_lowercase();
+        assert_eq!(pin_key_for("aumid:Microsoft.WindowsTerminal_8wekyb3d8bbwe!App", Some(&term)), "aumid:Microsoft.WindowsTerminal_8wekyb3d8bbwe!App");
+        assert_eq!(pin_key_for(r"exe:c:\x.exe", Some(r"c:\x.exe")), r"exe:c:\x.exe");
+        assert_eq!(pin_key_for("aumid:A", Some(r"c:\windows\system32\applicationframehost.exe")), "aumid:A");
+        // Paket-Apps immer über die AUMID, auch wenn die exe bekannt ist.
+        assert_eq!(launch_via("aumid:T!App", Some(&term), |_| false), Some(LaunchVia::Aumid));
+        assert_eq!(launch_via("aumid:Chrome._crx_abc", Some(r"c:\chrome\chrome.exe"), |_| true), Some(LaunchVia::Aumid));
+        assert_eq!(launch_via("aumid:Custom", Some(r"c:\custom.exe"), |_| false), Some(LaunchVia::Exe));
+        assert_eq!(launch_via(r"exe:c:\x.exe", Some(r"c:\x.exe"), |_| true), Some(LaunchVia::Exe));
+        assert_eq!(launch_via("hwnd:1", None, |_| true), None);
+        assert_eq!(quote_args(&[r"C:\a b.txt".into(), r"C:\c.txt".into()]), r#""C:\a b.txt" "C:\c.txt""#);
+    }
+
+    #[test]
+    fn start_menu_sees_aumid_pins_by_exe() {
+        let pins = vec!["aumid:Chrome".to_string()];
+        let hints: HashMap<String, String> = [("aumid:Chrome".to_string(), r"c:\chrome\chrome.exe".to_string())].into();
+        assert_eq!(pin_for_exe(&pins, &hints, r"C:\Chrome\chrome.exe").as_deref(), Some("aumid:Chrome"));
+        assert_eq!(pin_for_exe(&pins, &hints, r"C:\other.exe"), None);
+    }
+
+    #[test]
+    fn new_pin_goes_to_end_of_pinned_block() {
+        let pins = vec!["exe:a".to_string(), "exe:b".to_string()];
+        let mut order: Vec<String> = ["exe:a", "exe:b", "run1", "exe:new-old-slot", "run2"].iter().map(|s| s.to_string()).collect();
+        insert_pinned_slot(&mut order, &pins, "aumid:New", Some("exe:new-old-slot"));
+        assert_eq!(order, ["exe:a", "exe:b", "aumid:New", "run1", "run2"]);
+        // Keine eigene Reihenfolge: nichts zu tun (angeheftete stehen ohnehin vorn).
+        let mut empty = Vec::new();
+        insert_pinned_slot(&mut empty, &pins, "x", None);
+        assert!(empty.is_empty());
+        // Noch nichts angeheftet: ganz nach vorn.
+        let mut o: Vec<String> = vec!["run".into()];
+        insert_pinned_slot(&mut o, &[], "x", None);
+        assert_eq!(o, ["x", "run"]);
+    }
+
+    #[test]
+    fn flashing_pulses_then_stays_lit() {
+        assert!(attention_level(0.0) < 0.01);
+        assert!((attention_level(FLASH_PERIOD / 2.0) - 1.0).abs() < 0.01);
+        assert!(attention_pulsing(6.5 * FLASH_PERIOD));
+        assert!(!attention_pulsing(7.0 * FLASH_PERIOD));
+        assert_eq!(attention_level(60.0), 1.0);
+    }
+
+    #[test]
+    fn win_t_moves_to_next_button() {
+        let tasks = [3, 4, 7];
+        assert_eq!(next_task_focus(&tasks, 3), Some(4));
+        assert_eq!(next_task_focus(&tasks, 4), Some(7));
+        assert_eq!(next_task_focus(&tasks, 7), Some(3));
+        // Fokus auf Start (vor den Apps) → erste App.
+        assert_eq!(next_task_focus(&tasks, 1), Some(3));
+        assert_eq!(next_task_focus(&[], 1), None);
+    }
 
     fn non_empty(r: &RECT) -> bool {
         r.right > r.left
