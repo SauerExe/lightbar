@@ -147,6 +147,7 @@ mod tests {
         ("bar.rs", include_str!("bar.rs")),
         ("calendar.rs", include_str!("calendar.rs")),
         ("chat.rs", include_str!("chat.rs")),
+        ("destlist.rs", include_str!("destlist.rs")),
         ("display.rs", include_str!("display.rs")),
         ("jumplist.rs", include_str!("jumplist.rs")),
         ("main.rs", include_str!("main.rs")),

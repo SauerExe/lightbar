@@ -151,41 +151,6 @@ fn is_noise(path: &str) -> bool {
     NOISE.iter().any(|n| p.contains(n))
 }
 
-/// "Zuletzt verwendet" aus der Sprungliste einer App (dieselbe Liste, die
-/// Windows im Rechtsklick-Menü der Taskleiste zeigt), über die dokumentierte
-/// `IApplicationDocumentLists`-Schnittstelle. Bei wenig Verlauf werden die
-/// häufig verwendeten Einträge ergänzt. Rückgabe: (Anzeigename, Pfad).
-pub fn jump_list(app_id: &str, max: u32) -> Vec<(String, String)> {
-    unsafe { jump_list_inner(app_id, max).unwrap_or_default() }
-}
-
-unsafe fn jump_list_inner(app_id: &str, max: u32) -> windows::core::Result<Vec<(String, String)>> {
-    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-    use windows::Win32::UI::Shell::Common::IObjectArray;
-    let lists: IApplicationDocumentLists = CoCreateInstance(&ApplicationDocumentLists, None, CLSCTX_INPROC_SERVER)?;
-    lists.SetAppID(&HSTRING::from(app_id))?;
-    let mut out: Vec<(String, String)> = Vec::new();
-    for kind in [ADLT_RECENT, ADLT_FREQUENT] {
-        let Ok(array) = lists.GetList::<IObjectArray>(kind, max) else { continue };
-        for i in 0..array.GetCount().unwrap_or(0) {
-            // Einträge sind Shell-Elemente; Aufgaben-Links ("Neues Fenster") gehören
-            // zu den benutzerdefinierten Kategorien und kommen hier nicht vor.
-            let Ok(item) = array.GetAt::<IShellItem>(i) else { continue };
-            let name = display(&item, SIGDN_NORMALDISPLAY);
-            let path = display(&item, SIGDN_FILESYSPATH).or_else(|| display(&item, SIGDN_DESKTOPABSOLUTEPARSING));
-            if let (Some(name), Some(path)) = (name, path) {
-                if !out.iter().any(|(_, p)| *p == path) {
-                    out.push((name, path));
-                }
-            }
-            if out.len() >= max as usize {
-                return Ok(out);
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// AppUserModelID eines Fensters – danach gruppiert Windows die Taskleiste.
 /// Viele klassische Programme setzen keine; dann gilt deren exe.
 pub fn window_app_id(hwnd: *mut core::ffi::c_void) -> Option<String> {
@@ -358,5 +323,28 @@ unsafe fn premultiply(bmp: HBITMAP) {
         for c in &mut p[..3] {
             *c = (*c as u32 * a / 255) as u8;
         }
+    }
+}
+
+/// Elemente eines Shell-Ordners (z. B. Schnellzugriff), höchstens `max`.
+/// Rückgabe: (Anzeigename, Shell-Pfad).
+pub fn folder_items(parsing: &str, max: usize) -> Vec<(String, String)> {
+    unsafe {
+        let run = || -> windows::core::Result<Vec<(String, String)>> {
+            let folder: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(parsing), None::<&IBindCtx>)?;
+            let items: IEnumShellItems = folder.BindToHandler(None::<&IBindCtx>, &BHID_EnumItems)?;
+            let mut out = Vec::new();
+            while out.len() < max {
+                let mut batch: [Option<IShellItem>; 1] = [None];
+                let mut fetched = 0u32;
+                let _ = items.Next(&mut batch, Some(&mut fetched));
+                let Some(item) = (fetched > 0).then(|| batch[0].take()).flatten() else { break };
+                if let (Some(n), Some(p)) = (display(&item, SIGDN_NORMALDISPLAY), display(&item, SIGDN_DESKTOPABSOLUTEPARSING)) {
+                    out.push((n, p));
+                }
+            }
+            Ok(out)
+        };
+        run().unwrap_or_default()
     }
 }

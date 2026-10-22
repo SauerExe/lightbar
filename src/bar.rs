@@ -933,43 +933,70 @@ unsafe fn launch(g: &Group) {
     }
 }
 
-/// Sprungliste ("Zuletzt verwendet") einer Gruppe: über ihre AppUserModelID
-/// oder – bei Desktop-Apps ohne eigene – über die ID im App-Katalog.
-/// Im Präsentationsmodus leer (Dateinamen sind privat).
-/// Eine Sprunglisten-Kategorie ins Menü: Überschrift, Einträge (IDs ab 200 in
-/// der Reihenfolge von `labels`), Trennlinien.
-fn push_jump<'a>(items: &mut Vec<Item<'a>>, c: &crate::jumplist::Category, title: &'a str, labels: &'a [String], n: &mut usize) {
-    items.push(Item::Label(title));
-    for e in &c.entries {
-        if e.title.is_empty() {
-            items.push(Item::Sep);
-        } else {
-            items.push(Item::Cmd(200 + *n, &labels[*n]));
+/// Kennungen, unter denen Windows die Sprunglisten einer Gruppe ablegt:
+/// ausdrückliche AppUserModelID (Fenster bzw. Anheft-Eintrag), sonst aus der
+/// exe abgeleitet (Explorer, App-Katalog inkl. Squirrel-Update.exe,
+/// Standard-Kennung aus dem Pfad). Bei laufenden Fenstern zählt auch der
+/// echte exe-Pfad (bei Squirrel-Apps mit Versionsordner).
+unsafe fn app_ids_of(g: &Group) -> Vec<String> {
+    let aumid = g.key.strip_prefix("aumid:");
+    let mut exes: Vec<String> = Vec::new();
+    if aumid.is_none() {
+        exes.extend(g.windows.iter().filter_map(|&h| exe_of(h)));
+        exes.extend(g.exe.clone());
+        exes.dedup();
+    }
+    crate::jumplist::app_ids(aumid, &exes, crate::start::app_id_for_exe)
+}
+
+/// Was hinter einem Sprunglisten-Eintrag im Menü steckt.
+enum JumpAction<'a> {
+    Dest(&'a crate::destlist::Dest),
+    Entry(&'a crate::jumplist::Entry),
+}
+
+/// Abschnitte ins Menü: Überschrift, Einträge (IDs ab 100 in der Reihenfolge
+/// von `actions`/`labels`), Trennlinie danach.
+fn push_sections<'a>(items: &mut Vec<Item<'a>>, sections: &'a [crate::jumplist::Section], labels: &'a [String]) {
+    use crate::jumplist::{Known, Section};
+    let mut n = 0;
+    for s in sections {
+        let (title, seps): (&str, Vec<bool>) = match s {
+            Section::Dests(k, l) => (
+                match k {
+                    Known::Pinned => t!("Angeheftet", "Pinned"),
+                    Known::Recent => t!("Zuletzt verwendet", "Recent"),
+                    Known::Frequent => t!("Häufig", "Frequent"),
+                },
+                vec![false; l.len()],
+            ),
+            Section::Custom(name, l) => (name.as_str(), l.iter().map(|e| e.title.is_empty()).collect()),
+            Section::Tasks(l) => (t!("Aufgaben", "Tasks"), l.iter().map(|e| e.title.is_empty()).collect()),
+        };
+        items.push(Item::Label(title));
+        for sep in seps {
+            if sep {
+                items.push(Item::Sep);
+            } else {
+                items.push(Item::Cmd(100 + n, &labels[n]));
+            }
+            n += 1;
         }
-        *n += 1;
+        items.push(Item::Sep);
     }
-    items.push(Item::Sep);
 }
 
-/// Kennungen, unter denen Windows die Sprunglisten einer App ablegt: ihre
-/// AppUserModelID oder – ohne eine – die Startmenü-Kennung bzw. der Pfad der exe.
-fn app_ids_of(g: &Group) -> Vec<String> {
-    if let Some(id) = g.key.strip_prefix("aumid:") {
-        return vec![id.to_string()];
+/// Alle Einträge der Abschnitte in Menü-Reihenfolge (Index = ID - 100).
+fn jump_actions(sections: &[crate::jumplist::Section]) -> Vec<(JumpAction<'_>, String)> {
+    use crate::jumplist::Section;
+    let mut out = Vec::new();
+    for s in sections {
+        match s {
+            Section::Dests(_, l) => out.extend(l.iter().map(|d| (JumpAction::Dest(d), shorten(&d.name, 48)))),
+            Section::Custom(_, l) | Section::Tasks(l) => out.extend(l.iter().map(|e| (JumpAction::Entry(e), shorten(&e.title, 48)))),
+        }
     }
-    let exe = g.exe.clone();
-    [exe.as_deref().and_then(crate::start::app_id_for_exe), exe].into_iter().flatten().collect()
-}
-
-fn jump_list_of(g: &Group) -> Vec<(String, String)> {
-    if crate::settings::get().presentation {
-        return Vec::new();
-    }
-    let id = match g.key.strip_prefix("aumid:") {
-        Some(id) => Some(id.to_string()),
-        None => g.exe.as_deref().and_then(crate::start::app_id_for_exe),
-    };
-    id.map(|id| crate::apps::jump_list(&id, 8)).unwrap_or_default()
+    out
 }
 
 fn shorten(s: &str, max: usize) -> String {
@@ -1051,30 +1078,14 @@ unsafe fn task_menu(hwnd: HWND, g: Group) {
     };
     let pin = pin_of(&g);
     let pinned = pin.is_some();
-    let recent = jump_list_of(&g);
-    let recent_labels: Vec<String> = recent.iter().map(|(n, _)| shorten(n, 48)).collect();
-    // App-eigene Einträge wie bei Windows: eigene Kategorien oben, Aufgaben
-    // ("Neues Fenster" …) unten. Im Präsentationsmodus nur die Aufgaben –
-    // eigene Kategorien enthalten oft Persönliches ("Zuletzt geschlossen").
-    let presenting = crate::settings::get().presentation;
-    let custom: Vec<crate::jumplist::Category> = crate::jumplist::load(&app_ids_of(&g)).into_iter().filter(|c| !presenting || c.name.is_empty()).collect();
-    let entries: Vec<&crate::jumplist::Entry> = custom.iter().flat_map(|c| c.entries.iter()).collect();
-    let entry_labels: Vec<String> = entries.iter().map(|e| shorten(&e.title, 48)).collect();
+    // Sprungliste wie bei Windows: Angeheftet, Kategorien der App (Zuletzt
+    // verwendet/Häufig/eigene), Aufgaben. Im Präsentationsmodus nur Aufgaben –
+    // der Rest enthält oft Persönliches.
+    let sections = crate::jumplist::sections(&app_ids_of(&g), crate::settings::get().presentation);
+    let actions = jump_actions(&sections);
+    let labels: Vec<String> = actions.iter().map(|(_, l)| l.clone()).collect();
     let mut items = Vec::new();
-    let mut n = 0;
-    for c in custom.iter().filter(|c| !c.name.is_empty()) {
-        push_jump(&mut items, c, &c.name, &entry_labels, &mut n);
-    }
-    if !recent.is_empty() {
-        items.push(Item::Label(t!("Zuletzt verwendet", "Recent")));
-        for (i, label) in recent_labels.iter().enumerate() {
-            items.push(Item::Cmd(100 + i, label));
-        }
-        items.push(Item::Sep);
-    }
-    for c in custom.iter().filter(|c| c.name.is_empty()) {
-        push_jump(&mut items, c, t!("Aufgaben", "Tasks"), &entry_labels, &mut n);
-    }
+    push_sections(&mut items, &sections, &labels);
     if !title.is_empty() && title != name {
         items.push(Item::Label(&title));
         items.push(Item::Sep);
@@ -1097,16 +1108,11 @@ unsafe fn task_menu(hwnd: HWND, g: Group) {
     match menus::popup(hwnd, &items) {
         1 => launch(&g),
         2 => toggle_key(&pin.unwrap_or_else(|| pin_key_for(&g))),
-        id @ 100..=199 => {
-            if let Some((_, path)) = recent.get(id - 100) {
-                shell_open(path, "", SW_SHOWNORMAL);
-            }
-        }
-        id @ 200..=999 => {
-            if let Some(e) = entries.get(id - 200) {
-                crate::jumplist::launch(e);
-            }
-        }
+        id @ 100..=999 => match actions.get(id - 100) {
+            Some((JumpAction::Dest(d), _)) => crate::destlist::open(d),
+            Some((JumpAction::Entry(e), _)) => crate::jumplist::launch(e),
+            None => {}
+        },
         3 => {
             for &w in &g.windows {
                 PostMessageW(w, WM_CLOSE, 0, 0);
