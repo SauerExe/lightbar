@@ -81,8 +81,8 @@ pub struct TrayIcon {
 
 thread_local! {
     static ICONS: RefCell<Vec<TrayIcon>> = const { RefCell::new(Vec::new()) };
-    /// Kleingeschriebene exe-Pfade der hervorgehobenen Icons, plus Abfragezähler.
-    static PROMOTED: RefCell<(Vec<String>, u32)> = const { RefCell::new((Vec::new(), 0)) };
+    /// Kleingeschriebene exe-Pfade der hervorgehobenen Icons.
+    static PROMOTED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Known-Folder-GUIDs, mit denen Windows Pfade in NotifyIconSettings abkürzt.
@@ -144,7 +144,59 @@ unsafe fn read_promoted() -> Vec<String> {
 
 fn is_promoted(exe: Option<&str>) -> bool {
     let Some(exe) = exe else { return false };
-    PROMOTED.with(|p| p.borrow().0.iter().any(|e| e == exe))
+    PROMOTED.with(|p| p.borrow().iter().any(|e| e == exe))
+}
+
+/// Hervorhebungs-Einstellung (neu) lesen und auf alle Icons anwenden. Beim
+/// Start vor `announce`, damit die Icons gleich am richtigen Platz landen
+/// statt erst im Überlauf; danach bei jeder Änderung (`watch_promoted`).
+pub unsafe fn load_promoted() {
+    let list = read_promoted();
+    PROMOTED.with(|p| *p.borrow_mut() = list);
+    ICONS.with(|cell| {
+        for i in cell.borrow_mut().iter_mut() {
+            i.promoted = is_promoted(i.exe.as_deref());
+        }
+    });
+    let ov = HWND_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed);
+    if !ov.is_null() && IsWindowVisible(ov) != 0 {
+        InvalidateRect(ov, null(), 0);
+    }
+}
+
+/// HKCU\Control Panel\NotifyIconSettings beobachten (samt Unterschlüsseln:
+/// je App einer, IsPromoted darin) und bei Änderungen `notify` rufen – statt
+/// die Registry regelmäßig abzufragen. Wie `display::watch` auf eigenem Thread.
+pub fn watch_promoted(notify: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || unsafe {
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+        let path = w16(r"Control Panel\NotifyIconSettings");
+        let mut key: HKEY = null_mut();
+        // Frisches Profil: Den Schlüssel legt Explorer erst mit dem ersten Icon an.
+        while RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_NOTIFY, &mut key) != 0 {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+        notify();
+        let event = CreateEventW(null(), 0, 0, null());
+        if event.is_null() {
+            RegCloseKey(key);
+            return;
+        }
+        loop {
+            let filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET;
+            if RegNotifyChangeKeyValue(key, 1, filter, event, 1) != 0 {
+                break;
+            }
+            if WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0 {
+                break;
+            }
+            // Die Einstellungen-App schreibt oft mehrere Werte nacheinander.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            notify();
+        }
+        CloseHandle(event);
+        RegCloseKey(key);
+    });
 }
 
 unsafe fn owner_exe(owner: HWND) -> Option<String> {
@@ -274,6 +326,47 @@ pub unsafe fn handle_copydata(lp: LPARAM) -> Option<LRESULT> {
     Some(ok as LRESULT)
 }
 
+/// Tray-Nachricht zusätzlich an Explorer weiterreichen. Explorer führt so
+/// seine eigene Kopie der Icons und macht aus Sprechblasen (NIF_INFO)
+/// Windows-Benachrichtigungen – das kann nur Explorer. Seine Leiste ist
+/// versteckt (`shell::active`), seine Kopie also unsichtbar; ohne Übernahme
+/// (Explorers Leiste sichtbar) wird nichts weitergereicht, sonst stünden die
+/// Icons doppelt da. Die App bekommt weiter unsere Antwort, nicht Explorers.
+///
+/// Gesendet wird auf einem eigenen Thread in der Reihenfolge des Eingangs:
+/// Ein hängender Explorer bremst so weder die Leiste noch die App.
+pub unsafe fn forward_to_explorer(ours: HWND, wp: WPARAM, lp: LPARAM) {
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::{Mutex, OnceLock};
+    static QUEUE: OnceLock<Mutex<Sender<(isize, usize, usize, Vec<u8>)>>> = OnceLock::new();
+    if !crate::shell::active() {
+        return;
+    }
+    let cds = &*(lp as *const COPYDATASTRUCT);
+    if cds.lpData.is_null() || cds.cbData == 0 {
+        return;
+    }
+    let data = std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize).to_vec();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = channel::<(isize, usize, usize, Vec<u8>)>();
+        std::thread::spawn(move || unsafe {
+            for (ours, wp, kind, mut data) in rx {
+                let ex = explorer_tray(ours as HWND);
+                if ex.is_null() {
+                    continue;
+                }
+                let cds = COPYDATASTRUCT { dwData: kind, cbData: data.len() as u32, lpData: data.as_mut_ptr() as *mut c_void };
+                let mut result = 0usize;
+                SendMessageTimeoutW(ex, WM_COPYDATA, wp, &cds as *const _ as LPARAM, SMTO_ABORTIFHUNG, 2000, &mut result);
+            }
+        });
+        Mutex::new(tx)
+    });
+    if let Ok(tx) = queue.lock() {
+        let _ = tx.send((ours as isize, wp, cds.dwData, data));
+    }
+}
+
 /// Explorers eigenes Shell_TrayWnd (nicht unseres).
 pub unsafe fn explorer_tray(ours: HWND) -> HWND {
     let class = w16("Shell_TrayWnd");
@@ -286,31 +379,50 @@ pub unsafe fn explorer_tray(ours: HWND) -> HWND {
     }
 }
 
-/// Sekundentakt: verwaiste Icons entfernen (Absturz ohne NIM_DELETE) und
-/// alle 5 s die Hervorhebungs-Einstellung neu lesen.
+/// Sicherheitsnetz (aus dem langsamen Takt der Leiste): verwaiste Icons
+/// entfernen (Absturz ohne NIM_DELETE). Die Hervorhebung meldet `watch_promoted`.
 pub unsafe fn tick() {
-    let reload = PROMOTED.with(|p| {
-        let mut p = p.borrow_mut();
-        p.1 += 1;
-        p.1 % 5 == 1
-    });
-    if reload {
-        let list = read_promoted();
-        PROMOTED.with(|p| p.borrow_mut().0 = list);
-    }
     ICONS.with(|cell| {
-        let mut icons = cell.borrow_mut();
-        icons.retain(|i| {
+        cell.borrow_mut().retain(|i| {
             let alive = IsWindow(i.owner) != 0;
             if !alive && !i.icon.is_null() {
                 DestroyIcon(i.icon);
             }
             alive
         });
-        for i in icons.iter_mut() {
-            i.promoted = is_promoted(i.exe.as_deref());
+    });
+}
+
+/// Icon an `index`, falls sein Fenster noch lebt: (Besitzer, uid, Callback, Version).
+/// Ist der Besitzer weg (Absturz ohne NIM_DELETE), fliegt das Icon sofort
+/// raus und Leiste samt Überlauf werden neu gezeichnet – wie bei Explorer,
+/// wo tote Icons beim Darüberfahren verschwinden.
+unsafe fn live(index: usize) -> Option<(HWND, u32, u32, u32)> {
+    let (owner, uid, callback, version) = ICONS.with(|cell| cell.borrow().get(index).map(|i| (i.owner, i.uid, i.callback, i.version)))?;
+    if IsWindow(owner) != 0 {
+        return Some((owner, uid, callback, version));
+    }
+    ICONS.with(|cell| {
+        let mut icons = cell.borrow_mut();
+        if index < icons.len() {
+            let icon = icons.remove(index);
+            if !icon.icon.is_null() {
+                DestroyIcon(icon.icon);
+            }
         }
     });
+    let ov = HWND_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed);
+    if !ov.is_null() && IsWindowVisible(ov) != 0 {
+        if overflow().is_empty() {
+            hide_overflow();
+        } else {
+            InvalidateRect(ov, null(), 0);
+        }
+    }
+    for bar in crate::bar::all_bars() {
+        InvalidateRect(bar, null(), 0);
+    }
+    None
 }
 
 fn listed(promoted: bool) -> Vec<(usize, HICON)> {
@@ -354,20 +466,82 @@ pub fn tip(index: usize) -> String {
     ICONS.with(|cell| cell.borrow().get(index).map(|i| i.tip.clone()).unwrap_or_default())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Click {
     Left,
     Right,
     Double,
+    /// Enter/Leertaste auf dem Icon im Tastaturfokus.
+    Key,
+    /// Kontextmenü-Taste bzw. Umschalt+F10 im Tastaturfokus.
+    KeyMenu,
+}
+
+const NIN_KEYSELECT: u32 = WM_USER + 1;
+
+/// Nachrichten an die App, wie Explorer sie schickt. `after_double`: Das ist
+/// das Loslassen nach einem Doppelklick – dort kommt kein weiteres
+/// WM_LBUTTONDOWN (die App hat schon WM_LBUTTONDBLCLK bekommen), nur das
+/// Loslassen samt NIN_SELECT. Qt-Apps z. B. erwarten genau dieses eine
+/// NIN_SELECT nach dem Doppelklick und verwerfen es; ein zusätzliches würde
+/// als neuer Klick zählen.
+fn messages(kind: Click, version: u32, after_double: bool) -> Vec<u32> {
+    let v3 = version >= 3;
+    let mut out = Vec::new();
+    match kind {
+        Click::Left => {
+            if !after_double {
+                out.push(WM_LBUTTONDOWN);
+            }
+            out.push(WM_LBUTTONUP);
+            if v3 {
+                out.push(NIN_SELECT);
+            }
+        }
+        Click::Double => out.push(WM_LBUTTONDBLCLK),
+        Click::Right => {
+            out.extend([WM_RBUTTONDOWN, WM_RBUTTONUP]);
+            if v3 {
+                out.push(WM_CONTEXTMENU);
+            }
+        }
+        // Ältere Apps (vor Version 3) kennen keine Tastatur-Meldungen: Klick nachbilden.
+        Click::Key if v3 => out.push(NIN_KEYSELECT),
+        Click::Key => out.extend([WM_LBUTTONDOWN, WM_LBUTTONUP]),
+        Click::KeyMenu if v3 => out.push(WM_CONTEXTMENU),
+        Click::KeyMenu => out.extend([WM_RBUTTONDOWN, WM_RBUTTONUP]),
+    }
+    out
+}
+
+/// wParam/lParam einer Callback-Nachricht: ab Version 4 mit Ankerpunkt und
+/// uid im oberen Wort, davor uid und Nachricht.
+fn encode(version: u32, uid: u32, anchor: POINT, msg: u32) -> (WPARAM, LPARAM) {
+    if version >= 4 {
+        let wp = (anchor.x as u16 as usize) | ((anchor.y as u16 as usize) << 16);
+        let lp = (msg & 0xffff) as isize | ((uid as isize & 0xffff) << 16);
+        (wp, lp)
+    } else {
+        (uid as usize, msg as isize)
+    }
+}
+
+thread_local! {
+    /// Letzter Doppelklick: (Icon-Index, GetTickCount) – das folgende Loslassen
+    /// gehört noch zu ihm.
+    static LAST_DOUBLE: std::cell::Cell<Option<(usize, u32)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Klick so an die App melden, wie Explorer es tut. `anchor` = Bildschirmpunkt.
 pub unsafe fn click(index: usize, kind: Click, anchor: POINT) {
-    let Some((owner, uid, callback, version)) =
-        ICONS.with(|cell| cell.borrow().get(index).map(|i| (i.owner, i.uid, i.callback, i.version)))
-    else {
-        return;
-    };
+    let now = windows_sys::Win32::System::SystemInformation::GetTickCount();
+    let last = LAST_DOUBLE.with(|c| c.take());
+    if kind == Click::Double {
+        LAST_DOUBLE.with(|c| c.set(Some((index, now))));
+    }
+    let after_double = kind == Click::Left
+        && last.is_some_and(|(i, t)| i == index && now.wrapping_sub(t) <= windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime());
+    let Some((owner, uid, callback, version)) = live(index) else { return };
     if callback == 0 {
         return;
     }
@@ -375,56 +549,20 @@ pub unsafe fn click(index: usize, kind: Click, anchor: POINT) {
     GetWindowThreadProcessId(owner, &mut pid);
     // Die App darf ihr Menü/Fenster in den Vordergrund holen.
     AllowSetForegroundWindow(pid);
-    let send = |msg: u32| {
-        let (wp, lp) = if version >= 4 {
-            let wp = (anchor.x as u16 as usize) | ((anchor.y as u16 as usize) << 16);
-            let lp = (msg & 0xffff) as isize | ((uid as isize & 0xffff) << 16);
-            (wp, lp)
-        } else {
-            (uid as usize, msg as isize)
-        };
+    for msg in messages(kind, version, after_double) {
+        let (wp, lp) = encode(version, uid, anchor, msg);
         SendNotifyMessageW(owner, callback, wp, lp);
-    };
-    match kind {
-        Click::Left => {
-            send(WM_LBUTTONDOWN);
-            send(WM_LBUTTONUP);
-            if version >= 4 {
-                send(NIN_SELECT);
-            }
-        }
-        Click::Double => {
-            send(WM_LBUTTONDBLCLK);
-            if version >= 4 {
-                send(NIN_SELECT);
-            }
-        }
-        Click::Right => {
-            send(WM_RBUTTONDOWN);
-            send(WM_RBUTTONUP);
-            if version >= 3 {
-                send(WM_CONTEXTMENU);
-            }
-        }
     }
 }
 
 /// Maus über dem Icon: der App melden, wie Explorer es tut (manche Apps
 /// zeigen daraufhin eigene Infos oder aktualisieren ihren Tooltip).
 pub unsafe fn hover(index: usize, anchor: POINT) {
-    let Some((owner, uid, callback, version)) =
-        ICONS.with(|cell| cell.borrow().get(index).map(|i| (i.owner, i.uid, i.callback, i.version)))
-    else {
-        return;
-    };
+    let Some((owner, uid, callback, version)) = live(index) else { return };
     if callback == 0 {
         return;
     }
-    let (wp, lp) = if version >= 4 {
-        ((anchor.x as u16 as usize) | ((anchor.y as u16 as usize) << 16), (WM_MOUSEMOVE & 0xffff) as isize | ((uid as isize & 0xffff) << 16))
-    } else {
-        (uid as usize, WM_MOUSEMOVE as isize)
-    };
+    let (wp, lp) = encode(version, uid, anchor, WM_MOUSEMOVE);
     SendNotifyMessageW(owner, callback, wp, lp);
 }
 
@@ -591,6 +729,11 @@ unsafe extern "system" fn overflow_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         // Kontextmenü öffnet (das holt sich den Fokus).
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_TIMER if wp == TIMER_OUTSIDE => {
+            // Nach einem Klick: Die App hat ihr Fenster/Menü nach vorne geholt.
+            if PENDING_HIDE.with(|p| p.get()).is_some_and(|(fg, _)| GetForegroundWindow() != fg) {
+                hide_overflow();
+                return 0;
+            }
             watch_outside_click(hwnd);
             0
         }
@@ -659,12 +802,30 @@ unsafe extern "system" fn overflow_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     WM_LBUTTONDBLCLK => Click::Double,
                     _ => Click::Left,
                 };
-                // Rechtsklick lässt den Überlauf offen, wie bei Windows.
-                if !matches!(kind, Click::Right) {
-                    hide_overflow();
-                }
                 click(index, kind, pt);
+                // Rechtsklick lässt den Überlauf offen, wie bei Windows. Links
+                // nicht sofort schließen: Ein Doppelklick braucht das Fenster
+                // noch (zweiter Klick und sein Loslassen). Zu geht er nach der
+                // Doppelklickzeit, sobald die App etwas in den Vordergrund holt
+                // oder gleich nach dem Loslassen eines Doppelklicks.
+                use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+                match kind {
+                    Click::Right => {}
+                    Click::Double => {
+                        PENDING_HIDE.with(|p| p.set(Some((GetForegroundWindow(), true))));
+                        SetTimer(hwnd, TIMER_HIDE, GetDoubleClickTime(), None);
+                    }
+                    _ if PENDING_HIDE.with(|p| p.get()).is_some_and(|p| p.1) => hide_overflow(),
+                    _ => {
+                        PENDING_HIDE.with(|p| p.set(Some((GetForegroundWindow(), false))));
+                        SetTimer(hwnd, TIMER_HIDE, GetDoubleClickTime(), None);
+                    }
+                }
             }
+            0
+        }
+        WM_TIMER if wp == TIMER_HIDE => {
+            hide_overflow();
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -709,10 +870,21 @@ pub unsafe fn toggle_overflow(anchor: RECT, dpi: u32) {
 
 const TIMER_OUTSIDE: usize = 7;
 const TIMER_TIP: usize = 8;
+/// Schließen nach einem Linksklick, verzögert um die Doppelklickzeit.
+const TIMER_HIDE: usize = 9;
 static MOUSE_WAS_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// Schließen steht an: (Vordergrundfenster beim Klick, war ein Doppelklick).
+    static PENDING_HIDE: std::cell::Cell<Option<(HWND, bool)>> = const { std::cell::Cell::new(None) };
+}
 
 pub unsafe fn hide_overflow() {
     let hwnd = HWND_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed);
+    PENDING_HIDE.with(|p| p.set(None));
+    if !hwnd.is_null() {
+        KillTimer(hwnd, TIMER_HIDE);
+    }
     if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 {
         KillTimer(hwnd, TIMER_TIP);
         crate::tooltip::hide();
@@ -749,4 +921,43 @@ unsafe fn watch_outside_click(hwnd: HWND) {
 pub fn overflow_visible() -> bool {
     let hwnd = HWND_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed);
     unsafe { !hwnd.is_null() && IsWindowVisible(hwnd) != 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn click_messages_like_explorer() {
+        assert_eq!(messages(Click::Left, 0, false), vec![WM_LBUTTONDOWN, WM_LBUTTONUP]);
+        // NIN_SELECT schon ab Version 3, nicht erst ab 4.
+        assert_eq!(messages(Click::Left, 3, false), vec![WM_LBUTTONDOWN, WM_LBUTTONUP, NIN_SELECT]);
+        assert_eq!(messages(Click::Left, 4, false), vec![WM_LBUTTONDOWN, WM_LBUTTONUP, NIN_SELECT]);
+        // Doppelklick: nur WM_LBUTTONDBLCLK, das Loslassen danach ohne neues Drücken.
+        assert_eq!(messages(Click::Double, 4, false), vec![WM_LBUTTONDBLCLK]);
+        assert_eq!(messages(Click::Left, 4, true), vec![WM_LBUTTONUP, NIN_SELECT]);
+        assert_eq!(messages(Click::Left, 0, true), vec![WM_LBUTTONUP]);
+        assert_eq!(messages(Click::Right, 4, false), vec![WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU]);
+        assert_eq!(messages(Click::Right, 0, false), vec![WM_RBUTTONDOWN, WM_RBUTTONUP]);
+    }
+
+    #[test]
+    fn keyboard_messages() {
+        assert_eq!(messages(Click::Key, 3, false), vec![NIN_KEYSELECT]);
+        assert_eq!(messages(Click::Key, 4, false), vec![NIN_KEYSELECT]);
+        assert_eq!(messages(Click::Key, 0, false), vec![WM_LBUTTONDOWN, WM_LBUTTONUP]);
+        assert_eq!(messages(Click::KeyMenu, 4, false), vec![WM_CONTEXTMENU]);
+        assert_eq!(messages(Click::KeyMenu, 0, false), vec![WM_RBUTTONDOWN, WM_RBUTTONUP]);
+    }
+
+    #[test]
+    fn callback_encoding() {
+        let p = POINT { x: 1900, y: -5 };
+        assert_eq!(encode(0, 7, p, WM_LBUTTONUP), (7, WM_LBUTTONUP as isize));
+        let (wp, lp) = encode(4, 7, p, NIN_SELECT);
+        assert_eq!(wp & 0xffff, 1900);
+        assert_eq!((wp >> 16) as u16 as i16, -5);
+        assert_eq!(lp & 0xffff, NIN_SELECT as isize);
+        assert_eq!(lp >> 16, 7);
+    }
 }

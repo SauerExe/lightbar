@@ -1,11 +1,12 @@
 //! Win-Taste übernehmen: Low-Level-Tastaturhook auf eigenem Thread.
 //!
 //! Win allein öffnet unser Startmenü, Win+S die Suche, Win+X das Kontextmenü,
-//! Win+A die Schnelleinstellungen, Win+1…9 die Taskleisten-Apps. Andere
-//! Kombinationen wie Win+E
-//! laufen unverändert an Windows durch. Damit Windows beim Loslassen nicht
-//! zusätzlich sein eigenes Startmenü öffnet, schicken wir vorher eine
-//! unbelegte Maskierungstaste (0xE8) – Windows sieht dann eine Kombination.
+//! Win+A die Schnelleinstellungen, Win+T/Win+B den Tastaturfokus in der
+//! Leiste bzw. im Infobereich, Win+1…9/0 die Taskleisten-Apps (mit Shift
+//! neue Instanz, mit Strg letztes Fenster, mit Alt Sprungliste). Andere
+//! Kombinationen wie Win+E oder Win+Shift+S laufen unverändert an Windows
+//! durch. Damit Windows beim Loslassen nicht zusätzlich sein eigenes
+//! Startmenü öffnet, schicken wir vorher eine unbelegte Maskierungstaste (0xE8) – Windows sieht dann eine Kombination.
 //!
 //! Der Hook läuft auf einem eigenen Thread, damit er nie hinter langsamer
 //! UI-Arbeit wartet (Windows entfernt Hooks, die zu oft zu lange brauchen).
@@ -28,6 +29,7 @@ const VK_KEY_S: u16 = b'S' as u16;
 const VK_KEY_X: u16 = b'X' as u16;
 const VK_KEY_A: u16 = b'A' as u16;
 const VK_KEY_T: u16 = b'T' as u16;
+const VK_KEY_B: u16 = b'B' as u16;
 
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 static COMBO: AtomicBool = AtomicBool::new(false);
@@ -42,8 +44,63 @@ unsafe fn win_physically_down() -> bool {
     (GetAsyncKeyState(VK_LWIN as i32) as u16 & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN as i32) as u16 & 0x8000) != 0
 }
 
-unsafe fn modifier_down() -> bool {
-    [VK_SHIFT, VK_CONTROL, VK_MENU].iter().any(|&k| GetAsyncKeyState(k as i32) as u16 & 0x8000 != 0)
+/// Gedrückte Zusatztasten neben Win: (Shift, Strg, Alt).
+unsafe fn modifiers() -> (bool, bool, bool) {
+    let down = |k: VIRTUAL_KEY| GetAsyncKeyState(k as i32) as u16 & 0x8000 != 0;
+    (down(VK_SHIFT), down(VK_CONTROL), down(VK_MENU))
+}
+
+/// Win+Taste → (Zielfenster, Nachricht, wParam), `None` = an Windows durchlassen.
+unsafe fn shortcut(vk: u16, mods: (bool, bool, bool)) -> Option<(HWND, u32, usize)> {
+    Some(match action(vk, mods)? {
+        Action::Search => (start::hwnd(), start::WM_TOGGLE, 1),
+        Action::WinX => (bar::hwnd(), bar::WM_BAR_WINX, 0),
+        Action::Quick => (bar::hwnd(), bar::WM_BAR_QUICK, 0),
+        Action::FocusTasks => (bar::hwnd(), bar::WM_BAR_FOCUS, 0),
+        Action::FocusTray => (bar::hwnd(), bar::WM_BAR_TRAYFOCUS, 0),
+        Action::App(n) => (bar::hwnd(), bar::WM_BAR_NUM, n),
+        Action::NewInstance(n) => (bar::hwnd(), bar::WM_BAR_NUM_NEW, n),
+        Action::LastWindow(n) => (bar::hwnd(), bar::WM_BAR_NUM_LAST, n),
+        Action::JumpList(n) => (bar::hwnd(), bar::WM_BAR_NUM_JUMP, n),
+    })
+}
+
+#[derive(Debug, PartialEq)]
+enum Action {
+    Search,
+    WinX,
+    Quick,
+    FocusTasks,
+    FocusTray,
+    App(usize),
+    NewInstance(usize),
+    LastWindow(usize),
+    JumpList(usize),
+}
+
+/// Welche Win-Kombination wir selbst bedienen (rein, testbar). Zahlen 1…9 und
+/// 0 (= zehnte App) wie bei Windows, mit genau einer Zusatztaste:
+/// Shift = neue Instanz, Strg = letztes aktives Fenster, Alt = Sprungliste.
+fn action(vk: u16, (shift, ctrl, alt): (bool, bool, bool)) -> Option<Action> {
+    let nth = match vk {
+        0x31..=0x39 => Some((vk - 0x31) as usize),
+        0x30 => Some(9),
+        _ => None,
+    };
+    match (shift, ctrl, alt) {
+        (false, false, false) => Some(match vk {
+            VK_KEY_S => Action::Search,
+            VK_KEY_X => Action::WinX,
+            VK_KEY_A => Action::Quick,
+            VK_KEY_T => Action::FocusTasks,
+            VK_KEY_B => Action::FocusTray,
+            _ => Action::App(nth?),
+        }),
+        (true, false, false) => Some(Action::NewInstance(nth?)),
+        (false, true, false) => Some(Action::LastWindow(nth?)),
+        (false, false, true) => Some(Action::JumpList(nth?)),
+        _ => None,
+    }
 }
 
 unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -86,20 +143,18 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 WIN_DOWN.store(false, Ordering::Relaxed);
             } else if WIN_DOWN.load(Ordering::Relaxed) {
                 COMBO.store(true, Ordering::Relaxed);
-                // Mit Shift/Strg/Alt gehört das Kürzel Windows (z. B. Win+Shift+S
-                // = Bildschirmausschnitt, Strg+Win+Pfeil = Desktops).
-                if modifier_down() {
-                    return CallNextHookEx(null_mut(), code, wp, lp);
-                }
                 // Kürzel, die wir selbst bedienen; die Taste wird geschluckt.
-                let (target, msg, wp) = match vk {
-                    VK_KEY_S => (start::hwnd(), start::WM_TOGGLE, 1),
-                    VK_KEY_X => (bar::hwnd(), bar::WM_BAR_WINX, 0),
-                    VK_KEY_A => (bar::hwnd(), bar::WM_BAR_QUICK, 0),
-                    VK_KEY_T => (bar::hwnd(), bar::WM_BAR_FOCUS, 0),
-                    0x31..=0x39 => (bar::hwnd(), bar::WM_BAR_NUM, (vk - 0x31) as usize),
-                    _ => return CallNextHookEx(null_mut(), code, wp, lp),
+                // Alles andere – auch mit Shift/Strg/Alt (Win+Shift+S =
+                // Bildschirmausschnitt, Strg+Win+Pfeil = Desktops) – gehört Windows.
+                let Some((target, msg, wp)) = shortcut(vk, modifiers()) else {
+                    return CallNextHookEx(null_mut(), code, wp, lp);
                 };
+                // Alt allein gedrückt und wieder losgelassen öffnet in vielen Apps
+                // die Menüleiste – die geschluckte Zahl dazwischen sieht die App
+                // nicht. Eine unbelegte Taste dazwischen verhindert das.
+                if down && msg == bar::WM_BAR_NUM_JUMP {
+                    send_keys(&[(VK_MASK, false), (VK_MASK, true)]);
+                }
                 // Nur beim ersten Druck auslösen: Tastenwiederholung beim
                 // Festhalten (Win+S gedrückt) würde sonst wiederholt umschalten.
                 // Geschluckt wird trotzdem jedes Ereignis.
@@ -158,5 +213,40 @@ pub fn reinstall() {
     let tid = HOOK_THREAD.load(Ordering::Acquire);
     if tid != 0 {
         unsafe { PostThreadMessageW(tid, WM_HOOK_REINSTALL, 0, 0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NONE: (bool, bool, bool) = (false, false, false);
+    const SHIFT: (bool, bool, bool) = (true, false, false);
+    const CTRL: (bool, bool, bool) = (false, true, false);
+    const ALT: (bool, bool, bool) = (false, false, true);
+
+    #[test]
+    fn digits_with_modifiers() {
+        assert_eq!(action(0x31, NONE), Some(Action::App(0)));
+        assert_eq!(action(0x39, NONE), Some(Action::App(8)));
+        // Win+0 = zehnte App, wie bei Windows.
+        assert_eq!(action(0x30, NONE), Some(Action::App(9)));
+        assert_eq!(action(0x32, SHIFT), Some(Action::NewInstance(1)));
+        assert_eq!(action(0x30, CTRL), Some(Action::LastWindow(9)));
+        assert_eq!(action(0x33, ALT), Some(Action::JumpList(2)));
+        // Mehrere Zusatztasten (Strg+Shift+Win+Zahl = als Admin): Windows.
+        assert_eq!(action(0x31, (true, true, false)), None);
+    }
+
+    #[test]
+    fn letters_and_passthrough() {
+        assert_eq!(action(VK_KEY_S, NONE), Some(Action::Search));
+        assert_eq!(action(VK_KEY_T, NONE), Some(Action::FocusTasks));
+        assert_eq!(action(VK_KEY_B, NONE), Some(Action::FocusTray));
+        // Win+Shift+S (Bildschirmausschnitt), Win+Strg+D, Win+E bleiben bei Windows.
+        assert_eq!(action(VK_KEY_S, SHIFT), None);
+        assert_eq!(action(b'D' as u16, CTRL), None);
+        assert_eq!(action(b'E' as u16, NONE), None);
+        assert_eq!(action(VK_KEY_B, ALT), None);
     }
 }

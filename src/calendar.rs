@@ -1,6 +1,7 @@
-//! Kalender beim Klick auf die Uhr: Datum groß, Monatsansicht (Woche ab
-//! Montag, Kalenderwochen links), Blättern per Pfeil oder Mausrad, Klick auf
-//! den Monatsnamen springt zurück zu heute. Unten: Benachrichtigungen und
+//! Kalender beim Klick auf die Uhr: Datum groß, Monatsansicht (Woche ab dem
+//! ersten Wochentag des Regionalformats, Kalenderwochen links nur auf Wunsch –
+//! wie bei Windows standardmäßig aus), Blättern per Pfeil oder Mausrad, Klick
+//! auf den Monatsnamen springt zurück zu heute. Unten: Benachrichtigungen und
 //! Datums-Einstellungen.
 
 use std::cell::RefCell;
@@ -114,6 +115,34 @@ fn iso_week(y: i32, m: i32, d: i32) -> i32 {
     ((thursday - days_from_civil(ty, 1, 1)) / 7 + 1) as i32
 }
 
+/// Spalte (0…6) eines Wochentags (0 = Montag), wenn die Woche an `first` beginnt.
+fn column(weekday: i32, first: i32) -> i32 {
+    (weekday - first).rem_euclid(7)
+}
+
+/// Kalenderwoche einer Rasterzeile, die am Tag `days` (seit 1970) beginnt:
+/// die ISO-Woche ihres Montags (eine am Sonntag beginnende Zeile gehört
+/// überwiegend zur Woche des folgenden Montags).
+fn row_week(days: i64) -> i32 {
+    let monday = (0..7).map(|k| days + k).find(|d| (d + 3).rem_euclid(7) == 0).unwrap_or(days);
+    let (y, m, d) = civil_from_days(monday);
+    iso_week(y, m, d)
+}
+
+/// Umkehrung von `days_from_civil`.
+fn civil_from_days(z: i64) -> (i32, i32, i32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    (y as i32, m as i32, d as i32)
+}
+
 fn today() -> (i32, i32, i32) {
     let mut st: SYSTEMTIME = unsafe { zeroed() };
     unsafe { GetLocalTime(&mut st) };
@@ -137,8 +166,12 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     let head = RECT { left: pad, top: px(d, 14), right: w - pad, bottom: px(d, 50) };
     let (day, month) = (day_names()[weekday(ty, tm, td) as usize], months()[(tm - 1) as usize]);
     text(dc, &tf!("{day}, {td}. {month}", "{day}, {month} {td}"), &head, big, TEXT, LINE);
-    let sub = RECT { left: pad, top: px(d, 50), right: w - pad, bottom: px(d, 74) };
-    text(dc, &tf!("Kalenderwoche {}", "Week {}", iso_week(ty, tm, td)), &sub, small, SUBTEXT, LINE);
+    let weeks = crate::settings::get().week_numbers;
+    let first_day = crate::clockfmt::first_weekday();
+    if weeks {
+        let sub = RECT { left: pad, top: px(d, 50), right: w - pad, bottom: px(d, 74) };
+        text(dc, &tf!("Kalenderwoche {}", "Week {}", iso_week(ty, tm, td)), &sub, small, SUBTEXT, LINE);
+    }
     fill(dc, &RECT { left: 0, top: px(d, HEAD - 6), right: w, bottom: px(d, HEAD - 5) }, BORDER);
 
     // Monatszeile mit Pfeilen
@@ -159,33 +192,30 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
         st.hits.push((r, act));
     }
 
-    // Wochentage + Raster (Spalte 0 = Kalenderwoche)
+    // Wochentage + Raster (links optional die Kalenderwoche)
     let cell = px(d, CELL);
-    let grid_left = pad + px(d, 30);
+    let grid_left = pad + if weeks { px(d, 30) } else { 0 };
     let cw = (w - grid_left - pad) / 7;
     let wd_top = row.bottom + px(d, 4);
-    for (i, name) in days().iter().enumerate() {
-        let r = RECT { left: grid_left + i as i32 * cw, top: wd_top, right: grid_left + (i as i32 + 1) * cw, bottom: wd_top + px(d, 24) };
+    for i in 0..7 {
+        let name = days()[((i + first_day) % 7) as usize];
+        let r = RECT { left: grid_left + i * cw, top: wd_top, right: grid_left + (i + 1) * cw, bottom: wd_top + px(d, 24) };
         text(dc, name, &r, small, SUBTEXT, CENTER);
     }
-    let first = weekday(st.year, st.month, 1);
+    let first = column(weekday(st.year, st.month, 1), first_day);
     let len = days_in_month(st.year, st.month);
     let (py, pm) = if st.month == 1 { (st.year - 1, 12) } else { (st.year, st.month - 1) };
     let prev_len = days_in_month(py, pm);
     let grid_top = wd_top + px(d, 28);
+    let month_start = days_from_civil(st.year, st.month, 1);
     for week in 0..6 {
         let y0 = grid_top + week * cell;
-        // Erster Tag dieser Zeile → Kalenderwoche
-        let n0 = week * 7 - first + 1;
-        let (wy, wm, wdd) = if n0 < 1 {
-            (py, pm, prev_len + n0)
-        } else if n0 > len {
-            if st.month == 12 { (st.year + 1, 1, n0 - len) } else { (st.year, st.month + 1, n0 - len) }
-        } else {
-            (st.year, st.month, n0)
-        };
-        let kw = RECT { left: pad - px(d, 4), top: y0, right: grid_left, bottom: y0 + cell };
-        text(dc, &iso_week(wy, wm, wdd).to_string(), &kw, small, DIM, CENTER);
+        if weeks {
+            // Erster Tag dieser Zeile → Kalenderwoche
+            let row_start = month_start + (week * 7 - first) as i64;
+            let kw = RECT { left: pad - px(d, 4), top: y0, right: grid_left, bottom: y0 + cell };
+            text(dc, &row_week(row_start).to_string(), &kw, small, DIM, CENTER);
+        }
         for col in 0..7 {
             let n = week * 7 + col - first + 1;
             let (day, current) = if n < 1 {
@@ -208,7 +238,7 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
                 rgb(0, 0, 0)
             } else if !current {
                 DIM
-            } else if col >= 5 {
+            } else if (col + first_day) % 7 >= 5 {
                 SUBTEXT
             } else {
                 TEXT
@@ -253,6 +283,8 @@ pub unsafe fn toggle() {
         ShowWindow(h, SW_HIDE);
         return;
     }
+    // Titel (Screenreader, Fensterlisten) in der aktuellen Sprache.
+    SetWindowTextW(h, w16(t!("Kalender", "Calendar")).as_ptr());
     let bar = crate::bar::anchor();
     let dpi = GetDpiForWindow(bar);
     let (y, m, _) = today();
@@ -277,6 +309,14 @@ pub unsafe fn toggle() {
     crate::anim::pop_in(h, x, y, w, hh, crate::display::pop_offset(px(dpi, 18)));
     force_foreground(h);
     InvalidateRect(h, null(), 0);
+}
+
+/// Offenen Kalender neu zeichnen (Regionalformat, Uhrzeit oder Einstellung geändert).
+pub unsafe fn refresh() {
+    let h = HWND_CAL.load(Ordering::Relaxed);
+    if !h.is_null() && IsWindowVisible(h) != 0 {
+        InvalidateRect(h, null(), 0);
+    }
 }
 
 fn shift_month(delta: i32) {
@@ -378,6 +418,7 @@ pub unsafe fn create(inst: HINSTANCE) {
     let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
         class.as_ptr(),
+        // Sprache kann bis zum Öffnen wechseln: `toggle` setzt den Titel neu.
         w16(t!("Kalender", "Calendar")).as_ptr(),
         WS_POPUP,
         0,
@@ -402,4 +443,40 @@ pub unsafe fn create(inst: HINSTANCE) {
         *s.borrow_mut() = Some(State { dpi: 0, fonts: None, year: y, month: m, mouse: (-1, -1), tracking: false, hits: Vec::new() })
     });
     HWND_CAL.store(hwnd, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_round_trip() {
+        for z in [-800_000i64, -1, 0, 1, 10_957, 20_748, 60_000, 400_000] {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m, d), z);
+        }
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(days_from_civil(2026, 10, 22)), (2026, 10, 22));
+    }
+
+    #[test]
+    fn columns_follow_first_weekday() {
+        // 1. Oktober 2026 ist ein Donnerstag (3).
+        let thu = weekday(2026, 10, 1);
+        assert_eq!(thu, 3);
+        assert_eq!(column(thu, 0), 3); // Woche ab Montag
+        assert_eq!(column(thu, 6), 4); // Woche ab Sonntag (USA)
+        assert_eq!(column(thu, 5), 5); // Woche ab Samstag
+        assert_eq!(column(6, 6), 0);
+    }
+
+    #[test]
+    fn row_week_uses_the_rows_monday() {
+        // Zeile ab Montag, 28.12.2026: ISO-Woche 53.
+        assert_eq!(row_week(days_from_civil(2026, 12, 28)), 53);
+        // Zeile ab Sonntag, 3.1.2027: Montag 4.1.2027 → Woche 1.
+        assert_eq!(row_week(days_from_civil(2027, 1, 3)), 1);
+        // Zeile ab Sonntag, 18.10.2026: Montag 19.10. → Woche 43.
+        assert_eq!(row_week(days_from_civil(2026, 10, 18)), 43);
+    }
 }

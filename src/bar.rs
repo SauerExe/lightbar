@@ -88,6 +88,16 @@ pub const WM_BAR_STATUS: u32 = WM_APP + 36;
 const WM_BAR_EVENT: u32 = WM_APP + 37;
 /// Taskleisten-Einstellungen in der Registry geändert (siehe `display::watch`).
 const WM_BAR_SETTINGS: u32 = WM_APP + 39;
+/// Win+Umschalt+Zahl: neue Instanz der n-ten App (wParam = n).
+pub const WM_BAR_NUM_NEW: u32 = WM_APP + 50;
+/// Win+Strg+Zahl: zuletzt aktives Fenster der n-ten App.
+pub const WM_BAR_NUM_LAST: u32 = WM_APP + 51;
+/// Win+Alt+Zahl: Sprungliste der n-ten App öffnen.
+pub const WM_BAR_NUM_JUMP: u32 = WM_APP + 52;
+/// Win+B: Tastaturfokus in den Infobereich.
+pub const WM_BAR_TRAYFOCUS: u32 = WM_APP + 53;
+/// Hervorhebung der Tray-Icons in der Registry geändert (`tray::watch_promoted`).
+const WM_BAR_TRAYPREFS: u32 = WM_APP + 54;
 const USAGE_W: i32 = 236;
 const TASKMGR_W: i32 = 40;
 const VK_KEY_D: VIRTUAL_KEY = 0x44;
@@ -410,6 +420,8 @@ struct LayoutInput {
     /// Suche: 0 aus, 1 Symbol, 2 Suchfeld, 3 Symbol mit Beschriftung.
     search: u32,
     task_view: bool,
+    /// Breite der Uhr (logische Pixel), je nach Regionalformat (12 h ist breiter).
+    clock_w: i32,
 }
 
 /// Kleinste Buttonbreite, bevor Buttons wegfallen (Symbol 24 px + Rand).
@@ -423,6 +435,27 @@ fn layout(i: &LayoutInput) -> Layout {
     if i.vertical {
         return layout_vertical(i);
     }
+    let l = layout_horizontal(i);
+    // Reicht der Platz selbst nach allem Ausweichen nicht (sehr schmale Leiste:
+    // kein Platz mehr für den "…"-Knopf), bekommt eine breite Uhr
+    // (12-Stunden-Format) nur das Standardmaß.
+    if i.clock_w > CLOCK_W && cramped(&l, i) {
+        return layout_horizontal(&LayoutInput { clock_w: CLOCK_W, ..*i });
+    }
+    l
+}
+
+/// Waagerechte Aufteilung ohne Notlösung nicht mehr möglich: Apps fehlen ohne
+/// "…"-Knopf, oder die linke Gruppe reicht in die rechte hinein.
+fn cramped(l: &Layout, i: &LayoutInput) -> bool {
+    let set = |r: &RECT| r.right > r.left;
+    let left_end = [Some(l.start), Some(l.search), Some(l.taskview), l.tasks.last().copied(), l.more].into_iter().flatten().filter(set).map(|r| r.right).max().unwrap_or(0);
+    let right_start = [l.chevron, l.tray.first().copied(), Some(l.kbd), Some(l.status), Some(l.clock)].into_iter().flatten().filter(set).map(|r| r.left).min().unwrap_or(i.width);
+    (l.tasks.len() < i.n_tasks && l.more.is_none()) || left_end > right_start
+}
+
+/// Waagerechte Aufteilung.
+fn layout_horizontal(i: &LayoutInput) -> Layout {
     let (w, dpi) = (i.width, i.dpi);
     let gap = px(dpi, BTN_GAP);
     let m = metrics(i.small);
@@ -434,7 +467,7 @@ fn layout(i: &LayoutInput) -> Layout {
     // Rechte Seite von außen nach innen.
     let desktop = RECT { left: w - px(dpi, DESKTOP_W), top: 0, right: w, bottom: h };
     let clock_r = desktop.left - px(dpi, 4);
-    let clock = RECT { left: clock_r - px(dpi, CLOCK_W), top, right: clock_r, bottom };
+    let clock = RECT { left: clock_r - px(dpi, i.clock_w), top, right: clock_r, bottom };
     let status = if i.primary {
         let glyphs = 2 + i.battery as i32;
         let status_r = clock.left - px(dpi, 4);
@@ -664,6 +697,7 @@ unsafe fn current_layout(hwnd: HWND) -> Option<(Layout, Vec<(usize, HICON)>)> {
         // zeigen Zweitleisten nur Start und Apps).
         search: if primary && settings.taskbar_search { crate::display::search_mode() } else { 0 },
         task_view: primary && crate::display::task_view_button(),
+        clock_w: crate::clockfmt::width(clock_seconds(), CLOCK_W),
     });
     if primary {
         tray::set_shown(l.tray.len());
@@ -1396,17 +1430,8 @@ unsafe fn tip_text(hit: Hit) -> String {
         Hit::Clock => {
             let mut st: SYSTEMTIME = zeroed();
             GetLocalTime(&mut st);
-            const DAYS: [&str; 7] = ["Sonntag", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag"];
-            const MONTHS: [&str; 12] = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
-            const DAYS_EN: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-            const MONTHS_EN: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-            let (wd, mo) = (st.wDayOfWeek as usize % 7, (st.wMonth as usize + 11) % 12);
-            if crate::i18n::en() {
-                // Englisch: "Thursday, October 22, 2026".
-                format!("{}, {} {}, {}", DAYS_EN[wd], MONTHS_EN[mo], st.wDay, st.wYear)
-            } else {
-                format!("{}, {}. {} {}", DAYS[wd], st.wDay, MONTHS[mo], st.wYear)
-            }
+            // Langes Datum im Regionalformat, wie der Tooltip der Windows-Uhr.
+            crate::clockfmt::long_date(&st)
         }
         Hit::Desktop => t!("Desktop anzeigen", "Show desktop").into(),
         Hit::TaskMgr => {
@@ -1721,11 +1746,20 @@ unsafe fn kbd_menu(hwnd: HWND) {
 unsafe fn clock_menu(hwnd: HWND) {
     let id = menus::popup(
         hwnd,
-        &[Item::Cmd(1, t!("Datum und Uhrzeit anpassen", "Adjust date and time")), Item::Cmd(2, t!("Benachrichtigungseinstellungen", "Notification settings"))],
+        &[
+            Item::Cmd(1, t!("Datum und Uhrzeit anpassen", "Adjust date and time")),
+            Item::Cmd(2, t!("Benachrichtigungseinstellungen", "Notification settings")),
+            Item::Sep,
+            Item::Check(3, t!("Kalenderwochen anzeigen", "Show week numbers"), crate::settings::get().week_numbers),
+        ],
     );
     match id {
         1 => shell_open("ms-settings:dateandtime", "", SW_SHOWNORMAL),
         2 => shell_open("ms-settings:notifications", "", SW_SHOWNORMAL),
+        3 => {
+            crate::settings::update(|s| s.week_numbers = !s.week_numbers);
+            crate::calendar::refresh();
+        }
         _ => {}
     }
 }
@@ -1915,6 +1949,9 @@ unsafe fn focus_key(hwnd: HWND, vk: u16) -> bool {
         VK_LEFT | VK_UP | VK_TAB => ui_set_focus((cur + n.max(1) - 1) % n.max(1)),
         VK_HOME => ui_set_focus(0),
         VK_END => ui_set_focus(n.saturating_sub(1)),
+        // Tray-Icons bekommen Tastatur-Meldungen (NIN_KEYSELECT, WM_CONTEXTMENU)
+        // statt nachgebildeter Mausklicks, wie bei Explorer.
+        VK_RETURN | VK_SPACE | VK_APPS | VK_F10 if tray_key(cur, vk) => {}
         VK_RETURN | VK_SPACE => click_element(hwnd, cur, WM_LBUTTONUP),
         VK_APPS | VK_F10 => click_element(hwnd, cur, WM_RBUTTONUP),
         VK_ESCAPE => {
@@ -1923,6 +1960,17 @@ unsafe fn focus_key(hwnd: HWND, vk: u16) -> bool {
         }
         _ => return false,
     }
+    true
+}
+
+/// Taste auf einem fokussierten Tray-Icon an die App melden; `false`, wenn
+/// das Element kein Tray-Icon ist.
+unsafe fn tray_key(index: usize, vk: u16) -> bool {
+    let Some(e) = ui_elements().into_iter().nth(index) else { return false };
+    let Hit::Tray(i) = e.hit else { return false };
+    let anchor = POINT { x: (e.rect.left + e.rect.right) / 2, y: (e.rect.top + e.rect.bottom) / 2 };
+    let kind = if matches!(vk, VK_RETURN | VK_SPACE) { Click::Key } else { Click::KeyMenu };
+    tray::click(i, kind, anchor);
     true
 }
 
@@ -3363,19 +3411,10 @@ unsafe fn draw_clock(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
     let narrow = r.right - r.left < px(dpi, CLOCK_W);
     let flags = if narrow { DT_CENTER } else { DT_RIGHT } | DT_SINGLELINE;
     let cr = if narrow { *r } else { RECT { right: r.right - px(dpi, 10), ..*r } };
-    let time = if clock_seconds() {
-        format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
-    } else {
-        format!("{:02}:{:02}", st.wHour, st.wMinute)
-    };
+    // Regionalformat von Windows (12/24 h, Datumsreihenfolge), nicht die UI-Sprache.
+    let time = crate::clockfmt::time(&st, clock_seconds());
     text(dc, &time, &RECT { bottom: mid, ..cr }, font, TEXT, flags | DT_BOTTOM);
-    // Englisch im US-Format wie Windows (M/D/YYYY), sonst TT.MM.JJJJ.
-    let date = match (crate::i18n::en(), narrow) {
-        (true, true) => format!("{}/{}", st.wMonth, st.wDay),
-        (true, false) => format!("{}/{}/{}", st.wMonth, st.wDay, st.wYear),
-        (false, true) => format!("{:02}.{:02}.", st.wDay, st.wMonth),
-        (false, false) => format!("{:02}.{:02}.{}", st.wDay, st.wMonth, st.wYear),
-    };
+    let date = crate::clockfmt::short_date(&st, narrow);
     text(dc, &date, &RECT { top: mid, ..cr }, font, TEXT, flags | DT_TOP);
 }
 
@@ -3727,6 +3766,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_COPYDATA => {
             prof(7);
             if let Some(r) = tray::handle_copydata(lp) {
+                // Explorer bekommt eine Kopie (Sprechblasen → Benachrichtigungen);
+                // die App erhält aber unsere Antwort `r`.
+                tray::forward_to_explorer(hwnd, wp, lp);
                 InvalidateRect(hwnd, null(), 0);
                 return r;
             }
@@ -3812,6 +3854,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             activate_nth(wp);
             0
         }
+        WM_BAR_NUM_NEW | WM_BAR_NUM_LAST | WM_BAR_NUM_JUMP => {
+            if let Some(g) = with(|s| s.groups.get(wp).cloned()).flatten() {
+                match msg {
+                    // Wie Umschalt+Klick bzw. Mittelklick: neue Instanz.
+                    WM_BAR_NUM_NEW => launch(&g),
+                    // Zuletzt aktives Fenster der App; ohne Fenster starten.
+                    WM_BAR_NUM_LAST => match by_z_order(&g.windows).first() {
+                        Some(&h) => activate(h),
+                        None => launch(&g),
+                    },
+                    _ => task_menu(hwnd, g),
+                }
+            }
+            0
+        }
+        WM_BAR_TRAYFOCUS => {
+            // Win+B: auf den Überlauf-Pfeil bzw. das erste Tray-Icon, sonst auf die Uhr.
+            let els = ui_elements();
+            let first = els.iter().position(|e| matches!(e.hit, Hit::Chevron | Hit::Tray(_))).or_else(|| els.iter().position(|e| e.hit == Hit::Clock));
+            ui_set_focus(first.unwrap_or(0));
+            0
+        }
+        WM_BAR_TRAYPREFS => {
+            tray::load_promoted();
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
         // Im Leerlauf soll Lightbar fast nichts tun: Änderungen kommen als
         // Ereignisse (Shell-Hook, WinEvents, Audio-/Netz-/Akku-Meldungen).
         // Zeitgeber gibt es nur für das, was sich wirklich mit der Zeit ändert.
@@ -3822,6 +3891,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 InvalidateRect(hwnd, &l.clock, 0);
             }
             schedule_clock(hwnd);
+            0
+        }
+        // Systemzeit oder Zeitzone geändert: Uhr sofort neu, Takt neu ausrichten.
+        WM_TIMECHANGE => {
+            if let Some((l, _)) = current_layout(hwnd) {
+                InvalidateRect(hwnd, &l.clock, 0);
+            }
+            if hwnd == self::hwnd() {
+                schedule_clock(hwnd);
+                crate::calendar::refresh();
+            }
             0
         }
         WM_TIMER if wp == TIMER_KBD => {
@@ -4137,6 +4217,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Akzentfarbe geändert (Personalisierung) → neu einlesen.
         0x0320 | WM_SETTINGCHANGE => {
             reload_accent();
+            // Regionalformat geändert ("intl"): Uhrbreite neu messen, Uhr und
+            // Kalender zeichnen sich danach im neuen Format.
+            if msg == WM_SETTINGCHANGE && crate::clockfmt::is_intl(lp) {
+                crate::clockfmt::invalidate();
+                crate::calendar::refresh();
+            }
             // Taskleisten-Einstellungen von Windows (Ausrichtung, alle Bildschirme)
             // gelten sofort – nicht bei unserer eigenen Arbeitsbereich-Meldung.
             // Arbeitsbereich von jemand anderem geändert (meist Explorer): kurz danach
@@ -4359,7 +4445,14 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     // set_pos lief noch unsichtbar – jetzt den Arbeitsbereich prüfen.
     ensure_work_area(hwnd);
+    // Hervorhebung vor dem Anmelden der Icons kennen – sonst landen alle erst
+    // im Überlauf, bis die Einstellung gelesen ist.
+    tray::load_promoted();
     tray::announce();
+    let tray_target = hwnd as isize;
+    tray::watch_promoted(move || {
+        PostMessageW(tray_target as HWND, WM_BAR_TRAYPREFS, 0, 0);
+    });
     sync_monitors();
     // Taskleisten-Einstellungen sofort übernehmen, auch ohne WM_SETTINGCHANGE.
     let settings_target = hwnd as isize;
@@ -4397,7 +4490,7 @@ mod tests {
                     for n_tray in [0, 4, 12] {
                         let small = (n_tasks + n_tray + dpi as usize) % 2 == 1;
                         for (primary, usage, align_left, hidden_tray) in [(true, true, false, true), (true, false, true, false), (true, true, true, false), (false, false, false, false), (false, false, true, false)] {
-                            let i = LayoutInput { width, vertical: false, length: px(dpi, BAR_H), dpi, n_tasks, n_tray, hidden_tray, battery: true, kbd: (n_tasks + n_tray) % 3 != 0, primary, usage, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0 };
+                            let i = LayoutInput { width, vertical: false, length: px(dpi, BAR_H), dpi, n_tasks, n_tray, hidden_tray, battery: true, kbd: (n_tasks + n_tray) % 3 != 0, primary, usage, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0, clock_w: if n_tasks % 2 == 0 { CLOCK_W } else { 116 } };
                             let l = layout(&i);
                             let ctx = format!("w={width} dpi={dpi} tasks={n_tasks} tray={n_tray} primary={primary} usage={usage} left={align_left}");
                             let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("kbd", l.kbd), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr)];
@@ -4465,8 +4558,23 @@ mod tests {
         }
     }
 
+    /// Breite Uhr (12-Stunden-Format): bekommt ihren Platz, auch bei vielen
+    /// Apps ("…"-Knopf); nur wenn gar nichts mehr geht, das Standardmaß.
+    #[test]
+    fn wide_clock_gets_its_width() {
+        for dpi in [96, 144] {
+            for n_tasks in [6, 40] {
+                let l = layout(&LayoutInput { clock_w: 116, n_tasks, ..kbd_input(dpi, false) });
+                assert_eq!(l.clock.right - l.clock.left, px(dpi, 116), "dpi={dpi} tasks={n_tasks}");
+                assert!(l.status.right <= l.clock.left);
+            }
+        }
+        let tight = layout(&LayoutInput { width: 720, clock_w: 116, n_tasks: 3, usage: true, n_tray: 0, ..kbd_input(192, false) });
+        assert_eq!(tight.clock.right - tight.clock.left, px(192, CLOCK_W));
+    }
+
     fn kbd_input(dpi: u32, small: bool) -> LayoutInput {
-        LayoutInput { width: 1920, vertical: false, length: px(dpi, BAR_H), dpi, n_tasks: 6, n_tray: 4, hidden_tray: true, battery: true, kbd: true, primary: true, usage: false, align_left: false, small, search: 1, task_view: true }
+        LayoutInput { width: 1920, vertical: false, length: px(dpi, BAR_H), dpi, n_tasks: 6, n_tray: 4, hidden_tray: true, battery: true, kbd: true, primary: true, usage: false, align_left: false, small, search: 1, task_view: true, clock_w: CLOCK_W }
     }
 }
 
@@ -4479,7 +4587,7 @@ mod vertical_tests {
     #[test]
     fn drag_reorders_along_bar() {
         let dpi = 96;
-        let i = LayoutInput { width: px(dpi, BAR_W_V), vertical: true, length: 1080, dpi, n_tasks: 4, n_tray: 0, hidden_tray: false, battery: true, kbd: false, primary: false, usage: false, align_left: true, small: false, search: 0, task_view: false };
+        let i = LayoutInput { width: px(dpi, BAR_W_V), vertical: true, length: 1080, dpi, n_tasks: 4, n_tray: 0, hidden_tray: false, battery: true, kbd: false, primary: false, usage: false, align_left: true, small: false, search: 0, task_view: false, clock_w: CLOCK_W };
         let l = layout(&i);
         assert_eq!(l.tasks.len(), 4);
         let t = &l.tasks;
@@ -4539,7 +4647,7 @@ mod vertical_tests {
                     for n_tray in [0, 3, 10] {
                         let small = (n_tasks + n_tray + dpi as usize) % 2 == 1;
                         for (primary, align_left, hidden_tray) in [(true, false, true), (true, true, false), (false, false, false)] {
-                            let i = LayoutInput { width, vertical: true, length, dpi, n_tasks, n_tray, hidden_tray, battery: true, kbd: (n_tasks + n_tray) % 3 != 0, primary, usage: true, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0 };
+                            let i = LayoutInput { width, vertical: true, length, dpi, n_tasks, n_tray, hidden_tray, battery: true, kbd: (n_tasks + n_tray) % 3 != 0, primary, usage: true, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0, clock_w: if n_tasks % 2 == 0 { CLOCK_W } else { 116 } };
                             let l = layout(&i);
                             let ctx = format!("len={length} dpi={dpi} tasks={n_tasks} tray={n_tray} primary={primary} top={align_left}");
                             let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("kbd", l.kbd), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr), ("desktop", l.desktop)];
