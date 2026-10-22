@@ -268,6 +268,14 @@ pub fn set_volume(v: f32) {
     })
 }
 
+pub fn set_mute(on: bool) {
+    HANDLES.with(|cell| unsafe {
+        if let Some(ep) = endpoint(&mut cell.borrow_mut()) {
+            let _ = ep.SetMute(on, std::ptr::null());
+        }
+    })
+}
+
 pub fn toggle_mute() {
     HANDLES.with(|cell| unsafe {
         if let Some(ep) = endpoint(&mut cell.borrow_mut()) {

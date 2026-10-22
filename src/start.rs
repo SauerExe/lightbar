@@ -205,7 +205,7 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 
 // --------------------------------------------------------------- Daten
 
-const SETTINGS: &[(&str, &str, &str)] = &[
+pub(crate) const SETTINGS: &[(&str, &str, &str)] = &[
     ("Einstellungen", "ms-settings:", "settings einstellungen"),
     ("Bluetooth & Geräte", "ms-settings:bluetooth", "bluetooth geräte maus tastatur kopfhörer"),
     ("WLAN", "ms-settings:network-wifi", "wlan wifi netzwerk internet"),
@@ -889,10 +889,9 @@ fn hash_of(s: &str) -> u64 {
     h.finish()
 }
 
-/// Zwischenschritte einer Antwort (Werkzeugaufrufe). Sobald `ai::Answer`
-/// ein Feld `steps` hat, hier `&a.steps` zurückgeben.
-fn steps(_a: &crate::ai::Answer) -> &[String] {
-    &[]
+/// Zwischenschritte einer Antwort (Werkzeugaufrufe).
+fn steps(a: &crate::ai::Answer) -> &[String] {
+    &a.steps
 }
 
 /// Textmaße über GDI für das Chat-Layout (`chat::Measure`).
