@@ -258,8 +258,57 @@ impl TrayIcon {
     }
 }
 
+/// Was eine Tray-Meldung an der Leiste ändert.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TrayChange {
+    /// Nichts Sichtbares (nur Tooltip, Version, ausgeblendetes Icon …).
+    None,
+    /// Nur Bilder von Icons in der Leiste: Infobereich neu zeichnen.
+    Icons,
+    /// Anzahl der Icons in Leiste oder Überlauf: Aufteilung der Leiste ändert sich.
+    Layout,
+}
+
+/// Wo ein Icon steht: gar nicht (ausgeblendet/ohne Bild), in der Leiste
+/// (hervorgehoben) oder nur im Überlauf.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Place {
+    Gone,
+    Bar,
+    Overflow,
+}
+
+impl TrayIcon {
+    fn place(&self) -> Place {
+        if self.hidden || self.icon.is_null() {
+            Place::Gone
+        } else if self.promoted {
+            Place::Bar
+        } else {
+            Place::Overflow
+        }
+    }
+}
+
+/// Auswirkung einer Meldung (rein, testbar): Platz des Icons vorher/nachher,
+/// ob sein Bild gewechselt hat und ob es (in der Leiste) zu den angezeigten
+/// gehört. Ergebnis: (Leiste, Überlauf betroffen).
+fn classify(before: Place, after: Place, icon_changed: bool, shown_in_bar: bool) -> (TrayChange, bool) {
+    if before != after {
+        return (TrayChange::Layout, true);
+    }
+    match after {
+        Place::Gone => (TrayChange::None, false),
+        _ if !icon_changed => (TrayChange::None, false),
+        Place::Bar if shown_in_bar => (TrayChange::Icons, false),
+        // Hervorgehoben, aber aus Platzmangel im Überlauf, oder ohnehin dort.
+        _ => (TrayChange::None, true),
+    }
+}
+
 /// WM_COPYDATA an Shell_TrayWnd. `None` heißt: nicht unser Thema, weiterreichen.
-pub unsafe fn handle_copydata(lp: LPARAM) -> Option<LRESULT> {
+/// Sonst die Antwort an die App und was sich an der Leiste sichtbar ändert.
+pub unsafe fn handle_copydata(lp: LPARAM) -> Option<(LRESULT, TrayChange)> {
     let cds = &*(lp as *const COPYDATASTRUCT);
     if cds.dwData != 1 || cds.lpData.is_null() || (cds.cbData as usize) < 8 + 12 {
         return None;
@@ -272,10 +321,12 @@ pub unsafe fn handle_copydata(lp: LPARAM) -> Option<LRESULT> {
         return None;
     }
     let nid = data.nid;
-    let ok = ICONS.with(|cell| {
+    let shown = SHOWN.load(std::sync::atomic::Ordering::Relaxed);
+    let (ok, change, overflow_dirty) = ICONS.with(|cell| {
         let mut icons = cell.borrow_mut();
         let pos = icons.iter().position(|i| i.matches(&nid));
-        match (data.message, pos) {
+        let before = pos.map(|i| icons[i].place()).unwrap_or(Place::Gone);
+        let ok = match (data.message, pos) {
             (NIM_ADD, None) => {
                 let exe = owner_exe(handle32(nid.hwnd));
                 let promoted = is_promoted(exe.as_deref());
@@ -313,17 +364,31 @@ pub unsafe fn handle_copydata(lp: LPARAM) -> Option<LRESULT> {
             // NIM_SETFOCUS und Unbekanntes: bestätigen, sonst versuchen es manche Apps endlos.
             (m, Some(_)) if m > NIM_SETVERSION || m == 3 => true,
             _ => false,
-        }
+        };
+        // Das Icon danach: neu angelegt hinten, sonst an seinem Platz.
+        let (after, at) = match (data.message, pos) {
+            (NIM_ADD, None) if ok => (icons.last().map(|i| i.place()).unwrap_or(Place::Gone), icons.len().checked_sub(1)),
+            (NIM_DELETE, _) => (Place::Gone, None),
+            (_, Some(i)) => (icons[i].place(), Some(i)),
+            _ => (Place::Gone, None),
+        };
+        let icon_changed = data.message == NIM_MODIFY && nid.flags & NIF_ICON != 0;
+        // Rang unter den Leisten-Icons: nur die ersten `shown` stehen wirklich dort.
+        let shown_in_bar = at.is_some_and(|at| icons[..at].iter().filter(|i| i.place() == Place::Bar).count() < shown);
+        let (change, overflow_dirty) = classify(before, after, icon_changed, shown_in_bar);
+        // Entfernen verschiebt die Plätze aller späteren Icons (Überlauf-Felder!).
+        let overflow_dirty = overflow_dirty || data.message == NIM_DELETE && pos.is_some();
+        (ok, change, overflow_dirty)
     });
     // Offener Überlauf: sofort neu zeichnen. Seine Felder verweisen auf Plätze in
     // der Icon-Liste, die sich beim Entfernen verschieben – ein Klick träfe
     // sonst die falsche App.
     let overflow = HWND_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed);
-    if !overflow.is_null() && IsWindowVisible(overflow) != 0 {
+    if overflow_dirty && !overflow.is_null() && IsWindowVisible(overflow) != 0 {
         InvalidateRect(overflow, std::ptr::null(), 0);
         windows_sys::Win32::Graphics::Gdi::UpdateWindow(overflow);
     }
-    Some(ok as LRESULT)
+    Some((ok as LRESULT, change))
 }
 
 /// Tray-Nachricht zusätzlich an Explorer weiterreichen. Explorer führt so
@@ -959,5 +1024,24 @@ mod tests {
         assert_eq!((wp >> 16) as u16 as i16, -5);
         assert_eq!(lp & 0xffff, NIN_SELECT as isize);
         assert_eq!(lp >> 16, 7);
+    }
+
+    #[test]
+    fn tray_change_only_for_visible_effects() {
+        use Place::*;
+        // Nur Tooltip: nichts.
+        assert_eq!(classify(Bar, Bar, false, true), (TrayChange::None, false));
+        // Neues Bild in der Leiste: nur der Infobereich.
+        assert_eq!(classify(Bar, Bar, true, true), (TrayChange::Icons, false));
+        // Neues Bild im Überlauf (ausgeblendet oder kein Platz): nur der Überlauf.
+        assert_eq!(classify(Overflow, Overflow, true, false), (TrayChange::None, true));
+        assert_eq!(classify(Bar, Bar, true, false), (TrayChange::None, true));
+        // Unsichtbares Icon: gar nichts.
+        assert_eq!(classify(Gone, Gone, true, false), (TrayChange::None, false));
+        // Kommt, geht oder wechselt den Platz: Aufteilung.
+        assert_eq!(classify(Gone, Bar, false, true), (TrayChange::Layout, true));
+        assert_eq!(classify(Bar, Gone, false, false), (TrayChange::Layout, true));
+        assert_eq!(classify(Gone, Overflow, false, false), (TrayChange::Layout, true));
+        assert_eq!(classify(Overflow, Bar, false, true), (TrayChange::Layout, true));
     }
 }

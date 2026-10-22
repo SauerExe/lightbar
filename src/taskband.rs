@@ -35,7 +35,6 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::util::{log, register_class, w16};
@@ -99,35 +98,45 @@ fn state_after_value(state: u32) -> u32 {
     }
 }
 
-/// Animations-Zeitgeber nur laufen lassen, solange ein Fortschritt unbestimmt ist.
+/// Fenster mit unbestimmtem Fortschritt, die noch leben und einen Button haben.
+unsafe fn spinning() -> Vec<HWND> {
+    let candidates: Vec<HWND> = BADGES.with(|b| b.borrow().iter().filter(|(_, e)| e.state & TBPF_INDETERMINATE != 0).map(|(&h, _)| h as HWND).collect());
+    candidates.into_iter().filter(|&h| IsWindow(h) != 0 && crate::bar::has_button(h)).collect()
+}
+
+/// Animations-Zeitgeber nur laufen lassen, solange ein sichtbarer Fortschritt
+/// unbestimmt ist (nur Fenster mit Button – sonst sieht ihn niemand).
 unsafe fn sync_spin(band: HWND) {
     if band.is_null() {
         return;
     }
-    let spinning = BADGES.with(|b| b.borrow().values().any(|e| e.state & TBPF_INDETERMINATE != 0));
-    if spinning {
-        SetTimer(band, TIMER_SPIN, 50, None);
-    } else {
+    if spinning().is_empty() {
         KillTimer(band, TIMER_SPIN);
+    } else {
+        SetTimer(band, TIMER_SPIN, 50, None);
     }
 }
 
-unsafe fn redraw() {
-    for b in crate::bar::all_bars() {
-        InvalidateRect(b, null(), 0);
-    }
+/// Sichtbarer Zustand eines Eintrags: (Symbol, Status, Wert).
+fn look(e: Option<&Badge>) -> (usize, u32, u32) {
+    e.map(|e| (e.overlay as usize, e.state, e.value)).unwrap_or((0, 0, 0))
 }
 
+/// Eintrag ändern; nur bei sichtbarer Änderung den Button des Fensters neu zeichnen.
 unsafe fn update(target: HWND, f: impl FnOnce(&mut Badge)) {
-    BADGES.with(|b| {
+    let changed = BADGES.with(|b| {
         let mut b = b.borrow_mut();
+        let before = look(b.get(&(target as isize)));
         let e = b.entry(target as isize).or_default();
         f(e);
         if e.overlay.is_null() && e.state == 0 {
             b.remove(&(target as isize));
         }
+        look(b.get(&(target as isize))) != before
     });
-    redraw();
+    if changed {
+        crate::bar::invalidate_buttons_of(&[target]);
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -158,6 +167,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         MSG_OVERLAY => {
             // Der Absender gibt sein Symbol gleich nach der Nachricht frei.
             let copy = if lp == 0 { null_mut() } else { CopyIcon(lp as HICON) };
+            // Kein Symbol und keins gehabt: nichts zu tun.
+            if copy.is_null() && BADGES.with(|b| b.borrow().get(&(target as isize)).is_none_or(|e| e.overlay.is_null())) {
+                return 0;
+            }
             update(target, |e| {
                 if !e.overlay.is_null() {
                     DestroyIcon(e.overlay);
@@ -178,9 +191,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_TIMER if wp == TIMER_SPIN => {
-            redraw();
-            // Fenster mit unbestimmtem Fortschritt kann inzwischen weg sein.
-            sync_spin(hwnd);
+            // Nur die Buttons mit unbestimmtem Fortschritt; ist keiner mehr
+            // da (Fenster zu, Button weg), steht der Takt.
+            let spin = spinning();
+            if spin.is_empty() {
+                KillTimer(hwnd, TIMER_SPIN);
+            } else {
+                crate::bar::invalidate_buttons_of(&spin);
+            }
             0
         }
         // Übrige TaskbarList-Nachrichten (Vorschau-Buttons, Tooltips, Tabs …)
@@ -318,6 +336,15 @@ static TASKBAR_BUTTON_CREATED: AtomicU32 = AtomicU32::new(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn look_ignores_unchanged_reports() {
+        let a = Badge { overlay: null_mut(), state: TBPF_NORMAL, value: 10 };
+        let b = Badge { overlay: null_mut(), state: TBPF_NORMAL, value: 10 };
+        assert_eq!(look(Some(&a)), look(Some(&b)));
+        assert_ne!(look(Some(&a)), look(Some(&Badge { value: 11, ..b })));
+        assert_eq!(look(None), (0, 0, 0));
+    }
 
     #[test]
     fn value_without_state_shows_normal_progress() {

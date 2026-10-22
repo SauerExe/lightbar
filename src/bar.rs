@@ -73,6 +73,15 @@ const TIMER_REFIT: usize = 12;
 const TIMER_KBD: usize = 13;
 const KBD_POLL_MS: u32 = 400;
 
+/// Energieeinstellung "Bildschirm an/aus" (GUID_CONSOLE_DISPLAY_STATE).
+const GUID_CONSOLE_DISPLAY_STATE: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
+/// Anmeldung für die Meldung oben (zum Abmelden beim Beenden).
+static DISPLAY_NOTIFY: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+
+fn guid_eq(a: &windows_sys::core::GUID, b: &windows_sys::core::GUID) -> bool {
+    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
+}
+
 /// Explorers Leiste kurz nach der Übernahme noch einmal ausblenden.
 pub unsafe fn schedule_rehide() {
     SetTimer(hwnd(), TIMER_REHIDE, 3000, None);
@@ -282,6 +291,11 @@ impl State {
     /// Sekunden, seit eines der Fenster blinkt (das am längsten blinkende).
     fn attention_of(&self, windows: &[HWND]) -> Option<f32> {
         self.attention.iter().filter(|(w, _)| windows.contains(w)).map(|(_, t)| t.elapsed().as_secs_f32()).reduce(f32::max)
+    }
+
+    /// Beginn des Blinkens (das am längsten blinkende Fenster).
+    fn attention_since(&self, windows: &[HWND]) -> Option<Instant> {
+        self.attention.iter().filter(|(w, _)| windows.contains(w)).map(|&(_, t)| t).min()
     }
 }
 
@@ -1985,11 +1999,38 @@ unsafe fn update_status(hwnd: HWND) {
     }
 }
 
+thread_local! {
+    /// Aktueller Takt der Eingabesprache in ms (0 = keiner).
+    static KBD_TIMER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Takt der Eingabesprache an der Hauptleiste setzen (0 = anhalten).
+unsafe fn arm_kbd(ms: u32) {
+    if KBD_TIMER.with(|t| t.replace(ms)) == ms {
+        return;
+    }
+    if ms == 0 {
+        KillTimer(self::hwnd(), TIMER_KBD);
+    } else {
+        SetTimer(self::hwnd(), TIMER_KBD, ms, None);
+    }
+}
+
 /// Eingabesprache neu bestimmen; nur bei Änderung neu zeichnen. Kommt sie dazu
 /// oder fällt sie weg (zweites Layout installiert/entfernt, Einstellung), ändert
 /// sich das Layout der Leiste – dann alles neu zeichnen.
 unsafe fn update_kbd(hwnd: HWND, relayout: bool) {
-    let next = if crate::settings::get().input_lang { crate::kbd::poll() } else { None };
+    let on = crate::settings::get().input_lang;
+    // Häufigster Fall (Takt): alles wie gehabt – ohne Speicheranforderung.
+    if on && !relayout && with(|s| s.kbd.as_ref().is_some_and(crate::kbd::unchanged)).unwrap_or(false) {
+        arm_kbd(KBD_POLL_MS);
+        return;
+    }
+    let next = if on { crate::kbd::poll() } else { None };
+    // Nachsehen im Takt nur, solange die Anzeige zu sehen ist (an und mehrere
+    // Layouts). Sonst prüfen Vordergrundwechsel, Einstellungen und der
+    // 30-s-Takt, ob sie (wieder) nötig ist.
+    arm_kbd(if next.is_some() { KBD_POLL_MS } else { 0 });
     let Some((changed, shown_changed)) = with(|s| {
         let changed = s.kbd != next;
         let shown_changed = s.kbd.is_some() != next.is_some();
@@ -2028,6 +2069,30 @@ unsafe extern "system" fn win_event(_: windows_sys::Win32::UI::Accessibility::HW
 /// Steht das Fenster gerade als Button auf der Leiste?
 fn is_known(h: HWND) -> bool {
     with(|s| s.groups.iter().any(|g| g.windows.contains(&h))).unwrap_or(false)
+}
+
+/// Hat das Fenster einen Button (für Fortschritt/Zähler aus `taskband`)?
+pub fn has_button(h: HWND) -> bool {
+    is_known(h)
+}
+
+/// Nur die Buttons dieser Fenster neu zeichnen, auf allen Leisten (Zähler,
+/// Fortschritt). Fenster ohne Button: nichts.
+pub unsafe fn invalidate_buttons_of(windows: &[HWND]) {
+    let Some(idx) = with(|s| s.groups.iter().enumerate().filter(|(_, g)| g.windows.iter().any(|w| windows.contains(w))).map(|(i, _)| i).collect::<Vec<_>>()) else { return };
+    if idx.is_empty() {
+        return;
+    }
+    for b in all_bars() {
+        if b.is_null() {
+            continue;
+        }
+        if let Some((l, _)) = current_layout(b) {
+            for r in idx.iter().filter_map(|&i| l.tasks.get(i)) {
+                InvalidateRect(b, r, 0);
+            }
+        }
+    }
 }
 
 /// Vordergrundwechsel, Cloaking (virtuelle Desktops) und Ein-/Ausblenden abonnieren.
@@ -2123,7 +2188,7 @@ unsafe fn kbd_menu(hwnd: HWND) {
     if crate::kbd::menu(hwnd, &k) {
         // Das Zielfenster stellt asynchron um: gleich und kurz danach nachsehen.
         update_kbd(self::hwnd(), false);
-        SetTimer(self::hwnd(), TIMER_KBD, 100, None);
+        arm_kbd(100);
     }
 }
 
@@ -2450,6 +2515,14 @@ unsafe fn kick(hwnd: HWND) {
 /// Leiste, deren Layout die Animation gerade antreibt.
 static ANIM_OWNER: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
+thread_local! {
+    /// Pulsierte beim letzten Animationsschritt ein Button?
+    static PULSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Was die Zweitleisten zuletzt gezeigt haben: Fingerabdruck des
+    /// gemeinsamen Zustands und Uhrzeit (siehe `secondary_signature`).
+    static SECONDARY_SEEN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Gleiten (anim.x, entlang der Leiste – senkrecht also nach y) gilt nur für
 /// die Leiste, die es berechnet; die anderen zeichnen ihre Buttons an der
 /// Zielposition.
@@ -2523,15 +2596,17 @@ unsafe fn drag_end(hwnd: HWND) -> bool {
     true
 }
 
-/// Ein Animationsschritt; `true`, solange sich noch etwas bewegt.
-unsafe fn step_anim(hwnd: HWND) -> bool {
-    let Some((l, _)) = current_layout(hwnd) else { return false };
+/// Ein Animationsschritt: (bewegt sich noch etwas außer dem Blinken?,
+/// Gruppen, deren Button gerade pulsiert). Pulsieren allein braucht kein
+/// Neuzeichnen der ganzen Leiste – nur dieser Buttons.
+unsafe fn step_anim(hwnd: HWND) -> (bool, Vec<usize>) {
+    let Some((l, _)) = current_layout(hwnd) else { return (false, Vec::new()) };
     let dpi = bar_dpi(hwnd);
     let fg = GetForegroundWindow();
     let vertical = crate::display::edge().vertical();
     let mut bar_origin = POINT { x: 0, y: 0 };
     ClientToScreen(hwnd, &mut bar_origin);
-    let (moving, new_buttons) = with(|s| {
+    let (moving, new_buttons, pulsing) = with(|s| {
         let d = dpi;
         let mut moving = false;
         let hover_id = hit_id(s.hover, &s.groups);
@@ -2581,17 +2656,15 @@ unsafe fn step_anim(hwnd: HWND) -> bool {
         // Aufmerksamkeit pulsiert etwa sieben Mal, danach leuchtet sie ruhig –
         // nur für Fenster mit Button (z. B. nicht auf einem anderen Desktop).
         s.attention.retain(|&(w, _)| IsWindow(w) != 0);
-        if s.groups.iter().any(|g| s.attention_of(&g.windows).is_some_and(attention_pulsing)) {
-            moving = true;
-        }
-        (moving, new_buttons)
+        let pulsing: Vec<usize> = s.groups.iter().enumerate().filter(|(_, g)| s.attention_of(&g.windows).is_some_and(attention_pulsing)).map(|(i, _)| i).collect();
+        (moving, new_buttons, pulsing)
     })
-    .unwrap_or((false, Vec::new()));
+    .unwrap_or((false, Vec::new(), Vec::new()));
     // Neu geöffnete App: Lichtimpuls im Leuchtrand.
     for at in new_buttons {
         crate::glow::flash(at);
     }
-    moving
+    (moving, pulsing)
 }
 
 /// Leuchtrand mit Hover-Position und Aufmerksamkeits-Buttons versorgen.
@@ -2614,9 +2687,8 @@ unsafe fn sync_glow(hwnd: HWND) {
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, g)| s.attention_of(&g.windows).is_some())
-            .filter_map(|(i, _)| l.tasks.get(i).map(|r| origin + mid(vertical, r)))
-            .collect::<Vec<i32>>();
+            .filter_map(|(i, g)| Some((origin + mid(vertical, l.tasks.get(i)?), s.attention_since(&g.windows)?)))
+            .collect::<Vec<(i32, Instant)>>();
         attention
     }) else {
         return;
@@ -3836,6 +3908,103 @@ unsafe fn draw_clock(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
     text(dc, &date, &RECT { top: mid, ..cr }, font, TEXT, flags | DT_TOP);
 }
 
+/// Fingerabdruck dessen, was Zweitleisten außer der Uhr zeigen: Buttons
+/// (Apps, Fenster, Icons, aktive App, Aufmerksamkeit ruhig/pulsierend,
+/// Laufend-Strich und Einblenden), Feder, Ziehen, Startsymbol und Akzentfarbe.
+/// Hover der Hauptleiste, Tray, Status, CPU-Balken und Eingabesprache gehören
+/// nicht dazu. Fortschritt/Zähler zeichnet `taskband` selbst auf allen Leisten neu.
+fn secondary_signature() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let fg = unsafe { GetForegroundWindow() } as usize;
+    with(|s| {
+        for g in &s.groups {
+            g.key.hash(&mut h);
+            for w in &g.windows {
+                (*w as usize).hash(&mut h);
+            }
+            (g.icon as usize).hash(&mut h);
+            g.windows.iter().any(|w| *w as usize == fg).hash(&mut h);
+            // Pulsieren selbst zeichnet der Animations-Takt auf allen Leisten.
+            s.attention_of(&g.windows).map(attention_pulsing).hash(&mut h);
+            let id = format!("g:{}", g.key);
+            s.anim.ind.get(&id).map(|v| v.round() as i32).hash(&mut h);
+            s.anim.appear.get(&id).map(|v| (v * 64.0) as i32).hash(&mut h);
+        }
+        s.anim.press.as_ref().map(|(id, t0)| (id.clone(), (t0.elapsed().as_secs_f32() * 60.0) as i32)).hash(&mut h);
+        s.drag.as_ref().filter(|d| d.active).map(|d| (d.slot.clone(), d.pos)).hash(&mut h);
+    });
+    (crate::settings::get().start_logo as u8).hash(&mut h);
+    accent().hash(&mut h);
+    h.finish()
+}
+
+/// Angezeigte Uhrzeit als Zahl (Tag, Stunde, Minute, ggf. Sekunde): ändert sich
+/// genau dann, wenn die Uhr anders aussieht.
+fn clock_key() -> u64 {
+    let mut st: SYSTEMTIME = unsafe { zeroed() };
+    unsafe { GetLocalTime(&mut st) };
+    let sec = if clock_seconds() { st.wSecond as u64 } else { 0 };
+    ((((st.wYear as u64 * 13 + st.wMonth as u64) * 32 + st.wDay as u64) * 24 + st.wHour as u64) * 60 + st.wMinute as u64) * 60 + sec
+}
+
+/// Was ein WM_SETTINGCHANGE für die Leiste bedeutet.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SettingAction {
+    /// Nichts (Umgebung, Richtlinien, win.ini-Abschnitte).
+    Ignore,
+    /// Fremde Änderung des Arbeitsbereichs: Platz nachprüfen.
+    WorkArea,
+    /// Regionalformat.
+    Intl,
+    /// Aussehen (Akzentfarbe, Design, Metriken): neu zeichnen.
+    Look,
+    /// Mögliche Taskleisten-Einstellung: neu lesen und anwenden.
+    Taskbar,
+}
+
+/// Bereich (lParam-Zeichenkette) eines WM_SETTINGCHANGE, falls vorhanden.
+unsafe fn setting_area(lp: LPARAM) -> Option<String> {
+    if lp == 0 {
+        return None;
+    }
+    let p = lp as *const u16;
+    let mut v = Vec::new();
+    for i in 0..128 {
+        let c = *p.add(i);
+        if c == 0 {
+            break;
+        }
+        v.push(c);
+    }
+    Some(String::from_utf16_lossy(&v))
+}
+
+/// WM_SETTINGCHANGE einordnen (wParam = SPI_*, `area` = lParam-Text): Nur
+/// Taskleisten-Meldungen ("TraySettings" oder die allgemeine ohne Angaben)
+/// lesen die Einstellungen neu und gleichen die Bildschirme ab.
+fn setting_action(spi: u32, area: Option<&str>) -> SettingAction {
+    if spi == SPI_SETWORKAREA {
+        return SettingAction::WorkArea;
+    }
+    match area {
+        Some(a) if a.eq_ignore_ascii_case("intl") => SettingAction::Intl,
+        Some(a) if a.eq_ignore_ascii_case("TraySettings") => SettingAction::Taskbar,
+        Some(a) if ["Environment", "Policy", "Windows", "Extensions", "Devices", "PrinterPorts"].iter().any(|x| a.eq_ignore_ascii_case(x)) => SettingAction::Ignore,
+        // Registry-Pfade (z. B. Richtlinien-Schlüssel) betreffen die Leiste nur unter Explorer.
+        Some(a) if a.contains('\\') => {
+            if a.to_ascii_lowercase().contains("explorer") {
+                SettingAction::Taskbar
+            } else {
+                SettingAction::Ignore
+            }
+        }
+        // Allgemeine Meldung ohne Angaben: kann alles sein, auch die Leiste.
+        None if spi == 0 => SettingAction::Taskbar,
+        _ => SettingAction::Look,
+    }
+}
+
 /// Ist nur die Uhr ungültig (Sekunden-/Minutentakt)?
 unsafe fn clock_only_update(hwnd: HWND) -> Option<RECT> {
     let mut ur: RECT = zeroed();
@@ -4199,11 +4368,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_COPYDATA => {
             prof(7);
-            if let Some(r) = tray::handle_copydata(lp) {
+            if let Some((r, change)) = tray::handle_copydata(lp) {
                 // Explorer bekommt eine Kopie (Sprechblasen → Benachrichtigungen);
                 // die App erhält aber unsere Antwort `r`.
                 tray::forward_to_explorer(hwnd, wp, lp);
-                InvalidateRect(hwnd, null(), 0);
+                match change {
+                    // Nur Tooltip oder Icons im Überlauf (der zeichnet sich selbst).
+                    tray::TrayChange::None => {}
+                    // Nur Bilder: Infobereich samt Pfeil.
+                    tray::TrayChange::Icons => {
+                        if let Some((l, _)) = current_layout(self::hwnd()) {
+                            for r in l.tray.iter().chain(l.chevron.iter()) {
+                                InvalidateRect(self::hwnd(), r, 0);
+                            }
+                        }
+                    }
+                    // Mehr oder weniger Icons: Aufteilung der Hauptleiste ändert sich.
+                    tray::TrayChange::Layout => {
+                        InvalidateRect(self::hwnd(), null(), 0);
+                    }
+                }
                 return r;
             }
             // AppBar & Co. gehören weiter Explorer.
@@ -4220,15 +4404,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_PAINT => {
             prof(4);
-            let clock_only = clock_only_update(hwnd).is_some();
             paint(hwnd);
-            // Zweitleisten zeigen denselben Zustand: mitzeichnen – beim Uhr-Takt nur die Uhr.
+            // Zweitleisten zeigen Start, Apps und Uhr: nur mitzeichnen, wenn sich
+            // davon etwas geändert hat – nicht bei Hover, CPU-Balken, Tray,
+            // Status oder Eingabesprache der Hauptleiste.
             if hwnd == self::hwnd() {
-                for h in secondaries() {
-                    match current_layout(h).filter(|_| clock_only) {
-                        Some((l, _)) => InvalidateRect(h, &l.clock, 0),
-                        None => InvalidateRect(h, null(), 0),
-                    };
+                let now = (secondary_signature(), clock_key());
+                let seen = SECONDARY_SEEN.with(|s| s.replace(now));
+                if now != seen {
+                    for h in secondaries() {
+                        if now.0 != seen.0 {
+                            InvalidateRect(h, null(), 0);
+                        } else if let Some((l, _)) = current_layout(h) {
+                            InvalidateRect(h, &l.clock, 0);
+                        }
+                    }
                 }
             }
             0
@@ -4239,10 +4429,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Dateien über einer App verweilt: deren Fenster holen.
         WM_TIMER if dragdrop::on_timer(hwnd, wp) => 0,
         WM_TIMER if wp == TIMER_ANIM => {
-            if !step_anim(hwnd) {
+            let (moving, pulsing) = step_anim(hwnd);
+            let was_pulsing = PULSING.with(|p| p.replace(!pulsing.is_empty()));
+            if !moving && pulsing.is_empty() {
                 KillTimer(hwnd, TIMER_ANIM);
             }
-            InvalidateRect(hwnd, null(), 0);
+            // Bewegt sich etwas anderes (Hover, Gleiten, Feder) oder endet die
+            // Animation: ganze Leiste; sonst nur die pulsierenden Buttons.
+            if moving || pulsing.is_empty() {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            // Pulsieren zeigen alle Leisten. Nach dem letzten Puls einmal alle
+            // ganz, damit überall der ruhige Endzustand steht.
+            for b in all_bars() {
+                if b.is_null() || (b == hwnd && (moving || pulsing.is_empty())) {
+                    continue;
+                }
+                if was_pulsing && pulsing.is_empty() {
+                    InvalidateRect(b, null(), 0);
+                } else if let Some((l, _)) = (!pulsing.is_empty()).then(|| current_layout(b)).flatten() {
+                    for r in pulsing.iter().filter_map(|&i| l.tasks.get(i)) {
+                        InvalidateRect(b, r, 0);
+                    }
+                }
+            }
             0
         }
         WM_TIMER if wp == TIMER_TIP => {
@@ -4259,6 +4469,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_BAR_USAGE => {
+            crate::glow::usage_changed();
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -4357,8 +4568,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // Win+Leertaste/Alt+Umschalt meldet niemand: kurz nachsehen (billig,
             // gezeichnet wird nur bei Änderung). Setzt auch den Takt nach dem
             // schnellen Nachsehen aus dem Menü zurück.
+            // Stellt den Takt danach selbst wieder auf 400 ms bzw. hält ihn an.
             update_kbd(hwnd, false);
-            SetTimer(hwnd, TIMER_KBD, KBD_POLL_MS, None);
             0
         }
         WM_TIMER if wp == TIMER_CPU => {
@@ -4438,6 +4649,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // Z-Order gegenüber Explorer.
             refresh(hwnd, None);
             update_status(hwnd);
+            // Layout dazugekommen/entfernt, während die Anzeige aus war (kein Takt).
+            update_kbd(hwnd, false);
             tray::tick();
             crate::shell::ensure_hidden();
             // Position oder automatisches Ausblenden in Windows geändert, ohne
@@ -4473,6 +4686,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         // Lautstärke, Netzwerk oder Akku haben sich geändert (Meldung aus `status`).
+        // Bildschirm an/aus (GUID_CONSOLE_DISPLAY_STATE): Leuchtrand anhalten
+        // bzw. fortsetzen – niemand sieht ihn.
+        WM_POWERBROADCAST if wp as u32 == PBT_POWERSETTINGCHANGE => {
+            let ps = lp as *const windows_sys::Win32::System::Power::POWERBROADCAST_SETTING;
+            if hwnd == self::hwnd() && !ps.is_null() && guid_eq(&(*ps).PowerSetting, &GUID_CONSOLE_DISPLAY_STATE) && (*ps).DataLength >= 4 {
+                // 0 = aus, 1 = an, 2 = gedimmt (sichtbar).
+                let state = std::ptr::read_unaligned((*ps).Data.as_ptr() as *const u32);
+                crate::glow::set_paused(crate::glow::PAUSE_DISPLAY_OFF, state == 0);
+            }
+            1
+        }
         WM_BAR_STATUS | WM_POWERBROADCAST => {
             prof(6);
             if msg == WM_BAR_STATUS {
@@ -4493,6 +4717,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_WTSSESSION_CHANGE => {
             if hwnd == self::hwnd() && matches!(wp as u32, WTS_SESSION_UNLOCK | WTS_REMOTE_CONNECT | WTS_CONSOLE_CONNECT) {
                 crate::keyhook::reinstall();
+            }
+            // Gesperrt oder getrennt (RDP zu): Leuchtrand anhalten, danach weiter.
+            if hwnd == self::hwnd() {
+                use crate::glow::{set_paused, PAUSE_DISCONNECTED, PAUSE_LOCKED};
+                match wp as u32 {
+                    WTS_SESSION_LOCK => set_paused(PAUSE_LOCKED, true),
+                    WTS_SESSION_UNLOCK => set_paused(PAUSE_LOCKED, false),
+                    WTS_REMOTE_DISCONNECT | WTS_CONSOLE_DISCONNECT => set_paused(PAUSE_DISCONNECTED, true),
+                    WTS_REMOTE_CONNECT | WTS_CONSOLE_CONNECT => set_paused(PAUSE_DISCONNECTED, false),
+                    _ => {}
+                }
             }
             0
         }
@@ -4674,24 +4909,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         // Akzentfarbe geändert (Personalisierung) → neu einlesen.
         0x0320 | WM_SETTINGCHANGE => {
-            reload_accent();
-            // Regionalformat geändert ("intl"): Uhrbreite neu messen, Uhr und
-            // Kalender zeichnen sich danach im neuen Format.
-            if msg == WM_SETTINGCHANGE && crate::clockfmt::is_intl(lp) {
-                crate::clockfmt::invalidate();
-                crate::calendar::refresh();
+            let area = if msg == WM_SETTINGCHANGE { setting_area(lp) } else { None };
+            let action = if msg == WM_SETTINGCHANGE { setting_action(wp as u32, area.as_deref()) } else { SettingAction::Look };
+            let main = hwnd == self::hwnd();
+            match action {
+                // Umgebungsvariablen, Richtlinien, win.ini: nichts für die Leiste.
+                SettingAction::Ignore => {}
+                // Arbeitsbereich von jemand anderem geändert (meist Explorer): kurz
+                // danach prüfen, ob unsere Leisten noch Platz haben.
+                SettingAction::WorkArea => {
+                    if main {
+                        SetTimer(hwnd, TIMER_WORKAREA, 200, None);
+                    }
+                }
+                // Regionalformat ("intl"): Uhrbreite neu messen, Uhr und Kalender
+                // zeichnen sich danach im neuen Format.
+                SettingAction::Intl => {
+                    crate::clockfmt::invalidate();
+                    if main {
+                        crate::calendar::refresh();
+                        update_kbd(hwnd, false);
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                // Akzentfarbe, Design, Systemmetriken: neu einlesen und zeichnen.
+                SettingAction::Look => {
+                    reload_accent();
+                    if main {
+                        update_kbd(hwnd, false);
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                // Taskleisten-Einstellungen von Windows (Ausrichtung, alle
+                // Bildschirme, Position) gelten sofort.
+                SettingAction::Taskbar => {
+                    reload_accent();
+                    if main {
+                        apply_taskbar_settings();
+                        update_kbd(hwnd, false);
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                }
             }
-            // Taskleisten-Einstellungen von Windows (Ausrichtung, alle Bildschirme)
-            // gelten sofort – nicht bei unserer eigenen Arbeitsbereich-Meldung.
-            // Arbeitsbereich von jemand anderem geändert (meist Explorer): kurz danach
-            // prüfen, ob unsere Leisten noch Platz haben.
-            if msg == WM_SETTINGCHANGE && hwnd == self::hwnd() && wp as u32 == SPI_SETWORKAREA {
-                SetTimer(hwnd, TIMER_WORKAREA, 200, None);
-            }
-            if msg == WM_SETTINGCHANGE && hwnd == self::hwnd() && wp as u32 != SPI_SETWORKAREA {
-                apply_taskbar_settings();
-            }
-            InvalidateRect(hwnd, null(), 0);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_LBUTTONDBLCLK => {
@@ -4818,6 +5077,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             KillTimer(hwnd, TIMER_TICK);
             DeregisterShellHookWindow(hwnd);
             windows_sys::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification(hwnd);
+            let notify = DISPLAY_NOTIFY.swap(null_mut(), Ordering::Relaxed);
+            if !notify.is_null() {
+                windows_sys::Win32::System::Power::UnregisterPowerSettingNotification(notify as _);
+            }
             // Selbst gesetzten Arbeitsbereich zurückgeben (wie bei den Zweitleisten).
             release_work_area(hwnd);
             let mut abd = appbar_data(hwnd);
@@ -4898,10 +5161,14 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
     if windows_sys::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(hwnd, windows_sys::Win32::System::RemoteDesktop::NOTIFY_FOR_THIS_SESSION) == 0 {
         crate::util::log("Sitzungsmeldungen (Entsperren) nicht verfügbar");
     }
+    // Eingabesprache nur im Takt prüfen, wenn sie angezeigt wird.
+    arm_kbd(if with(|s| s.kbd.is_some()).unwrap_or(false) { KBD_POLL_MS } else { 0 });
+    // Bildschirm an/aus melden lassen (Leuchtrand pausiert bei dunklem Bildschirm).
+    let notify = windows_sys::Win32::System::Power::RegisterPowerSettingNotification(hwnd as _, &GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE);
+    DISPLAY_NOTIFY.store(notify as *mut c_void, Ordering::Relaxed);
     schedule_clock(hwnd);
     SetTimer(hwnd, TIMER_CPU, 2000, None);
     SetTimer(hwnd, TIMER_SLOW, 30_000, None);
-    SetTimer(hwnd, TIMER_KBD, KBD_POLL_MS, None);
     status::watch(hwnd);
     install_win_events();
     migrate_pins_on_start();
@@ -5123,6 +5390,26 @@ mod tests {
         for c in tight.iter().filter(|c| c.starts_with("w=1080 ") || c.starts_with("w=1366 ")) {
             println!("  {c}");
         }
+    }
+
+    #[test]
+    fn setting_change_filter() {
+        use SettingAction::*;
+        assert_eq!(setting_action(0, Some("Environment")), Ignore);
+        assert_eq!(setting_action(0, Some("Policy")), Ignore);
+        assert_eq!(setting_action(0, Some(r"Software\Microsoft\Windows\CurrentVersion\Policies\System")), Ignore);
+        assert_eq!(setting_action(0, Some(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")), Taskbar);
+        assert_eq!(setting_action(0, Some("TraySettings")), Taskbar);
+        assert_eq!(setting_action(0, None), Taskbar);
+        assert_eq!(setting_action(0, Some("intl")), Intl);
+        assert_eq!(setting_action(0, Some("ImmersiveColorSet")), Look);
+        assert_eq!(setting_action(SPI_SETWORKAREA, None), WorkArea);
+        assert_eq!(setting_action(SPI_SETNONCLIENTMETRICS, Some("WindowMetrics")), Look);
+    }
+
+    #[test]
+    fn glow_pulses_as_long_as_the_buttons() {
+        assert_eq!(FLASH_PULSES * FLASH_PERIOD, crate::glow::ATTENTION_PULSE_S);
     }
 
     /// Eingabesprache sitzt wie bei Windows zwischen Infobereich und Status

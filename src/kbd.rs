@@ -127,13 +127,31 @@ pub fn poll() -> Option<Indicator> {
         }
         c.1.clone()
     });
-    let mut current = current_hkl();
-    // Konsolen & Co. melden manchmal ein Layout, das nicht (mehr) in der Liste
-    // steht: dann nach der Sprache suchen.
-    if !entries.iter().any(|e| e.hkl == current) {
-        current = entries.iter().find(|e| e.hkl & 0xFFFF == current & 0xFFFF).map_or(entries[0].hkl, |e| e.hkl);
-    }
+    let current = resolve_current(current_hkl(), &entries);
     Some(Indicator { current, entries })
+}
+
+/// Konsolen & Co. melden manchmal ein Layout, das nicht (mehr) in der Liste
+/// steht: dann nach der Sprache suchen, sonst das erste.
+fn resolve_current(current: isize, entries: &[Entry]) -> isize {
+    if entries.iter().any(|e| e.hkl == current) {
+        return current;
+    }
+    entries.iter().find(|e| e.hkl & 0xFFFF == current & 0xFFFF).or(entries.first()).map_or(current, |e| e.hkl)
+}
+
+/// Stimmt die Anzeige noch (gleiche Layoutliste, gleiches aktives Layout)?
+/// Ohne Speicheranforderung – für das häufige Nachsehen im Takt.
+pub fn unchanged(prev: &Indicator) -> bool {
+    let mut buf: [HKL; 32] = [null_mut(); 32];
+    let n = unsafe { GetKeyboardLayoutList(buf.len() as i32, buf.as_mut_ptr()) };
+    if n <= 0 || n as usize != prev.entries.len() {
+        return false;
+    }
+    if !buf[..n as usize].iter().zip(&prev.entries).all(|(&h, e)| h as isize == e.hkl) {
+        return false;
+    }
+    resolve_current(current_hkl(), &prev.entries) == prev.current
 }
 
 /// Doppelte Sprachkürzel unterscheiden: verschiedene Regionen → Regionskürzel
@@ -321,6 +339,16 @@ mod tests {
 
     fn raw(hkl: isize, abbr: &str, region: &str, layout: &str) -> Raw {
         Raw { hkl, abbr: abbr.into(), region: region.into(), language: format!("{abbr}-{region}"), layout: layout.into() }
+    }
+
+    #[test]
+    fn current_layout_falls_back_to_language_then_first() {
+        let e = resolve(vec![raw(0x04070407, "DEU", "DE", "Deutsch"), raw(0x04090409, "ENG", "US", "US")]);
+        assert_eq!(resolve_current(0x04090409, &e), 0x04090409);
+        // Unbekanntes Layout derselben Sprache (en-US mit anderem Gerät).
+        assert_eq!(resolve_current(0xF0020409u32 as i32 as isize, &e), 0x04090409);
+        // Ganz unbekannt: das erste.
+        assert_eq!(resolve_current(0x040C040C, &e), 0x04070407);
     }
 
     #[test]

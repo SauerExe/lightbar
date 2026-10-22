@@ -8,7 +8,9 @@
 //!
 //! Eigene Layered-Fenster mit Pro-Pixel-Alpha (UpdateLayeredWindow),
 //! klickdurchlässig und nie aktiv. Gerendert wird spaltenweise in einen
-//! DIB-Puffer – rund 40 000 Pixel pro Leiste und Bild bei 30 fps. Auf
+//! DIB-Puffer – rund 40 000 Pixel pro Leiste und Bild. 30 fps nur, solange
+//! sich etwas bewegt (Hover, Blinken, Lichtimpuls, Komet), sonst 2 fps; bei
+//! gesperrter Sitzung oder ausgeschaltetem Bildschirm steht der Takt. Auf
 //! mehreren Monitoren hat jede Leiste ihr Leuchtfenster; Farbverlauf und Komet
 //! laufen in Bildschirmkoordinaten als ein Band von links nach rechts (bei
 //! seitlichen Leisten von oben nach unten).
@@ -28,6 +30,23 @@ use crate::settings::GlowStyle;
 use crate::util::*;
 
 const TIMER_FRAME: usize = 1;
+/// Bildtakt, solange sich etwas bewegt (Hover, Blinken, Impuls, Komet).
+const FAST_MS: u32 = 33;
+/// Ruhetakt: nur der langsam fließende Verlauf.
+const SLOW_MS: u32 = 500;
+/// Niemand am Rechner (keine Eingabe seit `DORMANT_S`): kaum noch Bilder, keine Kometen.
+const DORMANT_MS: u32 = 5000;
+const DORMANT_S: u32 = 120;
+/// Pause zwischen zwei Kometen: kurz, solange an der Leiste etwas passiert
+/// (bis `AWAKE_S` nach Hover, Impuls oder Aufmerksamkeit), sonst länger.
+const COMET_GAP_AWAKE: f32 = 5.4;
+const COMET_GAP_QUIET: f32 = 43.4;
+const AWAKE_S: f32 = 60.0;
+/// So lange pulsiert das Orange einer App, die Aufmerksamkeit will; danach
+/// leuchtet es ruhig (wie die Buttons der Leiste).
+pub const ATTENTION_PULSE_S: f32 = 7.0;
+/// Wärme (Usage-Auslastung) höchstens so oft neu berechnen.
+const WARMTH_TTL_S: f32 = 30.0;
 /// Tiefe des Leuchtens neben der Leiste und Stärke der Linie (logisch).
 const GLOW_H: i32 = 22;
 const LINE_H: i32 = 2;
@@ -69,14 +88,28 @@ struct State {
     /// Geglättete Hover-Position und -Stärke, damit das Glühen mitgleitet.
     hover_pos: f32,
     hover_amt: f32,
-    attention: Vec<i32>,
+    /// Stellen, die Aufmerksamkeit wollen, mit Beginn des Blinkens.
+    attention: Vec<(i32, Instant)>,
     flashes: Vec<Flash>,
+    /// Stil aus den Einstellungen (in `sync` gelesen, nicht in jedem Bild).
+    style: GlowStyle,
+    /// Gecachte Wärme und wann sie berechnet wurde (None = neu berechnen).
+    warm: f32,
+    warm_at: Option<Instant>,
+    /// Beginn des aktuellen bzw. nächsten Kometen (Sekunden seit `start`).
+    comet_at: f32,
+    /// Zuletzt etwas an der Leiste passiert (Hover, Impuls, Aufmerksamkeit).
+    activity: Instant,
+    /// Sitzung gesperrt/getrennt bzw. Bildschirm aus (PAUSE_*-Bits): kein Takt.
+    paused: u8,
 }
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     /// Fenster, an dem der Bildtakt für alle Leuchtfenster hängt.
     static TIMER_OWNER: Cell<HWND> = const { Cell::new(null_mut()) };
+    /// Aktuell gesetzter Takt in ms (0 = keiner).
+    static TIMER_MS: Cell<u32> = const { Cell::new(0) };
 }
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
@@ -95,17 +128,179 @@ pub unsafe fn set_style(style: GlowStyle) {
 /// Mauszeiger über der Leiste (Position entlang der Leiste: Bildschirm-x,
 /// seitlich Bildschirm-y) oder None.
 pub fn set_hover(x: Option<i32>) {
-    with(|s| s.hover_x = x);
+    let changed = with(|s| {
+        if s.hover_x == x {
+            return false;
+        }
+        s.hover_x = x;
+        if x.is_some() {
+            s.activity = Instant::now();
+            // Die Maus bewegt sich über der Leiste: Sitzung offen, Bildschirm an
+            // (Sicherheitsnetz, falls eine Entsperr-Meldung verloren ging).
+            s.paused = 0;
+        }
+        true
+    })
+    .unwrap_or(false);
+    if changed {
+        unsafe { wake() };
+    }
 }
 
-/// Dauerhaft pulsierende Stellen (Buttons, die Aufmerksamkeit wollen), entlang der Leiste.
-pub fn set_attention(xs: Vec<i32>) {
-    with(|s| s.attention = xs);
+/// Stellen, die Aufmerksamkeit wollen (Buttons), entlang der Leiste, mit dem
+/// Beginn ihres Blinkens: pulsieren `ATTENTION_PULSE_S` lang, dann ruhig.
+pub fn set_attention(xs: Vec<(i32, Instant)>) {
+    let changed = with(|s| {
+        if s.attention == xs {
+            return false;
+        }
+        if !xs.is_empty() {
+            s.activity = Instant::now();
+        }
+        s.attention = xs;
+        true
+    })
+    .unwrap_or(false);
+    if changed {
+        unsafe { wake() };
+    }
 }
 
 /// Einmaliger Lichtimpuls an einer Stelle entlang der Leiste (z. B. App gestartet).
 pub fn flash(at: i32) {
-    with(|s| s.flashes.push(Flash { at, start: Instant::now() }));
+    with(|s| {
+        s.flashes.push(Flash { at, start: Instant::now() });
+        s.activity = Instant::now();
+    });
+    unsafe { wake() };
+}
+
+/// Usage hat sich geändert: Wärme beim nächsten Bild neu berechnen.
+pub fn usage_changed() {
+    with(|s| s.warm_at = None);
+}
+
+/// Gründe, den Takt anzuhalten (Bits in `State::paused`).
+pub const PAUSE_LOCKED: u8 = 1;
+pub const PAUSE_DISCONNECTED: u8 = 2;
+pub const PAUSE_DISPLAY_OFF: u8 = 4;
+
+/// Grund zum Anhalten setzen (Sitzung gesperrt, getrennt, Bildschirm aus) oder
+/// aufheben; läuft wieder, sobald kein Grund mehr besteht.
+pub unsafe fn set_paused(reason: u8, on: bool) {
+    with(|s| if on { s.paused |= reason } else { s.paused &= !reason });
+    reschedule_now();
+}
+
+/// Nach Pause/Fortsetzen: sofort ein Bild (bzw. Takt anhalten).
+unsafe fn reschedule_now() {
+    let paused = with(|s| s.paused != 0).unwrap_or(true);
+    if paused {
+        set_interval(0);
+    } else {
+        frame();
+    }
+}
+
+/// Etwas Bewegtes beginnt: vom Ruhetakt sofort auf den schnellen Takt.
+unsafe fn wake() {
+    let ms = TIMER_MS.with(|t| t.get());
+    if ms == 0 || ms > FAST_MS {
+        let paused = with(|s| !s.visible || s.paused != 0).unwrap_or(true);
+        if !paused {
+            set_interval(FAST_MS);
+        }
+    }
+}
+
+/// Bildtakt setzen (0 = anhalten); unverändert nicht neu setzen.
+unsafe fn set_interval(ms: u32) {
+    let owner = TIMER_OWNER.with(|t| t.get());
+    if owner.is_null() {
+        TIMER_MS.with(|t| t.set(0));
+        return;
+    }
+    if TIMER_MS.with(|t| t.replace(ms)) == ms {
+        return;
+    }
+    if ms == 0 {
+        KillTimer(owner, TIMER_FRAME);
+    } else {
+        SetTimer(owner, TIMER_FRAME, ms, None);
+    }
+}
+
+/// Sekunden ohne Tastatur- oder Mauseingabe (ganze Sitzung).
+unsafe fn input_idle_s() -> u32 {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut li = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    if GetLastInputInfo(&mut li) == 0 {
+        return 0;
+    }
+    GetTickCount().wrapping_sub(li.dwTime) / 1000
+}
+
+/// Was den nächsten Takt bestimmt (reine Logik, testbar).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pace {
+    /// Hover gleitet noch, Impuls läuft, Aufmerksamkeit pulsiert.
+    effects: bool,
+    /// Komet unterwegs.
+    comet: bool,
+    /// Sekunden bis zum nächsten Kometen (falls keiner unterwegs).
+    comet_in: f32,
+    /// Niemand am Rechner.
+    dormant: bool,
+}
+
+/// Nächster Takt in ms: schnell bei Bewegung, sonst Ruhetakt – aber
+/// rechtzeitig zum Start des nächsten Kometen wach.
+fn next_interval(p: Pace) -> u32 {
+    if p.effects || p.comet {
+        return FAST_MS;
+    }
+    if p.dormant {
+        return DORMANT_MS;
+    }
+    let until = (p.comet_in * 1000.0).ceil().max(0.0) as u32;
+    until.clamp(FAST_MS, SLOW_MS)
+}
+
+/// Pause bis zum nächsten Kometen: kurz, solange an der Leiste kürzlich etwas los war.
+fn comet_gap(since_activity: f32) -> f32 {
+    if since_activity < AWAKE_S {
+        COMET_GAP_AWAKE
+    } else {
+        COMET_GAP_QUIET
+    }
+}
+
+/// Beginn des nächsten Kometen nach einem Bild zur Zeit `t`: Ist der aktuelle
+/// durch, kommt der nächste nach der Pause; wird es wieder lebhaft, früher;
+/// ist niemand am Rechner, wartet er.
+fn next_comet(comet_at: f32, t: f32, travel: f32, since_activity: f32, dormant: bool) -> f32 {
+    let gap = comet_gap(since_activity);
+    let mut at = comet_at;
+    if t >= at + travel {
+        at = t + gap;
+    }
+    if t < at {
+        at = at.min(t + gap);
+        if dormant {
+            at = at.max(t + COMET_GAP_AWAKE);
+        }
+    }
+    at
+}
+
+/// Pulsstärke (0..1) einer Aufmerksamkeitsstelle: erst pulsieren, dann ruhig voll.
+fn attention_pulse(t: f32, elapsed: f32) -> f32 {
+    if elapsed < ATTENTION_PULSE_S {
+        0.5 + 0.5 * (t * 6.0).sin()
+    } else {
+        1.0
+    }
 }
 
 /// Fenster des Leuchtrands zu einer Leiste `bar` (Bildschirmkoordinaten): die
@@ -224,12 +419,14 @@ pub unsafe fn sync() {
         free(o);
     }
     let first = surfaces.first().map(|s| s.hwnd).unwrap_or(null_mut());
+    let style = crate::settings::get().glow;
     with(|s| {
         s.visible = !surfaces.is_empty();
         s.surfaces = surfaces;
         s.dpi = dpi;
         s.span = span;
         s.edge = edge;
+        s.style = style;
     });
     // Ein Takt für alle Fenster, am ersten Leuchtfenster.
     let prev = TIMER_OWNER.with(|t| t.replace(first));
@@ -237,12 +434,13 @@ pub unsafe fn sync() {
         if !prev.is_null() && IsWindow(prev) != 0 {
             KillTimer(prev, TIMER_FRAME);
         }
-        if !first.is_null() {
-            SetTimer(first, TIMER_FRAME, 33, None);
-        }
+        TIMER_MS.with(|t| t.set(0));
     }
-    if !first.is_null() {
-        frame();
+    if first.is_null() {
+        set_interval(0);
+    } else {
+        // Ein Bild und der passende Takt (bei Pause: keiner).
+        reschedule_now();
     }
 }
 
@@ -297,15 +495,24 @@ fn warmth() -> f32 {
 }
 
 unsafe fn frame() {
-    let warm = warmth();
-    let style = crate::settings::get().glow;
-    let cool = stops(style);
-    // Neon fließt schneller und über mehr Farbe pro Breite.
-    let (spread, speed) = if style == GlowStyle::Neon { (2.4, 0.16) } else { (1.4, 0.06) };
-    let Some((dc, jobs)) = with(|s| {
-        if !s.visible {
-            return (s.dc, Vec::new());
+    // Wärme nur gelegentlich neu (Mutex + Kopien in usage::current), nicht je Bild.
+    if with(|s| s.warm_at.is_none_or(|at| at.elapsed().as_secs_f32() > WARMTH_TTL_S)).unwrap_or(false) {
+        let w = warmth();
+        with(|s| {
+            s.warm = w;
+            s.warm_at = Some(Instant::now());
+        });
+    }
+    let dormant = input_idle_s() >= DORMANT_S;
+    let Some((dc, jobs, pace)) = with(|s| {
+        if !s.visible || s.paused != 0 {
+            return (s.dc, Vec::new(), None);
         }
+        let warm = s.warm;
+        let style = s.style;
+        let cool = stops(style);
+        // Neon fließt schneller und über mehr Farbe pro Breite.
+        let (spread, speed) = if style == GlowStyle::Neon { (2.4, 0.16) } else { (1.4, 0.06) };
         let t = s.start.elapsed().as_secs_f32();
         let d = s.dpi;
         let scale = d as f32 / 96.0;
@@ -324,17 +531,34 @@ unsafe fn frame() {
                 s.hover_pos += (target - s.hover_pos) * 0.35;
                 s.hover_amt += (1.0 - s.hover_amt) * 0.2;
             }
-            None => s.hover_amt *= 0.85,
+            None => {
+                s.hover_amt *= 0.85;
+                if s.hover_amt < 0.01 {
+                    s.hover_amt = 0.0;
+                }
+            }
         }
         s.flashes.retain(|f| f.start.elapsed().as_secs_f32() < 1.2);
 
-        // Komet: alle ~7 s einmal von links nach rechts (seitlich von oben nach
-        // unten) über alle Leisten
-        // (bei breiterer Gesamtfläche entsprechend länger unterwegs).
+        // Komet: von links nach rechts (seitlich von oben nach unten) über alle
+        // Leisten (bei breiterer Gesamtfläche entsprechend länger unterwegs),
+        // danach Pause – kurz, solange an der Leiste etwas los ist, sonst länger.
         let travel = 1.6 * (span_w / (1920.0 * scale)).max(1.0);
-        let ct = (t % (travel + 5.4)) / travel;
-        let comet = (ct < 1.0).then(|| span_l + ct * (span_w + 400.0 * scale) - 200.0 * scale);
-        let pulse = 0.5 + 0.5 * (t * 6.0).sin();
+        s.comet_at = next_comet(s.comet_at, t, travel, s.activity.elapsed().as_secs_f32(), dormant);
+        let ct = (t - s.comet_at) / travel;
+        let comet = (0.0..1.0).contains(&ct).then(|| span_l + ct * (span_w + 400.0 * scale) - 200.0 * scale);
+        let attention: Vec<(f32, f32)> = s.attention.iter().map(|&(x, t0)| (x as f32, attention_pulse(t, t0.elapsed().as_secs_f32()))).collect();
+        // Hover-Glühen ruht erst, wenn es ganz aus oder an der Maus angekommen ist.
+        let hover_moving = match s.hover_x {
+            Some(x) => s.hover_amt < 0.99 || (s.hover_pos - x as f32).abs() > 0.5,
+            None => s.hover_amt > 0.0,
+        };
+        let pace = Pace {
+            effects: hover_moving || !s.flashes.is_empty() || s.attention.iter().any(|(_, t0)| t0.elapsed().as_secs_f32() < ATTENTION_PULSE_S),
+            comet: comet.is_some(),
+            comet_in: s.comet_at - t,
+            dormant,
+        };
         let flashes: Vec<(f32, f32)> = s.flashes.iter().map(|f| (f.at as f32, f.start.elapsed().as_secs_f32() / 1.2)).collect();
 
         let mut jobs = Vec::new();
@@ -362,8 +586,8 @@ unsafe fn frame() {
                 }
                 i += 0.9 * s.hover_amt * (-((xf - s.hover_pos) / (70.0 * scale)).powi(2)).exp();
                 let mut orange = 0.0f32;
-                for &ax in &s.attention {
-                    orange += (0.6 + 0.6 * pulse) * (-((xf - ax as f32) / (60.0 * scale)).powi(2)).exp();
+                for &(ax, pulse) in &attention {
+                    orange += (0.6 + 0.6 * pulse) * (-((xf - ax) / (60.0 * scale)).powi(2)).exp();
                 }
                 for &(fx, ft) in &flashes {
                     let spread = 40.0 + 260.0 * ft;
@@ -392,10 +616,12 @@ unsafe fn frame() {
             }
             jobs.push((sf.hwnd, sf.bmp, POINT { x: sf.x, y: sf.y }, SIZE { cx: w, cy: h }));
         }
-        (s.dc, jobs)
+        (s.dc, jobs, Some(pace))
     }) else {
         return;
     };
+    // Nächster Takt nach dem, was sich gerade bewegt (keiner bei Pause/unsichtbar).
+    set_interval(pace.map(next_interval).unwrap_or(0));
     if jobs.is_empty() {
         return;
     }
@@ -443,6 +669,12 @@ pub unsafe fn create(inst: HINSTANCE) {
             hover_amt: 0.0,
             attention: Vec::new(),
             flashes: Vec::new(),
+            style: crate::settings::get().glow,
+            warm: 0.0,
+            warm_at: None,
+            comet_at: 0.0,
+            activity: Instant::now(),
+            paused: 0,
         })
     });
     sync();
@@ -469,6 +701,42 @@ mod tests {
         // Rechts: links neben der Leiste.
         let r = surface_rect(Edge::Right, BAR, glow, line);
         assert_eq!((r.left, r.right, r.top, r.bottom), (78, 102, 200, 1000));
+    }
+
+    #[test]
+    fn pace_fast_only_while_moving() {
+        let idle = Pace { effects: false, comet: false, comet_in: 30.0, dormant: false };
+        assert_eq!(next_interval(idle), SLOW_MS);
+        assert_eq!(next_interval(Pace { effects: true, ..idle }), FAST_MS);
+        assert_eq!(next_interval(Pace { comet: true, ..idle }), FAST_MS);
+        // Rechtzeitig zum Kometen wach, aber nie schneller als der Bildtakt.
+        assert_eq!(next_interval(Pace { comet_in: 0.2, ..idle }), 200);
+        assert_eq!(next_interval(Pace { comet_in: 0.0, ..idle }), FAST_MS);
+        assert_eq!(next_interval(Pace { comet_in: -1.0, ..idle }), FAST_MS);
+        assert_eq!(next_interval(Pace { dormant: true, ..idle }), DORMANT_MS);
+        // Bewegung schlägt "niemand da".
+        assert_eq!(next_interval(Pace { dormant: true, effects: true, ..idle }), FAST_MS);
+    }
+
+    #[test]
+    fn comet_cadence() {
+        let travel = 1.6;
+        // Unterwegs bleibt der Start stehen.
+        assert_eq!(next_comet(10.0, 10.5, travel, 0.0, false), 10.0);
+        // Durch: nächster nach der kurzen Pause, solange etwas los ist …
+        assert_eq!(next_comet(10.0, 11.7, travel, 5.0, false), 11.7 + COMET_GAP_AWAKE);
+        // … sonst nach der langen.
+        assert_eq!(next_comet(10.0, 11.7, travel, 600.0, false), 11.7 + COMET_GAP_QUIET);
+        // Wieder lebhaft: der ferne Komet kommt früher.
+        assert_eq!(next_comet(50.0, 20.0, travel, 0.0, false), 20.0 + COMET_GAP_AWAKE);
+        // Niemand am Rechner: der Komet wartet.
+        assert_eq!(next_comet(20.1, 20.0, travel, 600.0, true), 20.0 + COMET_GAP_AWAKE);
+    }
+
+    #[test]
+    fn attention_pulses_then_stays() {
+        assert!(attention_pulse(0.3, 1.0) < 1.0);
+        assert_eq!(attention_pulse(0.3, ATTENTION_PULSE_S + 0.1), 1.0);
     }
 
     #[test]

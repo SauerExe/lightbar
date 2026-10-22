@@ -90,24 +90,6 @@ pub fn strip_year(pattern: &str) -> String {
     out.trim_end_matches(sep).trim_end().to_string()
 }
 
-/// WM_SETTINGCHANGE mit lParam = "intl": Regionalformat geändert.
-pub unsafe fn is_intl(lp: isize) -> bool {
-    if lp == 0 {
-        return false;
-    }
-    let p = lp as *const u16;
-    let mut s = Vec::new();
-    // Nur kurz lesen: "intl" hat 4 Zeichen, längere Bereiche sind es nicht.
-    for i in 0..8 {
-        let c = *p.add(i);
-        if c == 0 {
-            break;
-        }
-        s.push(c);
-    }
-    String::from_utf16_lossy(&s).eq_ignore_ascii_case("intl")
-}
-
 thread_local! {
     /// Gemessene Breite der Uhr (logische Pixel) je Sekundenanzeige.
     static WIDTH: Cell<[Option<i32>; 2]> = const { Cell::new([None, None]) };
