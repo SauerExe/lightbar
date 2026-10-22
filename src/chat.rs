@@ -241,8 +241,10 @@ pub fn parse(text: &str) -> Vec<Block> {
                     break;
                 }
                 // Einrückung des Zauns abziehen (Codeblock in einer Liste).
-                let cut = l.len() - l.trim_start().len();
-                code.push(&l[cut.min(indent)..]);
+                // Nur ASCII-Leerzeichen und Tabs: trim_start() nimmt auch NBSP
+                // & Co. mit, deren Bytegrenze mitten im Zeichen läge (Panic).
+                let cut = l.bytes().take(indent).take_while(|b| *b == b' ' || *b == b'\t').count();
+                code.push(&l[cut..]);
             }
             blocks.push(Block::Code { lang, text: code.join("\n") });
             continue;
@@ -725,6 +727,16 @@ mod tests {
                 Block::Item { level: 0, marker: "2.".into(), spans: vec![p("zwei")] },
             ]
         );
+    }
+
+    #[test]
+    fn code_block_with_nbsp_indent_does_not_panic() {
+        // NBSP (2 Bytes) in der Einrückung: früher Slice mitten im Zeichen.
+        let b = parse("  ```\n\u{a0}x\n  \u{a0}y\n   z\n  ```");
+        assert_eq!(b, vec![Block::Code { lang: String::new(), text: "\u{a0}x\n\u{a0}y\n z".into() }]);
+        // Zaun selbst mit NBSP eingerückt.
+        let b = parse("\u{a0}```\n\u{a0}\u{a0}a\n```");
+        assert_eq!(b, vec![Block::Code { lang: String::new(), text: "\u{a0}\u{a0}a".into() }]);
     }
 
     #[test]

@@ -26,7 +26,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             paint_buffered(hwnd, |dc, w, h| {
                 fill(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, rgb(43, 43, 43));
                 let r = RECT { left: px(dpi, 10), top: px(dpi, 6), right: w - px(dpi, 10), bottom: h - px(dpi, 6) };
-                text(dc, &text_s, &r, font, TEXT, DT_LEFT | DT_TOP);
+                text(dc, &text_s, &r, font, TEXT, DT_LEFT | DT_TOP | DT_WORDBREAK);
             });
             0
         }

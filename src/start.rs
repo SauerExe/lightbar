@@ -458,8 +458,12 @@ unsafe fn purge_icons(st: &mut State, all: bool) {
 }
 
 unsafe fn icon_bitmap(st: &mut State, t: &Target, size: i32) -> HBITMAP {
+    // Index kann nach einem Neuladen der Apps veraltet sein – dann kein Symbol.
     let key = match t {
-        Target::App(i) => format!("a{size}:{}", st.apps[*i].id),
+        Target::App(i) => match st.apps.get(*i) {
+            Some(a) => format!("a{size}:{}", a.id),
+            None => return null_mut(),
+        },
         Target::Path(p) => format!("p{size}:{p}"),
         Target::Uri(_) | Target::Ask(_) => return null_mut(),
     };
@@ -467,7 +471,7 @@ unsafe fn icon_bitmap(st: &mut State, t: &Target, size: i32) -> HBITMAP {
         return b;
     }
     let b = match t {
-        Target::App(i) => apps::app_icon(&st.apps[*i], size),
+        Target::App(i) => st.apps.get(*i).map_or(null_mut(), |a| apps::app_icon(a, size)),
         Target::Path(p) => apps::path_icon(p, size),
         Target::Uri(_) | Target::Ask(_) => null_mut(),
     };
@@ -655,7 +659,7 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     let shown = if chat { st.input.clone() } else { st.query.clone() };
     if shown.is_empty() {
         let hint = if chat {
-            if crate::ai::current().is_some() { t!("Nachfragen …", "Ask a follow-up …") } else { t!("Frag etwas …", "Ask something …") }
+            if crate::ai::has_current() { t!("Nachfragen …", "Ask a follow-up …") } else { t!("Frag etwas …", "Ask something …") }
         } else if crate::ai::enabled() {
             t!("Suchen – mit ? am Anfang die KI fragen", "Search – start with ? to ask the AI")
         } else {
@@ -975,17 +979,17 @@ fn clip(r: &RECT, area: &RECT) -> RECT {
 unsafe fn draw_answer(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bottom: i32) {
     use crate::chat::{Ink, Item};
     let d = st.dpi;
-    let answers = crate::ai::turns();
+    let has_turns = crate::ai::has_turns();
     let head = RECT { left: px(d, PAD + 12), top, right: w / 2, bottom: top + px(d, 28) };
     text(dc, t!("KI-Chat", "AI chat"), &head, f.bold, TEXT, LINE);
     let left = pill(st, dc, f, t!("Zurück", "Back"), "\u{E76B}", true, w - px(d, PAD), top, Act::ShowHome);
-    if !answers.is_empty() {
+    if has_turns {
         pill(st, dc, f, t!("Neuer Chat", "New chat"), "\u{E710}", true, left - px(d, 8), top, Act::NewChat);
     }
     let area = RECT { left: px(d, PAD + 12), top: top + px(d, 44), right: w - px(d, PAD + 12), bottom };
     let view_h = area.bottom - area.top;
     st.list_h = view_h;
-    if answers.is_empty() {
+    if !has_turns {
         st.max_scroll = 0;
         st.scroll = 0;
         let r = RECT { bottom: area.top + px(d, 60), ..area };
@@ -995,14 +999,13 @@ unsafe fn draw_answer(st: &mut State, dc: HDC, f: &Fonts, w: i32, top: i32, bott
 
     // Setzen nur, wenn sich Inhalt oder Breite geändert haben.
     let width = area.right - area.left;
-    let mut key = format!("{width}:{d}");
-    for a in &answers {
-        key.push_str(&format!("\u{1}{}\u{1}{}\u{1}{}{}{}\u{1}{}", a.question, a.text, a.thinking, a.done, a.error.as_deref().unwrap_or(""), steps(a).join("\u{2}")));
-    }
-    let key = hash_of(&key);
+    // Der Chat zählt jede Änderung mit – so muss nicht bei jedem Zeichnen
+    // (z. B. Mausbewegung) der ganze Verlauf kopiert und gehasht werden.
+    let key = hash_of(&format!("{width}:{d}:{}", crate::ai::revision()));
     let layout = match st.chat_layout.take() {
         Some((k, l)) if k == key => l,
         _ => {
+            let answers = crate::ai::turns();
             let m = GdiMeasure::new(dc, f, d);
             let turns: Vec<crate::chat::Turn> = answers
                 .iter()
@@ -1246,6 +1249,28 @@ unsafe fn edit_query(hwnd: HWND, f: impl FnOnce(&mut String, bool)) {
     InvalidateRect(hwnd, null(), 0);
 }
 
+thread_local! {
+    /// Hohes Surrogat aus WM_CHAR, das auf sein Gegenstück wartet.
+    static HIGH_SURROGATE: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
+/// Eine UTF-16-Einheit aus WM_CHAR zum Zeichen machen. Ein hohes Surrogat
+/// wird gemerkt und mit dem folgenden niedrigen verbunden; einzelne
+/// Hälften fallen weg.
+fn utf16_char(pending: &mut Option<u16>, unit: u16) -> Option<char> {
+    if (0xD800..0xDC00).contains(&unit) {
+        *pending = Some(unit);
+        return None;
+    }
+    match pending.take() {
+        Some(high) if (0xDC00..0xE000).contains(&unit) => char::decode_utf16([high, unit]).next()?.ok(),
+        _ => char::decode_utf16([unit]).next()?.ok(),
+    }
+}
+
+/// Höchstlänge beim Einfügen ins Such- bzw. Chatfeld (Zeichen).
+const MAX_PASTE: usize = 4000;
+
 /// Strg-Kürzel im Suchfeld wie in einem normalen Textfeld.
 unsafe fn on_ctrl_key(hwnd: HWND, vk: u16) -> bool {
     const VK_A: u16 = b'A' as u16;
@@ -1277,12 +1302,17 @@ unsafe fn on_ctrl_key(hwnd: HWND, vk: u16) -> bool {
             let Some(t) = clipboard_text(hwnd) else { return true };
             let chat = with(|st| chat_input(st)).unwrap_or(false);
             let text = if chat { t.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ") } else { t.lines().next().unwrap_or("").to_string() };
-            let line: String = text.chars().filter(|c| !c.is_control()).collect();
+            // Höchstens 4000 Zeichen (riesige Zwischenablage nicht ins Feld).
+            let line: String = text.chars().filter(|c| !c.is_control()).take(MAX_PASTE).collect();
             edit_query(hwnd, |q, all| {
                 if all {
                     q.clear();
                 }
                 q.push_str(line.trim());
+                // Auch mehrfaches Einfügen bleibt begrenzt (auf Zeichengrenze).
+                if let Some((i, _)) = q.char_indices().nth(MAX_PASTE) {
+                    q.truncate(i);
+                }
             });
         }
         // Strg+Rücktaste: letztes Wort löschen.
@@ -1485,8 +1515,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if !apps.is_empty() {
                     st.apps = apps;
                     rebuild(st);
+                    // Treffer zeigen per Index auf die alte App-Liste.
+                    if !st.query.is_empty() {
+                        let sel = st.sel;
+                        st.results = search(st);
+                        st.sel = sel.min(st.results.len().saturating_sub(1));
+                    }
                 }
             });
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_MOUSEMOVE => {
@@ -1590,7 +1627,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_CHAR => {
-            if let Some(c) = char::from_u32(wp as u32).filter(|c| !c.is_control()) {
+            // Emoji (Win+.) kommen als zwei WM_CHAR mit Surrogat-Hälften.
+            let c = if wp > 0xFFFF {
+                char::from_u32(wp as u32)
+            } else {
+                HIGH_SURROGATE.with(|p| {
+                    let mut pending = p.get();
+                    let c = utf16_char(&mut pending, wp as u16);
+                    p.set(pending);
+                    c
+                })
+            };
+            if let Some(c) = c.filter(|c| !c.is_control()) {
                 let chat = with(|st| {
                     // Nach Strg+A ersetzt das erste Zeichen die markierte Eingabe.
                     if std::mem::take(&mut st.select_all) {
@@ -1690,6 +1738,22 @@ pub unsafe fn create(inst: HINSTANCE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surrogate_pairs_make_emoji() {
+        let mut p = None;
+        assert_eq!(utf16_char(&mut p, 'a' as u16), Some('a'));
+        let mut buf = [0u16; 2];
+        let units = '😀'.encode_utf16(&mut buf);
+        assert_eq!(utf16_char(&mut p, units[0]), None);
+        assert_eq!(utf16_char(&mut p, units[1]), Some('😀'));
+        assert_eq!(p, None);
+        // Einzelne Hälften fallen weg, das nächste normale Zeichen kommt durch.
+        assert_eq!(utf16_char(&mut p, 0xDC00), None);
+        assert_eq!(utf16_char(&mut p, 0xD83D), None);
+        assert_eq!(utf16_char(&mut p, 'b' as u16), Some('b'));
+        assert_eq!(p, None);
+    }
 
     /// Chat-Layout mit echten GDI-Schriften: alles bleibt in der Breite,
     /// Zeilen überlappen nicht.

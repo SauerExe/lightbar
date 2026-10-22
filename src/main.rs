@@ -111,6 +111,7 @@ fn main() {
         // dabei nur als Testlauf; lesende (Systeminfo, Dateisuche) wirklich.
         if std::env::args().nth(1).as_deref() == Some("--ai-test") {
             ai_tools::set_dry_run(true);
+            ai::set_trace(true);
             let q = std::env::args().nth(2).unwrap_or_else(|| "Sag kurz Hallo.".into());
             let (tx, rx) = std::sync::mpsc::channel();
             ai::ask(q, move || {

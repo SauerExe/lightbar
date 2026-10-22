@@ -129,23 +129,53 @@ fn check_url(url: &str) -> Result<String, String> {
 /// Absoluter lokaler Pfad, der existiert. Netzwerkpfade (\\server) nicht –
 /// die würden ungefragt Anmeldedaten an fremde Rechner schicken.
 fn check_path(path: &str) -> Result<String, String> {
-    let path = path.trim_matches('"');
+    let path = normalize_path(path.trim_matches('"'));
     let b = path.as_bytes();
     let absolute = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
     if !absolute || path.contains(['"', '*', '?', '<', '>', '|']) {
         return Err(t!("Nur absolute lokale Pfade (z. B. C:\\…) sind erlaubt", "Only absolute local paths (e.g. C:\\...) are allowed").into());
     }
-    Ok(path.to_string())
+    Ok(path)
 }
 
-/// Dateiendungen, die etwas ausführen würden – solche Dateien nur zeigen.
-fn is_executable(path: &str) -> bool {
-    const EXT: [&str; 26] = [
-        "exe", "com", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp", "scr", "pif",
-        "cpl", "msc", "hta", "reg", "lnk", "url", "jar", "py", "pyw", "appref-ms",
+/// So, wie Windows den Pfad auflöst: Ein Datenstrom-Anhang ("x.exe::$DATA",
+/// "x.txt:y.exe") fällt weg (alles ab dem zweiten ':' nach dem Laufwerk),
+/// ebenso Punkte und Leerzeichen am Ende ("x.exe." öffnet x.exe).
+fn normalize_path(path: &str) -> String {
+    let mut p = path;
+    if let Some(i) = p.char_indices().filter(|(_, c)| *c == ':').nth(1).map(|(i, _)| i) {
+        p = &p[..i];
+    }
+    p.trim_end_matches(['.', ' ']).to_string()
+}
+
+/// Nur harmlose Dateien direkt öffnen (Dokumente, Bilder, Audio/Video, Text,
+/// Archive). Alles andere – Programme, Skripte, Verknüpfungen, Unbekanntes
+/// oder Dateien ohne Endung – wird nur im Explorer gezeigt.
+fn opens_directly(path: &str) -> bool {
+    const EXT: &[&str] = &[
+        // Dokumente und Text
+        "pdf", "txt", "md", "log", "csv", "rtf", "json", "epub", "odt", "ods", "odp", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+        // Bilder
+        "jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "heif", "tif", "tiff", "ico", "avif",
+        // Audio und Video
+        "mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "mp4", "m4v", "mkv", "avi", "mov", "wmv", "webm",
+        // Archive (öffnen im Explorer bzw. Packprogramm)
+        "zip", "7z", "rar", "tar", "gz",
     ];
     let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     EXT.contains(&ext.as_str())
+}
+
+/// Existierenden Pfad direkt öffnen? Ordner ja; Dateien nur mit harmloser
+/// Endung – auch nach Auflösen von Kurznamen (SETUP~1.PDF) und Links.
+fn may_open(p: &str) -> bool {
+    let path = std::path::Path::new(p);
+    if path.is_dir() {
+        return true;
+    }
+    let real = std::fs::canonicalize(path).ok();
+    opens_directly(p) && real.as_ref().and_then(|r| r.to_str()).is_some_and(opens_directly)
 }
 
 /// Einstellungsseite aus der Tabelle des Startmenüs. Direkte
@@ -234,9 +264,9 @@ impl Call {
                     if !path.exists() {
                         return Err(tf!("Pfad nicht gefunden: {p}", "Path not found: {p}"));
                     }
-                    if path.is_file() && is_executable(p) {
+                    if !may_open(p) {
                         shell_open("explorer.exe", &format!("/select,\"{p}\""), SW_SHOWNORMAL);
-                        return Ok(tf!("Programm/Skript wird nicht gestartet, nur im Explorer gezeigt: {p}", "Program/script is not started, only shown in Explorer: {p}"));
+                        return Ok(tf!("Datei wird nicht geöffnet, nur im Explorer gezeigt: {p}", "File is not opened, only shown in Explorer: {p}"));
                     }
                     shell_open(p, "", SW_SHOWNORMAL);
                     Ok(tf!("Geöffnet: {p}", "Opened: {p}"))
@@ -465,11 +495,44 @@ mod tests {
         assert!(parse("open_path", r#"{"path":"\\\\server\\share\\x.txt"}"#).is_err());
         assert!(parse("open_path", r#"{"path":"relativ\\x.txt"}"#).is_err());
         assert!(parse("open_path", r#"{"path":"shell:startup"}"#).is_err());
-        assert!(is_executable("C:\\x\\setup.EXE"));
-        assert!(is_executable("C:\\x\\run.ps1"));
-        assert!(is_executable("C:\\x\\link.lnk"));
-        assert!(!is_executable("C:\\x\\bericht.pdf"));
-        assert!(!is_executable("C:\\x\\Ordner"));
+        for p in ["C:\\x\\setup.EXE", "C:\\x\\run.ps1", "C:\\x\\link.lnk", "C:\\x\\Ordner", "C:\\x\\seite.hta", "C:\\x\\x.docm"] {
+            assert!(!opens_directly(p), "{p}");
+        }
+        for p in ["C:\\x\\bericht.PDF", "C:\\x\\foto.jpg", "C:\\x\\lied.mp3", "C:\\x\\a.docx", "C:\\x\\b.7z"] {
+            assert!(opens_directly(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn path_tricks_are_normalized() {
+        let path = |p: &str| match parse("open_path", &json!({ "path": p }).to_string()) {
+            Ok(Call::OpenPath(p)) => p,
+            other => panic!("{p}: {other:?}"),
+        };
+        assert_eq!(path("C:\\x\\setup.exe."), "C:\\x\\setup.exe");
+        assert_eq!(path("C:\\x\\setup.exe . . "), "C:\\x\\setup.exe");
+        assert_eq!(path("C:\\x\\setup.exe::$DATA"), "C:\\x\\setup.exe");
+        assert_eq!(path("C:\\x\\a.pdf:evil.exe"), "C:\\x\\a.pdf");
+        assert_eq!(path("C:/x/ok.pdf"), "C:/x/ok.pdf");
+        for p in ["C:\\x\\setup.exe.", "C:\\x\\setup.exe::$DATA", "C:\\x\\setup.exe  "] {
+            assert!(!opens_directly(&path(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn may_open_only_folders_and_harmless_files() {
+        let dir = std::env::temp_dir().join(format!("lightbar-test-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ordner.exe")).unwrap();
+        for f in ["a.pdf", "setup.exe", "ohne_endung"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let p = |f: &str| dir.join(f).to_str().unwrap().to_string();
+        assert!(may_open(&p("a.pdf")));
+        assert!(may_open(&p("ordner.exe")));
+        assert!(!may_open(&p("setup.exe")));
+        assert!(!may_open(&p("ohne_endung")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
