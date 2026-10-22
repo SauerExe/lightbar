@@ -4500,6 +4500,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 with(|s| if !s.attention.iter().any(|(w, _)| *w == target) { s.attention.push((target, Instant::now())) });
                 // Ausgeblendete Leiste zeigt sich (wie bei Windows).
                 autohide_wake();
+                // Leuchtrand pulsiert gleich mit (nicht erst beim nächsten Hover).
+                sync_glow(hwnd);
             }
             // 0x8004 = HSHELL_RUDEAPPACTIVATED (fehlt in windows-sys).
             // HSHELL_REDRAW ohne 0x8000: Die App blinkt nicht mehr (FlashWindowEx
