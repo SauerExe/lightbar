@@ -12,6 +12,18 @@
 //! | 0x441 | SetProgressState | App-Fenster | TBPFLAG |
 //! | 0x44F | SetOverlayIcon (synchron) | App-Fenster | HICON oder 0 |
 //! | 0x455 | Beschreibung zum Symbol | App-Fenster | Shared Memory |
+//! | 0x43C | MarkFullscreenWindow | fFullscreen (0/1) | App-Fenster |
+//! | 0x432 | SetActiveAlt (nach ActivateTab) | 0 | App-Fenster |
+//! | "SHELLHOOK" | AddTab / DeleteTab / ActivateTab | 1 / 2 / 4 | App-Fenster |
+//!
+//! AddTab und DeleteTab schicken die registrierte Nachricht "SHELLHOOK" mit
+//! HSHELL_WINDOWCREATED (1) bzw. HSHELL_WINDOWDESTROYED (2), wie sie auch der
+//! Shell-Hook liefert. Zusätzlich setzt DeleteTab am App-Fenster die
+//! Eigenschaft "ITaskList_Deleted" (1), AddTab entfernt sie wieder – daran
+//! erkennt auch Explorer ausgeblendete Fenster (`is_deleted`). ActivateTab
+//! schickt HSHELL_WINDOWACTIVATED (4) und 0x432. (Ermittelt per Ghidra in
+//! explorerframe.dll, Build 26300: CTaskbarList-vtable, Konstruktor
+//! registriert "SHELLHOOK".)
 //!
 //! Das Symbol gibt der Absender nach der Nachricht frei – deshalb sofort
 //! kopieren. Viele Apps melden sich erst nach `TaskbarButtonCreated`; das
@@ -31,6 +43,10 @@ use crate::util::{log, register_class, w16};
 const MSG_PROGRESS_VALUE: u32 = 0x440;
 const MSG_PROGRESS_STATE: u32 = 0x441;
 const MSG_OVERLAY: u32 = 0x44F;
+const MSG_FULLSCREEN: u32 = 0x43C;
+/// Shell-Hook-Codes, die AddTab/DeleteTab mit "SHELLHOOK" schicken.
+const TAB_ADDED: usize = 1;
+const TAB_DELETED: usize = 2;
 /// Höchster Wert der Fortschrittsskala.
 pub const PROGRESS_MAX: u32 = 0xFFFE;
 
@@ -62,9 +78,13 @@ thread_local! {
     static BADGES: RefCell<HashMap<isize, Badge>> = RefCell::new(HashMap::new());
     /// Fenster, denen schon "TaskbarButtonCreated" geschickt wurde.
     static ANNOUNCED: RefCell<HashSet<isize>> = RefCell::new(HashSet::new());
+    /// Per MarkFullscreenWindow als Vollbild gemeldete Fenster.
+    static FULLSCREEN: RefCell<HashSet<isize>> = RefCell::new(HashSet::new());
 }
 
 static BUTTON_CREATED: AtomicU32 = AtomicU32::new(0);
+/// Registrierte Nachricht "SHELLHOOK" (AddTab/DeleteTab).
+static SHELLHOOK: AtomicU32 = AtomicU32::new(0);
 /// Unser Taskband-Fenster (Besitzer des TIMER_SPIN).
 static BAND: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(null_mut());
 
@@ -112,6 +132,15 @@ unsafe fn update(target: HWND, f: impl FnOnce(&mut Badge)) {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let target = wp as HWND;
+    let shellhook = SHELLHOOK.load(Ordering::Relaxed);
+    if shellhook != 0 && msg == shellhook {
+        // AddTab/DeleteTab: Die Markierung am Fenster hat der Absender schon
+        // gesetzt bzw. entfernt – nur die Fensterliste neu einlesen.
+        if matches!(wp, TAB_ADDED | TAB_DELETED) {
+            crate::bar::schedule_refresh();
+        }
+        return 0;
+    }
     match msg {
         MSG_PROGRESS_VALUE => {
             update(target, |e| {
@@ -137,6 +166,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             0
         }
+        MSG_FULLSCREEN => {
+            // Hier: wParam = Vollbild ja/nein, lParam = App-Fenster.
+            let changed = FULLSCREEN.with(|f| {
+                let mut f = f.borrow_mut();
+                if wp != 0 { f.insert(lp) } else { f.remove(&lp) }
+            });
+            if changed {
+                crate::bar::fullscreen_marks_changed();
+            }
+            0
+        }
         WM_TIMER if wp == TIMER_SPIN => {
             redraw();
             // Fenster mit unbestimmtem Fortschritt kann inzwischen weg sein.
@@ -154,6 +194,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 /// bekannt machen.
 pub unsafe fn create(inst: HINSTANCE, bar: HWND) {
     BUTTON_CREATED.store(RegisterWindowMessageW(w16("TaskbarButtonCreated").as_ptr()), Ordering::Relaxed);
+    SHELLHOOK.store(RegisterWindowMessageW(w16("SHELLHOOK").as_ptr()), Ordering::Relaxed);
     let class = w16("MSTaskSwWClass");
     register_class(inst, &class, Some(wndproc), 0);
     let band = CreateWindowExW(0, class.as_ptr(), null(), WS_CHILD, 0, 0, 0, 0, bar, null_mut(), inst, null());
@@ -188,8 +229,20 @@ pub unsafe fn announce(windows: &[HWND]) {
             alive
         })
     });
+    FULLSCREEN.with(|f| f.borrow_mut().retain(|&h| IsWindow(h as HWND) != 0));
     // Mit einem geschlossenen Fenster kann der letzte unbestimmte Fortschritt weg sein.
     sync_spin(BAND.load(Ordering::Relaxed));
+}
+
+/// Per ITaskbarList::DeleteTab ausgeblendet? (Markierung am Fenster, die
+/// TaskbarList selbst setzt – gilt auch für Fenster von vor unserem Start.)
+pub unsafe fn is_deleted(h: HWND) -> bool {
+    !GetPropW(h, w16("ITaskList_Deleted").as_ptr()).is_null()
+}
+
+/// Hat die App das Fenster per MarkFullscreenWindow als Vollbild gemeldet?
+pub fn marked_fullscreen(h: HWND) -> bool {
+    !h.is_null() && FULLSCREEN.with(|f| f.borrow().contains(&(h as isize)))
 }
 
 /// Zähler-Symbol und Fortschritt für einen Button (seine Fenster): das zuletzt
