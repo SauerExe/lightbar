@@ -250,8 +250,19 @@ fn pins_path() -> Option<PathBuf> {
 }
 
 fn load_pins(apps: &[App]) -> Vec<String> {
-    if let Some(text) = pins_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-        return text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+    // Standardbelegung nur, wenn es die Datei nicht gibt. Ist sie da, aber nicht
+    // lesbar (gesperrt, keine Rechte), nicht speichern – sonst überschriebe
+    // die nächste Änderung die Anheftungen des Nutzers mit der Standardbelegung.
+    match pins_path().map(|p| std::fs::read(p)) {
+        Some(Ok(bytes)) => {
+            PINS_NO_SAVE.store(false, std::sync::atomic::Ordering::Relaxed);
+            return String::from_utf8_lossy(&bytes).lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+        }
+        Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => {
+            PINS_NO_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::util::log(&format!("pins.txt nicht lesbar ({e}) – Standardbelegung, Änderungen werden nicht gespeichert"));
+        }
+        _ => {}
     }
     let mut pins = Vec::new();
     for key in DEFAULT_PINS {
@@ -271,13 +282,19 @@ fn load_pins(apps: &[App]) -> Vec<String> {
 }
 
 fn save_pins(pins: &[String]) {
+    if PINS_NO_SAVE.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::util::log("pins.txt war nicht lesbar – Anheftungen nicht gespeichert");
+        return;
+    }
     if let Some(p) = pins_path() {
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = crate::util::write_atomic(&p, pins.join("\n").as_bytes()) {
+            crate::util::log(&format!("pins.txt nicht speicherbar ({e})"));
         }
-        let _ = std::fs::write(p, pins.join("\n"));
     }
 }
+
+/// pins.txt war vorhanden, aber nicht lesbar: in dieser Sitzung nicht überschreiben.
+static PINS_NO_SAVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn ago(t: SystemTime) -> String {
     let s = SystemTime::now().duration_since(t).map(|d| d.as_secs()).unwrap_or(0);

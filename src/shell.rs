@@ -25,6 +25,23 @@ fn state_file() -> Option<PathBuf> {
     Some(crate::util::data_dir()?.join("explorer-taskbar-state"))
 }
 
+/// Gemerkter Originalzustand (ABM_GETSTATE-Wert). `None`, wenn die Datei
+/// fehlt oder unlesbar/kaputt ist.
+fn read_state() -> Option<u32> {
+    std::fs::read_to_string(state_file()?).ok()?.trim().parse::<u32>().ok()
+}
+
+fn write_state(state: u32) -> bool {
+    let Some(f) = state_file() else { return false };
+    match crate::util::write_atomic(&f, state.to_string().as_bytes()) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::util::log(&format!("Originalzustand der Windows-Taskleiste nicht speicherbar ({e})"));
+            false
+        }
+    }
+}
+
 unsafe fn process_exe(h: HWND) -> Option<String> {
     let mut pid = 0u32;
     GetWindowThreadProcessId(h, &mut pid);
@@ -112,23 +129,21 @@ unsafe fn hide_explorer_bar(h: HWND) {
 pub unsafe fn takeover() {
     // Ohne gemerkten Originalzustand kein "automatisch ausblenden": Den könnten
     // wir später nicht zurücknehmen, er bliebe für immer.
-    let mut remembered = false;
-    if let Some(f) = state_file() {
-        remembered = f.exists();
-        if !remembered {
-            let mut original = appbar_state(None);
-            // Explorers Leiste trägt unsere Markierung: Ein früherer Lauf ohne
-            // gemerkten Zustand hat sie versteckt – das Autohide stammt dann von
-            // uns, das Original ist "nicht ausblenden".
-            let ours = explorer_bars().iter().any(|&h| !GetPropW(h, w16(HIDDEN_PROP).as_ptr()).is_null());
-            if original & ABS_AUTOHIDE != 0 && ours {
-                original = ABS_ALWAYSONTOP;
-            }
-            if let Some(dir) = f.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            remembered = std::fs::write(&f, original.to_string()).is_ok();
+    // Eine kaputte Datei (z. B. abgeschnitten) zählt wie eine fehlende.
+    let mut remembered = read_state().is_some();
+    if let (false, Some(f)) = (remembered, state_file()) {
+        if f.exists() {
+            crate::util::log("Gemerkter Zustand der Windows-Taskleiste unlesbar – wird neu bestimmt");
         }
+        let mut original = appbar_state(None);
+        // Explorers Leiste trägt unsere Markierung: Ein früherer Lauf ohne
+        // gemerkten Zustand hat sie versteckt – das Autohide stammt dann von
+        // uns, das Original ist "nicht ausblenden".
+        let ours = explorer_bars().iter().any(|&h| !GetPropW(h, w16(HIDDEN_PROP).as_ptr()).is_null());
+        if original & ABS_AUTOHIDE != 0 && ours {
+            original = ABS_ALWAYSONTOP;
+        }
+        remembered = write_state(original);
     }
     if remembered {
         force_autohide();
@@ -158,64 +173,78 @@ pub unsafe fn ensure_hidden() {
     }
 }
 
-/// Zeitpunkt (GetTickCount64), zu dem `takeover` Explorer zuletzt auf
-/// "automatisch ausblenden" gestellt hat.
-static FORCED_AT: AtomicU64 = AtomicU64::new(0);
-
 /// Explorers Leisten sind übernommen (versteckt, von uns auf Ausblenden gestellt).
 pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
-/// Hat `takeover` gerade erst (vor wenigen Sekunden) selbst auf Ausblenden
-/// gestellt? Eine Änderung in der Registry stammt dann von uns, nicht vom Nutzer.
-pub fn forced_recently() -> bool {
-    let at = FORCED_AT.load(Ordering::Relaxed);
-    at != 0 && unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }.saturating_sub(at) < 5000
-}
-
 /// "Automatisch ausblenden" im gemerkten Originalzustand – also wie der Nutzer
 /// es will, solange Explorer von uns auf Ausblenden gestellt ist.
 pub fn remembered_autohide() -> Option<bool> {
-    let state = std::fs::read_to_string(state_file()?).ok()?.trim().parse::<u32>().ok()?;
-    Some(state & ABS_AUTOHIDE != 0)
+    Some(read_state()? & ABS_AUTOHIDE != 0)
 }
 
 /// Der Nutzer hat "automatisch ausblenden" in Windows umgestellt, während
 /// Lightbar läuft: als neuen Originalzustand merken. Das ist eine bewusste
 /// Wahl (nicht unser eigenes Ausblenden) – `restore` stellt sie so wieder her.
-pub fn remember_autohide(on: bool) {
-    let Some(f) = state_file() else { return };
-    let Some(old) = std::fs::read_to_string(&f).ok().and_then(|s| s.trim().parse::<u32>().ok()) else { return };
+/// `false`, wenn es keinen gemerkten Zustand gibt (dann ist nichts geändert).
+pub fn remember_autohide(on: bool) -> bool {
+    let Some(old) = read_state() else { return false };
     let state = if on { old | ABS_AUTOHIDE } else { (old & !ABS_AUTOHIDE) | ABS_ALWAYSONTOP };
-    if state != old {
-        let _ = std::fs::write(&f, state.to_string());
+    state == old || write_state(state)
+}
+
+/// Schalter "Automatisch ausblenden" im Kontextmenü der Leiste. Mit
+/// übernommener Windows-Leiste wird nur der gemerkte Originalzustand geändert
+/// (Explorer bleibt von uns auf Ausblenden); sonst direkt die Windows-Einstellung.
+pub unsafe fn choose_autohide(on: bool) {
+    if !(active() && remember_autohide(on)) {
+        appbar_state(Some(if on { ABS_AUTOHIDE } else { ABS_ALWAYSONTOP }));
     }
 }
 
 /// Explorers (versteckte) Leiste auf "automatisch ausblenden" stellen, damit
-/// sie keinen Platz reserviert, und den Zeitpunkt merken: Die folgende
-/// Registry-Änderung stammt von uns, nicht vom Nutzer (`forced_recently`).
-/// Nach der Übernahme und nachdem der Nutzer die Einstellung umgestellt hat –
-/// sonst reservierte Explorers unsichtbare Leiste wieder Platz.
+/// sie keinen Platz reserviert. Nach der Übernahme und nachdem der Nutzer die
+/// Einstellung abgeschaltet hat – sonst reservierte Explorers unsichtbare
+/// Leiste wieder Platz. Das "an" in der Registry stammt dann von uns; solange
+/// die Leiste übernommen ist, gilt deshalb nur ein "aus" als Wahl des Nutzers.
 pub unsafe fn force_autohide() {
-    FORCED_AT.store(windows_sys::Win32::System::SystemInformation::GetTickCount64(), Ordering::Relaxed);
     appbar_state(Some(ABS_AUTOHIDE));
 }
 
+/// Zeitpunkt (GetTickCount64) unserer letzten eigenen "TaskbarCreated"-Rundmeldung.
+static OWN_ANNOUNCE: AtomicU64 = AtomicU64::new(0);
+
+/// Tray-Programme auffordern, ihre Symbole neu anzumelden ("TaskbarCreated").
+/// Die Leiste empfängt die Meldung selbst auch; `own_announce_recent` lässt
+/// sie erkennen, dass es kein Neustart von Explorer war.
+pub unsafe fn announce_tray() {
+    OWN_ANNOUNCE.store(windows_sys::Win32::System::SystemInformation::GetTickCount64(), Ordering::Relaxed);
+    crate::tray::announce();
+}
+
+/// Kam "TaskbarCreated" eben (vor höchstens 2 s) von uns selbst?
+pub fn own_announce_recent() -> bool {
+    let at = OWN_ANNOUNCE.load(Ordering::Relaxed);
+    at != 0 && unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }.saturating_sub(at) < 2000
+}
+
 /// Originalzustand zurück und Explorers Leisten wieder zeigen.
+/// Auch aus dem Wächter und mit `--restore` aufgerufen (nach einem Absturz):
+/// Dann holt erst die "TaskbarCreated"-Meldung die Tray-Symbole zu Explorer
+/// zurück. Mehrfaches Melden schadet nicht.
 pub unsafe fn restore() {
     ACTIVE.store(false, Ordering::Relaxed);
-    let original = state_file()
-        .and_then(|f| std::fs::read_to_string(f).ok())
-        .and_then(|s| s.trim().parse::<u32>().ok());
-    if let Some(state) = original {
+    if let Some(state) = read_state() {
         appbar_state(Some(state));
     }
     for h in explorer_bars() {
         RemovePropW(h, w16(HIDDEN_PROP).as_ptr());
         ShowWindowAsync(h, SW_SHOWNA);
+        // `hide_explorer_bar` hat sie ganz nach hinten gelegt – wieder nach vorn.
+        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
+    announce_tray();
 }
 
 // --------------------------------------------------------------- Autostart
@@ -253,8 +282,34 @@ unsafe fn set_run_named(name: &str, value: Option<&str>) -> bool {
     ok
 }
 
+/// Benanntes Ereignis "kein Neustart": `--install`/`--uninstall`/`--restore`
+/// setzen es, bevor sie die laufende Instanz beenden. Der Wächter prüft es,
+/// bevor er neu startet – sonst holte er eine Instanz, die wir gerade hart
+/// beenden mussten, sofort zurück.
+fn no_restart_event_name() -> Vec<u16> {
+    w16("Local\\lightbar-no-restart")
+}
+
+/// Für den Wächter: Läuft gerade ein Befehl, der Lightbar bewusst beendet?
+pub unsafe fn no_restart_requested() -> bool {
+    use windows_sys::Win32::System::Threading::{OpenEventW, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE};
+    let h = OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, no_restart_event_name().as_ptr());
+    if h.is_null() {
+        return false;
+    }
+    let set = WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+    CloseHandle(h);
+    set
+}
+
 /// Laufende Instanz sauber beenden (sie stellt dabei Explorer wieder her).
 unsafe fn close_running() {
+    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+    // Manuell zurückzusetzen und gesetzt: gilt, solange wir es offen halten.
+    let no_restart = CreateEventW(null(), 1, 1, no_restart_event_name().as_ptr());
+    if !no_restart.is_null() {
+        SetEvent(no_restart);
+    }
     let c = w16("Shell_TrayWnd");
     let mut h = null_mut();
     loop {
@@ -275,20 +330,46 @@ unsafe fn close_running() {
     while !other_instances().is_empty() && start.elapsed() < std::time::Duration::from_secs(8) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    for pid in other_instances() {
-        let p = OpenProcess(windows_sys::Win32::System::Threading::PROCESS_TERMINATE, 0, pid);
-        if !p.is_null() {
-            crate::util::log(&format!("Prozess {pid} reagierte nicht auf Beenden – hart beendet"));
-            windows_sys::Win32::System::Threading::TerminateProcess(p, 1);
-            CloseHandle(p);
+    // Ein Wächter kann zwischen Schnappschuss und Beenden noch eine Instanz
+    // gestartet haben: in ein paar Runden, bis keine mehr übrig ist.
+    for _ in 0..5 {
+        let pids = other_instances();
+        if pids.is_empty() {
+            break;
         }
+        for pid in pids {
+            let p = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+            if !p.is_null() {
+                crate::util::log(&format!("Prozess {pid} reagierte nicht auf Beenden – hart beendet"));
+                TerminateProcess(p, 1);
+                WaitForSingleObject(p, 2000);
+                CloseHandle(p);
+            }
+        }
+    }
+    if !other_instances().is_empty() {
+        crate::util::log("Andere Lightbar-Prozesse ließen sich nicht beenden");
+    }
+    if !no_restart.is_null() {
+        CloseHandle(no_restart);
     }
 }
 
-/// Andere laufende Lightbar-Prozesse (Leiste und Wächter), ohne diesen.
+/// Andere laufende Lightbar-Prozesse (Leiste und Wächter) in dieser Sitzung,
+/// ohne diesen. Lightbar anderer angemeldeter Benutzer (schneller
+/// Benutzerwechsel, RDP) bleibt unberührt.
 unsafe fn other_instances() -> Vec<u32> {
     use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     let me = std::process::id();
+    let mut my_session = 0u32;
+    if ProcessIdToSessionId(me, &mut my_session) == 0 {
+        return Vec::new();
+    }
+    let same_session = |pid: u32| {
+        let mut s = 0u32;
+        ProcessIdToSessionId(pid, &mut s) != 0 && s == my_session
+    };
     let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if snap == INVALID_HANDLE_VALUE {
         return Vec::new();
@@ -307,12 +388,39 @@ unsafe fn other_instances() -> Vec<u32> {
     // Paket-Container wartet er auf genau diesen Befehl.
     let parent = all.iter().find(|p| p.0 == me).map(|p| p.1).unwrap_or(0);
     all.into_iter()
-        .filter(|(pid, _, name)| (name == "lightbar.exe" || name == "rtaskbar.exe") && *pid != me && *pid != parent)
+        .filter(|(pid, _, name)| (name == "lightbar.exe" || name == "rtaskbar.exe") && *pid != me && *pid != parent && same_session(*pid))
         .map(|p| p.0)
         .collect()
 }
 
 const TASK_NAME: &str = "Lightbar";
+/// Argument der Anmelde-Aufgabe: Daran erkennt der Start, dass er aus dem
+/// Autostart kommt (ältere Aufgaben ohne Argument starten wie bisher).
+const AUTOSTART_ARG: &str = "--autostart";
+const STARTUP_APPROVED_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
+/// Hat der Nutzer Lightbar im Task-Manager unter "Autostart-Apps"
+/// deaktiviert? Windows vermerkt das im ersten Byte des Werts unter
+/// `StartupApproved\Run` (gerade = aktiviert, ungerade = deaktiviert). Die
+/// Aufgabenplanung kennt diese Liste nicht, also prüfen wir selbst.
+unsafe fn startup_disabled() -> bool {
+    let mut buf = [0u8; 12];
+    let mut size = buf.len() as u32;
+    let ok = RegGetValueW(
+        HKEY_CURRENT_USER,
+        w16(STARTUP_APPROVED_KEY).as_ptr(),
+        w16(RUN_NAME).as_ptr(),
+        RRF_RT_REG_BINARY,
+        null_mut(),
+        buf.as_mut_ptr() as _,
+        &mut size,
+    );
+    ok == 0 && size >= 1 && startup_byte_disabled(buf[0])
+}
+
+fn startup_byte_disabled(b: u8) -> bool {
+    b & 1 != 0
+}
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -357,7 +465,7 @@ fn set_logon_task(exe: Option<&str>) -> bool {
     <Priority>4</Priority>
     <Enabled>true</Enabled>
   </Settings>
-  <Actions Context="Author"><Exec><Command>{exe}</Command></Exec></Actions>
+  <Actions Context="Author"><Exec><Command>{exe}</Command><Arguments>{AUTOSTART_ARG}</Arguments></Exec></Actions>
 </Task>
 "#
     );
@@ -426,8 +534,17 @@ pub unsafe fn handle_args() -> bool {
             true
         }
         "--restore" => {
+            close_running();
             restore();
             true
+        }
+        // Start über die Anmelde-Aufgabe: im Task-Manager abgeschaltet → nicht starten.
+        AUTOSTART_ARG => {
+            if startup_disabled() {
+                crate::util::log("Autostart im Task-Manager deaktiviert – Start über die Aufgabe übersprungen");
+                return true;
+            }
+            false
         }
         _ => false,
     }
@@ -454,11 +571,13 @@ unsafe fn in_package() -> bool {
 /// (dokumentierte Ausnahme `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_OVERRIDE`).
 /// `true` = neu gestartet, dieser Prozess soll enden. Befehle (`--install`
 /// usw.) wartet er noch ab, damit sie wie gewohnt fertig sind, wenn er endet.
+/// Merker "schon aus dem Container ausgebrochen" (Schutz gegen eine Schleife).
+/// `main` entfernt ihn danach, damit von Lightbar gestartete Programme ihn nicht erben.
+pub const MARKER: &str = "LIGHTBAR_OUTSIDE_PACKAGE";
+
 pub unsafe fn escape_package() -> bool {
     use windows_sys::Win32::System::Threading::*;
     use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_OVERRIDE;
-    // Schutz gegen eine Schleife, falls das Ausbrechen nicht greift.
-    const MARKER: &str = "LIGHTBAR_OUTSIDE_PACKAGE";
     if !in_package() || std::env::var_os(MARKER).is_some() {
         return false;
     }
@@ -497,10 +616,23 @@ pub unsafe fn escape_package() -> bool {
     if !started {
         return false;
     }
-    if std::env::args().nth(1).is_some_and(|a| a.starts_with("--")) {
+    // Befehle abwarten – den normalen Start (auch aus dem Autostart) nicht.
+    if std::env::args().nth(1).is_some_and(|a| a.starts_with("--") && a != AUTOSTART_ARG) {
         WaitForSingleObject(pi.hProcess, INFINITE);
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn startup_approved_first_byte() {
+        // 02 = aktiviert, 03 = im Task-Manager deaktiviert (06/07 bei manchen Builds).
+        assert!(!super::startup_byte_disabled(2));
+        assert!(super::startup_byte_disabled(3));
+        assert!(!super::startup_byte_disabled(6));
+        assert!(super::startup_byte_disabled(7));
+    }
 }

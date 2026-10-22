@@ -115,6 +115,47 @@ pub fn log(msg: &str) {
     }
 }
 
+/// Datei atomar ersetzen: erst eine Kopie daneben schreiben (und auf die
+/// Platte bringen), dann per `MoveFileExW` über das Original schieben. Ein
+/// Absturz oder Stromausfall mittendrin hinterlässt so nie eine halbe Datei –
+/// entweder die alte oder die neue. Legt den Ordner bei Bedarf an.
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let name = path.file_name().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "kein Dateiname"))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!("{}.{}.tmp", name.to_string_lossy(), std::process::id()));
+    let written = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let wide = |p: &std::path::Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    let (from, to) = (wide(&tmp), wide(path));
+    // Kurz gesperrt (Virenscanner, Synchronisierung)? Ein paarmal versuchen.
+    let mut result = Ok(());
+    for attempt in 0..5 {
+        result = unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) }.map_err(std::io::Error::from);
+        if result.is_ok() {
+            break;
+        }
+        if attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 pub fn w16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
@@ -437,4 +478,34 @@ pub unsafe fn rect_to_screen(hwnd: HWND, r: RECT) -> RECT {
     ClientToScreen(hwnd, &mut a);
     ClientToScreen(hwnd, &mut b);
     RECT { left: a.x, top: a.y, right: b.x, bottom: b.y }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_atomic;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("lightbar-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn write_atomic_creates_and_replaces() {
+        let dir = temp_dir("atomic");
+        let f = dir.join("sub").join("datei.txt");
+        write_atomic(&f, b"eins").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"eins");
+        write_atomic(&f, "zwei – mit Umlaut ä".as_bytes()).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "zwei – mit Umlaut ä");
+        // Keine Zwischendateien übrig.
+        let left: Vec<_> = std::fs::read_dir(f.parent().unwrap()).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 1, "{left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_fails_without_file_name() {
+        assert!(write_atomic(std::path::Path::new("C:\\"), b"x").is_err());
+    }
 }

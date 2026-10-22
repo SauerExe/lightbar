@@ -63,6 +63,20 @@ unsafe fn dark_menus() {
     }
 }
 
+/// RegisterApplicationRestart (kernel32). Ohne Befehlszeile: normaler Start.
+unsafe fn register_restart() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn RegisterApplicationRestart(command_line: *const u16, flags: u32) -> i32;
+    }
+    const RESTART_NO_CRASH: u32 = 1;
+    const RESTART_NO_HANG: u32 = 2;
+    let hr = RegisterApplicationRestart(null(), RESTART_NO_CRASH | RESTART_NO_HANG);
+    if hr != 0 {
+        util::log(&format!("RegisterApplicationRestart fehlgeschlagen (0x{hr:X})"));
+    }
+}
+
 fn main() {
     unsafe {
         // Aus einem Paket-Container (z. B. Terminal einer paketierten App) heraus
@@ -70,6 +84,8 @@ fn main() {
         if shell::escape_package() {
             return;
         }
+        // Merker des Ausbruchs nicht an von hier gestartete Programme vererben.
+        std::env::remove_var(shell::MARKER);
         // Diagnose: Index-Suche ohne Oberfläche, Ergebnis nach %APPDATA%\Lightbar\search-test.txt.
         if std::env::args().nth(1).as_deref() == Some("--search-test") {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -173,9 +189,15 @@ fn main() {
         }
         // Nur eine Instanz: zwei Leisten würden sich gegenseitig Platz reservieren.
         CreateMutexW(null(), 0, util::w16("lightbar-single-instance").as_ptr());
+        // Eigener Exit-Code: Kam der Start vom Wächter, wartet der darauf, dass
+        // die alte Instanz den Mutex freigibt, und versucht es dann erneut.
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            return;
+            std::process::exit(watchdog::EXIT_MUTEX_BUSY);
         }
+        // Nach einem Update oder Neustart durch den Restart Manager (Installer,
+        // Windows Update) Lightbar wieder starten. Abstürze und Hänger
+        // übernimmt der Wächter, deshalb dafür kein Neustart durch Windows.
+        register_restart();
         // Wächter gleich zu Beginn, damit auch ein Absturz beim Hochfahren
         // auffällt. Vom Wächter neu gestartet: Der bewacht uns schon. Den Merker
         // entfernen, damit ihn von hier gestartete Programme nicht erben.

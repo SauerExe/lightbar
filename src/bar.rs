@@ -1261,6 +1261,7 @@ unsafe fn bar_menu(hwnd: HWND) {
             Item::Check(14, t!("Uhr mit Sekunden", "Show seconds in clock"), clock_seconds()),
             Item::Check(23, t!("Suche anzeigen", "Show search"), s.taskbar_search && crate::display::search_mode() > 0),
             Item::Check(24, t!("Aufgabenansicht anzeigen", "Show Task view"), crate::display::task_view_button()),
+            Item::Check(29, t!("Automatisch ausblenden", "Auto-hide"), autohide_on()),
             Item::Check(28, t!("Eingabesprache anzeigen", "Show input language"), s.input_lang),
             Item::Check(15, t!("Claude/Codex-Usage anzeigen", "Show Claude/Codex usage"), s.show_usage),
             Item::Check(5, t!("Tray-Icons in Akzentfarbe", "Tray icons in accent color"), s.mono_tray),
@@ -1309,6 +1310,12 @@ unsafe fn bar_menu(hwnd: HWND) {
             apply_taskbar_settings();
         }
         24 => crate::display::set_task_view(!crate::display::task_view_button()),
+        // Wie in Windows (Personalisierung → Taskleiste); mit übernommener
+        // Windows-Leiste nur als gemerkter Originalzustand (siehe `autohide_wanted`).
+        29 => {
+            crate::shell::choose_autohide(!autohide_on());
+            sync_autohide();
+        }
         15 => crate::settings::update(|s| {
             s.show_usage = !s.show_usage;
             // Beide Dienste abgewählt hieße: Anzeige bleibt trotzdem unsichtbar.
@@ -2651,21 +2658,21 @@ fn autohide_on() -> bool {
 
 /// Will der Nutzer die Leiste automatisch ausblenden? Grundlage ist die
 /// Windows-Einstellung (`display::autohide`). Nach der Übernahme steht Explorer
-/// aber von uns auf Ausblenden – dann gilt der gemerkte Originalzustand. Stellt
-/// der Nutzer die Einstellung um, während Lightbar läuft, wird das zum neuen
-/// Originalzustand (unser eigenes Umstellen bei der Übernahme zählt nicht).
+/// aber von uns auf Ausblenden – dann gilt der gemerkte Originalzustand.
+/// Solange die Windows-Leiste übernommen ist, zählt in der Registry nur ein
+/// Wechsel auf "aus" als Wahl des Nutzers: "an" schreiben wir selbst (bei der
+/// Übernahme, nach Explorer-Neustarts), und Explorer tut das mitunter
+/// verzögert. Einschalten geht dann über das Kontextmenü der Leiste.
 fn autohide_wanted() -> bool {
     let reg = crate::display::autohide();
-    // Kurz nach der Übernahme ist "an" unser eigener Wert, egal was die
-    // Registry schon zeigt (Explorer schreibt ihn evtl. etwas später).
-    let now: u8 = if reg || crate::shell::forced_recently() { 2 } else { 1 };
+    let now: u8 = if reg { 2 } else { 1 };
     let seen = AUTOHIDE_SEEN.swap(now, Ordering::Relaxed);
-    if seen != 0 && seen != now && crate::shell::active() && !crate::shell::forced_recently() {
-        crate::util::log(&format!("Taskleiste automatisch ausblenden in Windows umgestellt: {}", if reg { "an" } else { "aus" }));
-        crate::shell::remember_autohide(reg);
+    if seen == 2 && now == 1 && crate::shell::active() {
+        crate::util::log("Taskleiste automatisch ausblenden in Windows abgeschaltet");
+        crate::shell::remember_autohide(false);
         // Explorer hat die Einstellung damit auch für seine versteckte Leiste
-        // übernommen; bei "aus" reservierte sie wieder Platz. Zurück auf
-        // Ausblenden (wie bei der Übernahme) – das zählt nicht als Nutzerwahl.
+        // übernommen und reservierte wieder Platz. Zurück auf Ausblenden (wie
+        // bei der Übernahme) – das zählt nicht als Nutzerwahl (siehe oben).
         unsafe { crate::shell::force_autohide() };
     }
     crate::shell::remembered_autohide().unwrap_or(reg)
@@ -2792,6 +2799,21 @@ fn animations_enabled() -> bool {
     let mut on: BOOL = 1;
     unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &mut on as *mut BOOL as *mut c_void, 0) };
     on != 0
+}
+
+/// Start, Schnelleinstellungen, Kalender und Tray-Überlauf schließen.
+unsafe fn close_popups() {
+    let start = crate::start::hwnd();
+    if !start.is_null() && IsWindowVisible(start) != 0 {
+        crate::start::toggle(false);
+    }
+    if crate::quick::visible() {
+        crate::quick::toggle();
+    }
+    if crate::calendar::visible() {
+        crate::calendar::toggle();
+    }
+    tray::hide_overflow();
 }
 
 /// Ein Popup der Leiste ist offen (Start, Kalender, Schnelleinstellungen,
@@ -3647,6 +3669,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         let mut abd = appbar_data(hwnd);
         SHAppBarMessage(ABM_NEW, &mut abd);
         set_pos(hwnd);
+        // Unsere eigene Rundmeldung (Tray-Neuanmeldung nach dem Ausblenden oder
+        // beim Wiederherstellen): keine erneute Übernahme – sonst Schleife
+        // takeover → rehide → announce → takeover, bzw. beim Beenden würde
+        // Explorers Leiste gleich wieder versteckt.
+        if crate::shell::own_announce_recent() {
+            return 0;
+        }
         // Nach dem Login kann Explorer später fertig sein als wir: dann seine
         // Leiste jetzt (erneut) ausblenden und auf Auto-Ausblenden stellen.
         crate::shell::takeover();
@@ -3829,6 +3858,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER if wp == TIMER_REHIDE => {
             KillTimer(hwnd, TIMER_REHIDE);
             crate::shell::ensure_hidden();
+            // Nach einem Neustart von Explorer haben sich die Tray-Programme
+            // womöglich bei Explorers (jetzt versteckter) Leiste angemeldet:
+            // einmal zu uns holen. Die eigene Meldung löst keine Übernahme aus.
+            crate::shell::announce_tray();
             0
         }
         WM_TIMER if wp == TIMER_WORKAREA => {
@@ -3927,8 +3960,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         // Sitzung entsperrt: Tastaturhook vorsichtshalber neu setzen.
+        // Ebenso nach dem Wiederverbinden (Remotedesktop, Wechsel zurück an die Konsole).
         WM_WTSSESSION_CHANGE => {
-            if hwnd == self::hwnd() && wp as u32 == WTS_SESSION_UNLOCK {
+            if hwnd == self::hwnd() && matches!(wp as u32, WTS_SESSION_UNLOCK | WTS_REMOTE_CONNECT | WTS_CONSOLE_CONNECT) {
                 crate::keyhook::reinstall();
             }
             0
@@ -4171,6 +4205,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Nachbarmonitor, auf dem sie gerade größtenteils liegt – ignorieren.
         WM_DPICHANGED if slid_or_sliding(hwnd) => 0,
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            // Auflösung oder Bildschirme geändert: offene Popups stünden jetzt an
+            // der alten Stelle (evtl. auf einem abgesteckten Monitor) – schließen.
+            if msg == WM_DISPLAYCHANGE && hwnd == self::hwnd() {
+                close_popups();
+            }
             set_pos(hwnd);
             if hwnd == self::hwnd() {
                 refresh(hwnd, None);
@@ -4182,6 +4221,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Abmelden/Herunterfahren: Explorers Originalzustand (kein "automatisch
         // ausblenden") zurück. Der überlebt sonst den Neustart – und startet
         // Lightbar danach nicht, wäre die Windows-Leiste versteckt.
+        // Restart Manager (Installer, Windows Update) schließt nur diese App
+        // (ENDSESSION_CLOSEAPP): regulär beenden – Wiederherstellen, Tray-Symbole
+        // an Explorer, Exit-Code 0 (der Wächter startet dann nicht neu). Der
+        // Restart Manager startet Lightbar danach selbst wieder
+        // (RegisterApplicationRestart in `main`).
+        WM_ENDSESSION if hwnd == self::hwnd() && wp != 0 && (lp as u32 & ENDSESSION_CLOSEAPP) != 0 => {
+            crate::util::log("Restart Manager schließt Lightbar – reguläres Ende");
+            DestroyWindow(hwnd);
+            0
+        }
         WM_ENDSESSION if hwnd == self::hwnd() && wp != 0 => {
             crate::util::log("Sitzung endet – Windows-Taskleiste wiederhergestellt");
             crate::shell::restore();
@@ -4223,6 +4272,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             KillTimer(hwnd, TIMER_TICK);
             DeregisterShellHookWindow(hwnd);
             windows_sys::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification(hwnd);
+            // Selbst gesetzten Arbeitsbereich zurückgeben (wie bei den Zweitleisten).
+            release_work_area(hwnd);
             let mut abd = appbar_data(hwnd);
             SHAppBarMessage(ABM_REMOVE, &mut abd);
             with(|s| {

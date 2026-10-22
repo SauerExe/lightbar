@@ -419,10 +419,9 @@ fn save(p: &Prefs) {
     for k in &p.off {
         text.push_str(&format!("off={k}\n"));
     }
-    if let Some(dir) = f.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    if let Err(e) = crate::util::write_atomic(&f, text.as_bytes()) {
+        crate::util::log(&format!("monitors.txt nicht speicherbar ({e})"));
     }
-    let _ = std::fs::write(f, text);
 }
 
 fn with<R>(f: impl FnOnce(&mut Prefs) -> R) -> R {

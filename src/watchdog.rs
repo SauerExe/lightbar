@@ -10,6 +10,10 @@
 //!   einem blockierenden Aufruf, kommt die Nachricht nie an – direkt gesendete
 //!   Nachrichten (`WM_NULL`) würden dagegen weiter beantwortet,
 //! - bewacht auch die Instanz, die er neu startet (keine Lücke beim Hochfahren),
+//! - wartet, wenn die neue Instanz mit Code 2 endet (Mutex noch von der alten
+//!   belegt), bis die alte wirklich weg ist, und versucht es dann erneut,
+//! - startet nicht neu, solange `--install`/`--uninstall`/`--restore` Lightbar
+//!   bewusst beenden (`shell::no_restart_requested`),
 //! - gibt nach zu vielen Neustarts kurz hintereinander auf und holt die
 //!   Windows-Taskleiste zurück.
 
@@ -83,7 +87,7 @@ fn allow_restart() -> bool {
         return false;
     }
     recent.push(t);
-    let _ = std::fs::write(&path, recent.iter().map(|x| format!("{x}\n")).collect::<String>());
+    let _ = crate::util::write_atomic(&path, recent.iter().map(|x| format!("{x}\n")).collect::<String>().as_bytes());
     true
 }
 
@@ -107,14 +111,41 @@ unsafe fn bar_of(pid: u32) -> HWND {
 /// schon bewacht und startet keinen eigenen Wächter.
 pub const WATCHED: &str = "LIGHTBAR_WATCHED";
 
-/// Ausgang einer Instanz: `None` = regulär beendet, sonst der Grund.
-unsafe fn watch(proc: HANDLE, pid: u32) -> Option<String> {
+/// Exit-Code einer Instanz, die den Einzelinstanz-Mutex nicht bekam (siehe `main`).
+pub const EXIT_MUTEX_BUSY: i32 = 2;
+const MUTEX_NAME: &str = "lightbar-single-instance";
+
+/// Ausgang einer bewachten Instanz.
+enum Outcome {
+    /// Regulär beendet (Exit-Code 0).
+    Clean,
+    /// Mutex noch belegt – meist hält ihn die alte, gerade beendete Instanz noch.
+    MutexBusy,
+    /// Abgestürzt, hart beendet oder hängend: der Grund.
+    Failed(String),
+}
+
+/// Gibt es den Einzelinstanz-Mutex gerade (hält ihn also ein Prozess)?
+unsafe fn mutex_held() -> bool {
+    let h = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, w16(MUTEX_NAME).as_ptr());
+    if h.is_null() {
+        return false;
+    }
+    CloseHandle(h);
+    true
+}
+
+unsafe fn watch(proc: HANDLE, pid: u32) -> Outcome {
     let alive = CreateEventW(null(), 0, 0, alive_event_name(pid).as_ptr());
     let mut silent = 0u32;
     let exited = |proc: HANDLE| {
         let mut code = 0u32;
         GetExitCodeProcess(proc, &mut code);
-        (code != 0).then(|| format!("Lightbar unerwartet beendet (Code 0x{code:X})"))
+        match code {
+            0 => Outcome::Clean,
+            c if c == EXIT_MUTEX_BUSY as u32 => Outcome::MutexBusy,
+            c => Outcome::Failed(format!("Lightbar unerwartet beendet (Code 0x{c:X})")),
+        }
     };
     let outcome = loop {
         if WaitForSingleObject(proc, 10_000) == WAIT_OBJECT_0 {
@@ -137,7 +168,7 @@ unsafe fn watch(proc: HANDLE, pid: u32) -> Option<String> {
                 if silent >= MAX_SILENT {
                     TerminateProcess(proc, 0xDEAD);
                     WaitForSingleObject(proc, 5_000);
-                    break Some(format!("Leiste reagiert seit {} s nicht", silent * 15));
+                    break Outcome::Failed(format!("Leiste reagiert seit {} s nicht", silent * 15));
                 }
             }
         }
@@ -151,15 +182,52 @@ unsafe fn watch(proc: HANDLE, pid: u32) -> Option<String> {
 /// `--watchdog <pid>`: bewacht die Instanz und jede, die er selbst neu
 /// startet, bis eine regulär endet oder er aufgibt.
 pub unsafe fn run(pid: u32) {
+    use std::os::windows::io::IntoRawHandle;
     let mut proc = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, 0, pid);
     let mut pid = pid;
+    // Die zuvor bewachte Instanz: Startet die neue zu früh, hält die alte den
+    // Mutex evtl. noch (hart beendet, räumt noch auf) – dann auf sie warten.
+    let mut prev: HANDLE = null_mut();
+    let close = |h: HANDLE| {
+        if !h.is_null() {
+            CloseHandle(h);
+        }
+    };
     while !proc.is_null() {
-        let reason = watch(proc, pid);
-        CloseHandle(proc);
-        let Some(reason) = reason else { return };
+        let reason = match watch(proc, pid) {
+            Outcome::Clean => {
+                close(proc);
+                close(prev);
+                return;
+            }
+            Outcome::MutexBusy => {
+                if !prev.is_null() && WaitForSingleObject(prev, OLD_EXIT_WAIT_MS) != WAIT_OBJECT_0 {
+                    log("Wächter: vorige Instanz endet nicht – Windows-Taskleiste wird wiederhergestellt");
+                    crate::shell::restore();
+                    return;
+                }
+                // Die vorige ist weg und der Mutex trotzdem belegt: Eine andere
+                // Instanz (mit eigenem Wächter) läuft – nichts mehr zu tun.
+                if mutex_held() {
+                    log("Wächter: eine andere Lightbar-Instanz läuft bereits – Wächter endet");
+                    close(proc);
+                    close(prev);
+                    return;
+                }
+                "Neustart traf noch auf die vorige Instanz".to_string()
+            }
+            Outcome::Failed(reason) => reason,
+        };
+        close(prev);
+        prev = proc;
         // Beim Abmelden/Herunterfahren beendet Windows Lightbar selbst.
         if GetSystemMetrics(SM_SHUTTINGDOWN) != 0 {
             log(&format!("Wächter: {reason} – System fährt herunter, kein Neustart"));
+            return;
+        }
+        // --install/--uninstall/--restore beenden Lightbar gerade bewusst.
+        if crate::shell::no_restart_requested() {
+            log(&format!("Wächter: {reason} – Beenden durch Installation/Wiederherstellung, kein Neustart"));
             return;
         }
         if !allow_restart() {
@@ -175,6 +243,12 @@ pub unsafe fn run(pid: u32) {
             return;
         };
         pid = child.id();
-        proc = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, 0, pid);
+        // Das eigene Handle des Kinds (volle Rechte) statt neu per PID öffnen:
+        // Endet es sehr schnell, könnte die PID schon einem anderen Prozess gehören.
+        proc = child.into_raw_handle() as HANDLE;
     }
 }
+
+/// So lange wartet der Wächter höchstens darauf, dass die vorige Instanz den
+/// Mutex freigibt (5 min).
+const OLD_EXIT_WAIT_MS: u32 = 300_000;
