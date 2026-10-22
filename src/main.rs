@@ -13,6 +13,7 @@ mod anim;
 mod apps;
 mod bar;
 mod calendar;
+mod clockfmt;
 mod chat;
 mod destlist;
 mod display;

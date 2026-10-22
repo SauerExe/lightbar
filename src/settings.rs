@@ -71,11 +71,13 @@ pub struct Settings {
     /// Suchfeld in der Leiste. Standard aus – auch wenn Windows es zeigt
     /// (stört meist nur, Win-Taste + Tippen sucht ja schon).
     pub taskbar_search: bool,
+    /// Kalenderwochen im Kalender. Standard aus, wie bei Windows.
+    pub week_numbers: bool,
 }
 
 // Usage-Anzeige standardmäßig aus: Sie liest lokale Logins und nutzt nicht
 // offiziell dokumentierte Schnittstellen – das soll man bewusst einschalten.
-const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: false, usage_claude: true, usage_codex: true, start_logo: StartLogo::Orb, presentation: false, start_avatar: true, language: crate::i18n::LangSetting::Auto, input_lang: true, taskbar_search: false };
+const DEFAULTS: Settings = Settings { glow: GlowStyle::Aurora, mono_tray: false, clock_seconds: false, show_usage: false, usage_claude: true, usage_codex: true, start_logo: StartLogo::Orb, presentation: false, start_avatar: true, language: crate::i18n::LangSetting::Auto, input_lang: true, taskbar_search: false, week_numbers: false };
 
 static CURRENT: Mutex<Option<Settings>> = Mutex::new(None);
 
@@ -121,6 +123,7 @@ fn load() -> Settings {
                     "language" => s.language = crate::i18n::LangSetting::parse(v).unwrap_or(s.language),
                     "input_lang" => s.input_lang = on,
                     "taskbar_search" => s.taskbar_search = on,
+                    "week_numbers" => s.week_numbers = on,
                     _ => {}
                 }
             }
@@ -150,7 +153,7 @@ fn save(s: &Settings) {
     let _ = std::fs::create_dir_all(&dir);
     let b = |v: bool| if v { "1" } else { "0" };
     let text = format!(
-        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\nusage_claude={}\nusage_codex={}\nstart_logo={}\npresentation={}\nstart_avatar={}\nlanguage={}\ninput_lang={}\ntaskbar_search={}\n",
+        "glow={}\nmono_tray={}\nclock_seconds={}\nshow_usage={}\nusage_claude={}\nusage_codex={}\nstart_logo={}\npresentation={}\nstart_avatar={}\nlanguage={}\ninput_lang={}\ntaskbar_search={}\nweek_numbers={}\n",
         s.glow.key(),
         b(s.mono_tray),
         b(s.clock_seconds),
@@ -162,7 +165,8 @@ fn save(s: &Settings) {
         b(s.start_avatar),
         s.language.key(),
         b(s.input_lang),
-        b(s.taskbar_search)
+        b(s.taskbar_search),
+        b(s.week_numbers)
     );
     let _ = std::fs::write(dir.join("settings.txt"), text);
 }
