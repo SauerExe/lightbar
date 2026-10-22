@@ -6,7 +6,10 @@
 //! einzelnes Atomic – ein Lesezugriff pro Text, keine Tabelle, kein Hashing.
 //! Log-Zeilen (lightbar.log) bleiben deutsch.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(not(test))]
+use std::sync::atomic::AtomicU8;
+#[cfg(not(test))]
+use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Language {
@@ -37,6 +40,7 @@ impl LangSetting {
 }
 
 // 0 = noch nicht bestimmt, 1 = De, 2 = En.
+#[cfg(not(test))]
 static CURRENT: AtomicU8 = AtomicU8::new(0);
 
 #[link(name = "kernel32")]
