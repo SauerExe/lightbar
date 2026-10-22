@@ -17,6 +17,7 @@ mod chat;
 mod display;
 mod glow;
 mod jumplist;
+mod kbd;
 mod keyhook;
 mod menus;
 mod preview;

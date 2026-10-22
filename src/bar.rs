@@ -42,6 +42,9 @@ const TRAY_W: i32 = 28;
 const TRAY_ICON: i32 = 16;
 const STATUS_GLYPH_W: i32 = 26;
 const DESKTOP_W: i32 = 8;
+/// Eingabesprache ("DEU"): Breite waagerecht, Höhe senkrecht.
+const KBD_W: i32 = 40;
+const KBD_H_V: i32 = 40;
 
 // WM_APP statt WM_USER: Fremde Tools schicken Shell_TrayWnd eigene WM_USER-Nachrichten.
 const WM_APPBAR: u32 = WM_APP + 1;
@@ -66,6 +69,9 @@ const TIMER_AUTOHIDE: usize = 11;
 /// Kurz nach dem Umschalten von "automatisch ausblenden": maximierte Fenster
 /// an den neuen Arbeitsbereich anpassen.
 const TIMER_REFIT: usize = 12;
+/// Eingabesprache prüfen (Win+Leertaste, Alt+Umschalt melden sich nicht bei uns).
+const TIMER_KBD: usize = 13;
+const KBD_POLL_MS: u32 = 400;
 
 /// Explorers Leiste kurz nach der Übernahme noch einmal ausblenden.
 pub unsafe fn schedule_rehide() {
@@ -98,6 +104,8 @@ enum Hit {
     TaskView,
     /// "…": Apps, für die in der Leiste kein Platz mehr ist.
     More,
+    /// Eingabesprache ("DEU" / "ENG").
+    Kbd,
     Status,
     Clock,
     Desktop,
@@ -193,6 +201,8 @@ struct State {
     /// Tastaturfokus (Win+T) auf einem Element aus ui_elements.
     kb_focus: Option<usize>,
     status: Option<Status>,
+    /// Eingabesprache; `None` bei nur einem Layout (Windows zeigt dann nichts).
+    kbd: Option<crate::kbd::Indicator>,
     hover: Hit,
     /// Leiste, über der hover gilt (Haupt- oder Zweitleiste).
     hover_hwnd: HWND,
@@ -351,6 +361,8 @@ struct Layout {
     chevron: Option<RECT>,
     /// "…"-Knopf, wenn nicht alle App-Buttons Platz haben.
     more: Option<RECT>,
+    /// Eingabesprache (leer, wenn nicht angezeigt).
+    kbd: RECT,
     status: RECT,
     clock: RECT,
     desktop: RECT,
@@ -386,6 +398,8 @@ struct LayoutInput {
     /// Gibt es ausgeblendete Tray-Icons (Überlauf-Pfeil nötig)?
     hidden_tray: bool,
     battery: bool,
+    /// Eingabesprache anzeigen (mehrere Layouts, nur Hauptleiste).
+    kbd: bool,
     /// Hauptleiste: mit Infobereich, Status, Usage und Task-Manager. Zweitleisten
     /// zeigen wie bei Windows nur Start, Apps und Uhr.
     primary: bool,
@@ -428,11 +442,20 @@ fn layout(i: &LayoutInput) -> Layout {
     } else {
         RECT { left: clock.left, right: clock.left, ..empty }
     };
-    let tray_r = status.left - px(dpi, 4);
+    // Eingabesprache links neben den Status-Symbolen, wie bei Windows.
+    let kbd_rect = |on: bool| {
+        if on {
+            let r = status.left - px(dpi, 4);
+            RECT { left: r - px(dpi, KBD_W), top, right: r, bottom }
+        } else {
+            RECT { left: status.left, right: status.left, ..empty }
+        }
+    };
+    let tray_r = |kbd: bool| kbd_rect(kbd).left - px(dpi, 4);
     let tw = px(dpi, TRAY_W);
     let n_tray = if i.primary { i.n_tray } else { 0 };
     let chevron_needed = |shown: usize| i.primary && (i.hidden_tray || shown < n_tray);
-    let right_start = |shown: usize| tray_r - (shown as i32 + chevron_needed(shown) as i32) * tw;
+    let right_start = |kbd: bool, shown: usize| tray_r(kbd) - (shown as i32 + chevron_needed(shown) as i32) * tw;
 
     // Linke Seite: Usage, dann Task-Manager.
     let margin = px(dpi, 8);
@@ -456,12 +479,14 @@ fn layout(i: &LayoutInput) -> Layout {
         (if s > 0 { s + gap } else { 0 }) + if tv { bw + gap } else { 0 }
     };
     let need = |mode: u32, tv: bool, bw: i32| count * bw + (count - 1) * gap + extra(mode, tv, bw);
-    let room = |usage: bool, shown: usize| right_start(shown) - left_end(usage) - 2 * gap;
+    let room = |usage: bool, kbd: bool, shown: usize| right_start(kbd, shown) - left_end(usage) - 2 * gap;
     let (mut usage, mut shown, mut bw, mut search, mut task_view) = (i.primary && i.usage, n_tray, px(dpi, m.btn_w), i.search, i.task_view);
+    let mut kbd = i.primary && i.kbd;
     let min_bw = px(dpi, BTN_MIN_W);
-    // Ausweichen in dieser Reihenfolge; Suche und Aufgabenansicht fallen erst
-    // weg, wenn selbst die schmalsten Buttons nicht passen (Apps gehen vor).
-    while need(search, task_view, bw) > room(usage, shown) {
+    // Ausweichen in dieser Reihenfolge; Suche, Aufgabenansicht und zuletzt die
+    // Eingabesprache fallen erst weg, wenn selbst die schmalsten Buttons nicht
+    // passen (Apps gehen vor).
+    while need(search, task_view, bw) > room(usage, kbd, shown) {
         if shown > 0 {
             shown -= 1;
         } else if usage {
@@ -469,20 +494,24 @@ fn layout(i: &LayoutInput) -> Layout {
         } else if search >= 2 {
             search = 1; // Suchfeld wird zum Symbol.
         } else if bw > min_bw {
-            bw = ((room(usage, shown) - extra(search, task_view, bw) + gap) / count - gap).clamp(min_bw, bw - 1);
+            bw = ((room(usage, kbd, shown) - extra(search, task_view, bw) + gap) / count - gap).clamp(min_bw, bw - 1);
         } else if task_view {
             task_view = false;
         } else if search > 0 {
             search = 0;
+        } else if kbd {
+            kbd = false;
         } else {
             break;
         }
     }
+    let kbd_r = kbd_rect(kbd);
+    let tray_r = tray_r(kbd);
 
     // Apps: mittig (über die ganze Breite) oder links, wie in Windows eingestellt;
     // nie über die Elemente links und rechts hinaus.
     let lo = left_end(usage) + gap;
-    let hi = right_start(shown) - gap;
+    let hi = right_start(kbd, shown) - gap;
     let fixed = extra(search, task_view, bw);
     let fit = (((hi - lo - fixed + gap) / (bw + gap)).max(1) as usize).min(count as usize);
     let total = (count * bw + (count - 1) * gap).min(fit as i32 * (bw + gap) - gap) + fixed;
@@ -512,7 +541,7 @@ fn layout(i: &LayoutInput) -> Layout {
     } else {
         empty
     };
-    Layout { usage: usage_r, show_usage: usage, taskmgr, start, search: search_r, search_mode: search, taskview, tasks, tray, chevron, more, status, clock, desktop }
+    Layout { usage: usage_r, show_usage: usage, taskmgr, start, search: search_r, search_mode: search, taskview, tasks, tray, chevron, more, kbd: kbd_r, status, clock, desktop }
 }
 
 /// Aufteilung einer senkrechten Leiste (links oder rechts): oben der
@@ -538,7 +567,9 @@ fn layout_vertical(i: &LayoutInput) -> Layout {
     let cols = ((right - left) / cell).max(1);
     let chevron_needed = |shown: usize| i.primary && (i.hidden_tray || shown < n_tray);
     let tray_rows = |shown: usize| (shown as i32 + chevron_needed(shown) as i32 + cols - 1) / cols;
-    let tray_top = |shown: usize| status.top - px(dpi, 4) - tray_rows(shown) * cell;
+    // Eingabesprache als eigene Zeile über den Status-Symbolen.
+    let kbd = if i.primary && i.kbd { row(status.top - px(dpi, 4) - px(dpi, KBD_H_V), px(dpi, KBD_H_V)) } else { RECT { top: status.top, bottom: status.top, ..empty } };
+    let tray_top = |shown: usize| kbd.top - px(dpi, 4) - tray_rows(shown) * cell;
 
     let top_end = if i.primary { px(dpi, 8) + px(dpi, TASKMGR_W) } else { 0 };
     // Start, dann Suche (als Symbol) und Aufgabenansicht, wenn eingeschaltet.
@@ -602,13 +633,13 @@ fn layout_vertical(i: &LayoutInput) -> Layout {
     let first = chevron.is_some() as i32;
     let tray = (0..shown as i32).map(|n| at(first + n)).collect();
     let taskmgr = if i.primary { row(px(dpi, 8), px(dpi, TASKMGR_W)) } else { empty };
-    Layout { usage: empty, show_usage: false, taskmgr, start, search, search_mode: srch as u32, taskview, tasks, tray, chevron, more, status, clock, desktop }
+    Layout { usage: empty, show_usage: false, taskmgr, start, search, search_mode: srch as u32, taskview, tasks, tray, chevron, more, kbd, status, clock, desktop }
 }
 
 /// Layout einer Leiste und die Tray-Icons, die darin Platz haben. Tray-Icons,
 /// die nicht mehr passen, zeigt der Überlauf.
 unsafe fn current_layout(hwnd: HWND) -> Option<(Layout, Vec<(usize, HICON)>)> {
-    let (n, battery) = with(|s| (s.groups.len(), s.status.as_ref().is_some_and(|x| x.battery.is_some())))?;
+    let (n, battery, kbd) = with(|s| (s.groups.len(), s.status.as_ref().is_some_and(|x| x.battery.is_some()), s.kbd.is_some()))?;
     let dpi = bar_dpi(hwnd);
     let primary = hwnd == self::hwnd();
     let mut tray = if primary { tray::visible() } else { Vec::new() };
@@ -624,6 +655,7 @@ unsafe fn current_layout(hwnd: HWND) -> Option<(Layout, Vec<(usize, HICON)>)> {
         n_tray: tray.len(),
         hidden_tray: tray::has_hidden(),
         battery,
+        kbd: kbd && settings.input_lang,
         primary,
         usage: settings.show_usage && !settings.presentation && (settings.usage_claude || settings.usage_codex),
         align_left: crate::display::align_left(),
@@ -662,6 +694,9 @@ unsafe fn hit_at(hwnd: HWND, x: i32, y: i32) -> Hit {
     }
     if l.chevron.is_some_and(|r| inside(&r, x, y)) {
         return Hit::Chevron;
+    }
+    if inside(&l.kbd, x, y) {
+        return Hit::Kbd;
     }
     if inside(&l.status, x, y) {
         return Hit::Status;
@@ -1194,6 +1229,7 @@ unsafe fn bar_menu(hwnd: HWND) {
             Item::Check(14, t!("Uhr mit Sekunden", "Show seconds in clock"), clock_seconds()),
             Item::Check(23, t!("Suche anzeigen", "Show search"), crate::display::search_mode() > 0),
             Item::Check(24, t!("Aufgabenansicht anzeigen", "Show Task view"), crate::display::task_view_button()),
+            Item::Check(28, t!("Eingabesprache anzeigen", "Show input language"), s.input_lang),
             Item::Check(15, t!("Claude/Codex-Usage anzeigen", "Show Claude/Codex usage"), s.show_usage),
             Item::Check(5, t!("Tray-Icons in Akzentfarbe", "Tray icons in accent color"), s.mono_tray),
             Item::Check(18, t!("Präsentationsmodus", "Presentation mode"), s.presentation),
@@ -1241,6 +1277,11 @@ unsafe fn bar_menu(hwnd: HWND) {
                 s.usage_codex = true;
             }
         }),
+        28 => {
+            crate::settings::update(|s| s.input_lang = !s.input_lang);
+            // Die Anzeige sitzt nur auf der Hauptleiste, das Menü kann von einer Zweitleiste kommen.
+            update_kbd(self::hwnd(), true);
+        }
         5 => crate::settings::update(|s| s.mono_tray = !s.mono_tray),
         18 => crate::settings::update(|s| s.presentation = !s.presentation),
         25 => set_language(LangSetting::Auto),
@@ -1290,6 +1331,7 @@ unsafe fn tip_text(hit: Hit) -> String {
         Hit::More => t!("Weitere Apps", "More apps").into(),
         Hit::Search => t!("Suchen", "Search").into(),
         Hit::TaskView => t!("Aufgabenansicht", "Task view").into(),
+        Hit::Kbd => with(|s| s.kbd.as_ref().map(crate::kbd::tooltip)).flatten().unwrap_or_default(),
         Hit::Status => {
             let Some(s) = with(|s| s.status.clone()).flatten() else { return String::new() };
             let net = match &s.net {
@@ -1353,6 +1395,7 @@ unsafe fn rect_of(hwnd: HWND, hit: Hit) -> Option<RECT> {
         Hit::More => l.more,
         Hit::Search => Some(l.search),
         Hit::TaskView => Some(l.taskview),
+        Hit::Kbd => Some(l.kbd),
         Hit::Status => Some(l.status),
         Hit::Clock => Some(l.clock),
         Hit::Desktop => Some(l.desktop),
@@ -1486,6 +1529,30 @@ unsafe fn update_status(hwnd: HWND) {
     }
 }
 
+/// Eingabesprache neu bestimmen; nur bei Änderung neu zeichnen. Kommt sie dazu
+/// oder fällt sie weg (zweites Layout installiert/entfernt, Einstellung), ändert
+/// sich das Layout der Leiste – dann alles neu zeichnen.
+unsafe fn update_kbd(hwnd: HWND, relayout: bool) {
+    let next = if crate::settings::get().input_lang { crate::kbd::poll() } else { None };
+    let Some((changed, shown_changed)) = with(|s| {
+        let changed = s.kbd != next;
+        let shown_changed = s.kbd.is_some() != next.is_some();
+        if changed {
+            s.kbd = next;
+        }
+        (changed, shown_changed)
+    }) else {
+        return;
+    };
+    if relayout || shown_changed {
+        InvalidateRect(hwnd, null(), 0);
+    } else if changed {
+        if let Some((l, _)) = current_layout(hwnd) {
+            InvalidateRect(hwnd, &l.kbd, 0);
+        }
+    }
+}
+
 /// WinEvents (außerhalb unseres Prozesses, nur Fenster-Objekte) an die Leiste weiterreichen.
 unsafe extern "system" fn win_event(_: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK, event: u32, h: HWND, object: i32, child: i32, _: u32, _: u32) {
     if h.is_null() || object != OBJID_WINDOW || child != 0 {
@@ -1592,6 +1659,16 @@ unsafe fn status_menu(hwnd: HWND) {
         _ => return,
     };
     shell_open(uri, "", SW_SHOWNORMAL);
+}
+
+/// Klick auf die Eingabesprache: Layout wählen oder Spracheinstellungen öffnen.
+unsafe fn kbd_menu(hwnd: HWND) {
+    let Some(k) = with(|s| s.kbd.clone()).flatten() else { return };
+    if crate::kbd::menu(hwnd, &k) {
+        // Das Zielfenster stellt asynchron um: gleich und kurz danach nachsehen.
+        update_kbd(self::hwnd(), false);
+        SetTimer(self::hwnd(), TIMER_KBD, 100, None);
+    }
 }
 
 unsafe fn clock_menu(hwnd: HWND) {
@@ -1723,6 +1800,12 @@ pub fn ui_elements() -> Vec<UiElement> {
             let name = if name.is_empty() { t!("Infobereich-Symbol", "Notification area icon").to_string() } else { name };
             push(Hit::Tray(index), format!("tray:{index}"), name, t!("Infobereich", "Notification area"), l.tray[n]);
         }
+        if l.kbd.right > l.kbd.left {
+            if let Some(k) = with(|s| s.kbd.clone()).flatten() {
+                let name = k.active().map(crate::kbd::full_name).unwrap_or_default();
+                push(Hit::Kbd, "inputlanguage".into(), tf!("Eingabesprache: {name}", "Input language: {name}"), t!("Eingabesprache wechseln (Windows-Taste + Leertaste)", "Switch input language (Windows key + Space)"), l.kbd);
+            }
+        }
         push(Hit::Status, "status".into(), tip_text(Hit::Status).replace('\n', ", "), t!("Schnelleinstellungen öffnen", "Open Quick Settings"), l.status);
         push(Hit::Clock, "clock".into(), tip_text(Hit::Clock), t!("Kalender öffnen", "Open calendar"), l.clock);
         if crate::display::desktop_corner() {
@@ -1834,6 +1917,7 @@ fn hit_id(hit: Hit, groups: &[Group]) -> Option<String> {
         Hit::More => "more".into(),
         Hit::Search => "search".into(),
         Hit::TaskView => "taskview".into(),
+        Hit::Kbd => "kbd".into(),
         Hit::Status => "status".into(),
         Hit::Clock => "clock".into(),
         Hit::Usage => "usage".into(),
@@ -2312,6 +2396,15 @@ unsafe fn bar_fonts(hwnd: HWND) -> (u32, HFONT, HFONT) {
     }
     let (font, icons) = FONTS.with(|f| *f.borrow_mut().entry(dpi).or_insert_with(|| (make_font(dpi, 12, FW_NORMAL), icon_font(dpi, 16))));
     (dpi, font, icons)
+}
+
+thread_local! {
+    /// Kleine Schrift je DPI (zweite Zeile der Eingabesprache), einmal erzeugt.
+    static SMALL_FONTS: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
+}
+
+unsafe fn small_font(dpi: u32) -> HFONT {
+    SMALL_FONTS.with(|f| *f.borrow_mut().entry(dpi).or_insert_with(|| make_font(dpi, 10, FW_NORMAL) as usize)) as HFONT
 }
 
 fn secondaries() -> Vec<HWND> {
@@ -3241,6 +3334,7 @@ unsafe fn paint(hwnd: HWND) {
         return;
     };
     let focus = if hwnd == self::hwnd() { focus_rect(hwnd) } else { None };
+    let kbd = with(|s| s.kbd.clone()).flatten();
     let settings = crate::settings::get();
     let mono_on = settings.mono_tray;
     paint_buffered(hwnd, |dc, w, h| {
@@ -3390,6 +3484,22 @@ unsafe fn paint(hwnd: HWND) {
             let k = if tray::overflow_visible() { 1.0 } else { hv("chevron") };
             hover_bg(dc, &r, k);
             text(dc, "\u{E70E}", &r, icons, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        // Eingabesprache: "DEU", bei gleicher Sprache mehrfach mit zweiter Zeile ("CH").
+        if l.kbd.right > l.kbd.left {
+            if let Some(e) = kbd.as_ref().and_then(|k| k.active()) {
+                hover_bg(dc, &l.kbd, hv("kbd"));
+                let flags = DT_CENTER | DT_SINGLELINE;
+                match &e.sub {
+                    None => text(dc, &e.abbr, &l.kbd, font, TEXT, flags | DT_VCENTER),
+                    Some(sub) => {
+                        let mid = (l.kbd.top + l.kbd.bottom) / 2;
+                        text(dc, &e.abbr, &RECT { bottom: mid, ..l.kbd }, font, TEXT, flags | DT_BOTTOM);
+                        text(dc, sub, &RECT { top: mid, ..l.kbd }, small_font(dpi), TEXT, flags | DT_TOP);
+                    }
+                }
+            }
         }
 
         // Status: Netz, Lautstärke, Akku
@@ -3595,6 +3705,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             schedule_clock(hwnd);
             0
         }
+        WM_TIMER if wp == TIMER_KBD => {
+            // Win+Leertaste/Alt+Umschalt meldet niemand: kurz nachsehen (billig,
+            // gezeichnet wird nur bei Änderung). Setzt auch den Takt nach dem
+            // schnellen Nachsehen aus dem Menü zurück.
+            update_kbd(hwnd, false);
+            SetTimer(hwnd, TIMER_KBD, KBD_POLL_MS, None);
+            0
+        }
         WM_TIMER if wp == TIMER_CPU => {
             // CPU-Balken: messen ist billig, neu zeichnen nur bei sichtbarer Änderung.
             let before = with(|s| s.cpu).unwrap_or(0.0);
@@ -3720,6 +3838,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             prof(1);
             match wp as u32 {
                 EVENT_SYSTEM_FOREGROUND => {
+                    update_kbd(hwnd, false);
                     update_fullscreen(hwnd);
                     ensure_work_area(hwnd);
                     tick_secondaries();
@@ -3841,6 +3960,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Hit::Start => crate::start::toggle(false),
                 Hit::Clock => crate::calendar::toggle(),
                 Hit::Status => crate::quick::toggle(),
+                Hit::Kbd => kbd_menu(hwnd),
                 Hit::Usage => {
                     let h = hwnd as isize;
                     crate::usage::refresh_now(move || {
@@ -3925,6 +4045,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Hit::Chevron => bar_menu(hwnd),
                 Hit::More => more_menu(hwnd),
                 Hit::Status => status_menu(hwnd),
+                Hit::Kbd => kbd_menu(hwnd),
                 Hit::Clock => clock_menu(hwnd),
                 Hit::Usage => usage_menu(hwnd),
                 Hit::Desktop | Hit::TaskMgr | Hit::Search | Hit::TaskView | Hit::None => bar_menu(hwnd),
@@ -4046,6 +4167,7 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
             drag: None,
             kb_focus: None,
             status: Some(status::poll()),
+            kbd: if crate::settings::get().input_lang { crate::kbd::poll() } else { None },
             hover: Hit::None,
             hover_hwnd: null_mut(),
             tracking: null_mut(),
@@ -4070,6 +4192,7 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
     schedule_clock(hwnd);
     SetTimer(hwnd, TIMER_CPU, 2000, None);
     SetTimer(hwnd, TIMER_SLOW, 30_000, None);
+    SetTimer(hwnd, TIMER_KBD, KBD_POLL_MS, None);
     status::watch(hwnd);
     install_win_events();
     refresh(hwnd, None);
@@ -4114,10 +4237,10 @@ mod tests {
                     for n_tray in [0, 4, 12] {
                         let small = (n_tasks + n_tray + dpi as usize) % 2 == 1;
                         for (primary, usage, align_left, hidden_tray) in [(true, true, false, true), (true, false, true, false), (true, true, true, false), (false, false, false, false), (false, false, true, false)] {
-                            let i = LayoutInput { width, vertical: false, length: px(dpi, BAR_H), dpi, n_tasks, n_tray, hidden_tray, battery: true, primary, usage, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0 };
+                            let i = LayoutInput { width, vertical: false, length: px(dpi, BAR_H), dpi, n_tasks, n_tray, hidden_tray, battery: true, kbd: (n_tasks + n_tray) % 3 != 0, primary, usage, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0 };
                             let l = layout(&i);
                             let ctx = format!("w={width} dpi={dpi} tasks={n_tasks} tray={n_tray} primary={primary} usage={usage} left={align_left}");
-                            let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr)];
+                            let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("kbd", l.kbd), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr)];
                             if l.show_usage {
                                 all.push(("usage", l.usage));
                             }
@@ -4142,7 +4265,7 @@ mod tests {
                                 assert!(r.right - r.left >= px(dpi, BTN_MIN_W), "Button zu schmal: {ctx}");
                             }
                             if !primary {
-                                assert!(l.tray.is_empty() && !l.show_usage && !non_empty(&l.taskmgr), "Zweitleiste mit Hauptleisten-Elementen: {ctx}");
+                                assert!(l.tray.is_empty() && !l.show_usage && !non_empty(&l.taskmgr) && !non_empty(&l.kbd), "Zweitleiste mit Hauptleisten-Elementen: {ctx}");
                             }
                             if l.tasks.len() < n_tasks {
                                 dropped.push(ctx);
@@ -4159,6 +4282,32 @@ mod tests {
             println!("  {c}");
         }
     }
+
+    /// Eingabesprache sitzt wie bei Windows zwischen Infobereich und Status
+    /// (senkrecht: über dem Status), auf Zweitleisten nie.
+    #[test]
+    fn input_language_next_to_status() {
+        for small in [false, true] {
+            for dpi in [96, 144] {
+                let l = layout(&kbd_input(dpi, small));
+                assert_eq!(l.kbd.right - l.kbd.left, px(dpi, KBD_W));
+                assert!(l.kbd.right <= l.status.left && l.tray.last().unwrap().right <= l.kbd.left);
+                assert_eq!((l.kbd.top, l.kbd.bottom), (l.status.top, l.status.bottom));
+                let off = layout(&LayoutInput { kbd: false, ..kbd_input(dpi, small) });
+                assert!(!non_empty(&off.kbd));
+                assert!(off.tray.last().unwrap().right > l.tray.last().unwrap().right, "ohne Eingabesprache rückt der Infobereich nach");
+                let sec = layout(&LayoutInput { primary: false, ..kbd_input(dpi, small) });
+                assert!(!non_empty(&sec.kbd));
+                let v = layout(&LayoutInput { width: px(dpi, BAR_W_V), vertical: true, length: 1080, ..kbd_input(dpi, small) });
+                assert!(v.kbd.bottom <= v.status.top && v.kbd.bottom > v.kbd.top);
+                assert!(v.tray.iter().all(|r| r.bottom <= v.kbd.top));
+            }
+        }
+    }
+
+    fn kbd_input(dpi: u32, small: bool) -> LayoutInput {
+        LayoutInput { width: 1920, vertical: false, length: px(dpi, BAR_H), dpi, n_tasks: 6, n_tray: 4, hidden_tray: true, battery: true, kbd: true, primary: true, usage: false, align_left: false, small, search: 1, task_view: true }
+    }
 }
 
 #[cfg(test)]
@@ -4170,7 +4319,7 @@ mod vertical_tests {
     #[test]
     fn drag_reorders_along_bar() {
         let dpi = 96;
-        let i = LayoutInput { width: px(dpi, BAR_W_V), vertical: true, length: 1080, dpi, n_tasks: 4, n_tray: 0, hidden_tray: false, battery: true, primary: false, usage: false, align_left: true, small: false, search: 0, task_view: false };
+        let i = LayoutInput { width: px(dpi, BAR_W_V), vertical: true, length: 1080, dpi, n_tasks: 4, n_tray: 0, hidden_tray: false, battery: true, kbd: false, primary: false, usage: false, align_left: true, small: false, search: 0, task_view: false };
         let l = layout(&i);
         assert_eq!(l.tasks.len(), 4);
         let t = &l.tasks;
@@ -4230,10 +4379,10 @@ mod vertical_tests {
                     for n_tray in [0, 3, 10] {
                         let small = (n_tasks + n_tray + dpi as usize) % 2 == 1;
                         for (primary, align_left, hidden_tray) in [(true, false, true), (true, true, false), (false, false, false)] {
-                            let i = LayoutInput { width, vertical: true, length, dpi, n_tasks, n_tray, hidden_tray, battery: true, primary, usage: true, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0 };
+                            let i = LayoutInput { width, vertical: true, length, dpi, n_tasks, n_tray, hidden_tray, battery: true, kbd: (n_tasks + n_tray) % 3 != 0, primary, usage: true, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0 };
                             let l = layout(&i);
                             let ctx = format!("len={length} dpi={dpi} tasks={n_tasks} tray={n_tray} primary={primary} top={align_left}");
-                            let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr), ("desktop", l.desktop)];
+                            let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("kbd", l.kbd), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr), ("desktop", l.desktop)];
                             all.extend(l.tasks.iter().map(|r| ("task", *r)));
                             all.extend(l.tray.iter().map(|r| ("tray", *r)));
                             all.extend(l.chevron.iter().map(|r| ("chevron", *r)));

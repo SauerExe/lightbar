@@ -149,6 +149,7 @@ mod tests {
         ("chat.rs", include_str!("chat.rs")),
         ("display.rs", include_str!("display.rs")),
         ("jumplist.rs", include_str!("jumplist.rs")),
+        ("kbd.rs", include_str!("kbd.rs")),
         ("main.rs", include_str!("main.rs")),
         ("menus.rs", include_str!("menus.rs")),
         ("preview.rs", include_str!("preview.rs")),
