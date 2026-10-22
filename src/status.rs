@@ -52,6 +52,17 @@ struct Handles {
     device_watch: Option<IMMNotificationClient>,
 }
 
+/// Der WLAN-Handle gehört dem Thread; endet er (z. B. ein KI-Thread, der den
+/// Status abfragt), wird er geschlossen statt zu lecken.
+impl Drop for Handles {
+    fn drop(&mut self) {
+        if !self.wlan.is_null() {
+            unsafe { WlanCloseHandle(self.wlan, null_mut()) };
+            self.wlan = null_mut();
+        }
+    }
+}
+
 thread_local! {
     static HANDLES: RefCell<Handles> = const { RefCell::new(Handles { wlan: null_mut(), audio: None, endpoint: None, wifi: None, volume_watch: None, device_watch: None }) };
 }
@@ -66,6 +77,13 @@ unsafe fn wifi(h: &mut Handles) -> Option<(u32, String)> {
     }
     let mut list: *mut WLAN_INTERFACE_INFO_LIST = null_mut();
     if WlanEnumInterfaces(h.wlan, null_mut(), &mut list) != 0 || list.is_null() {
+        // Handle womöglich ungültig (z. B. WLAN-Dienst neu gestartet): schließen
+        // und beim nächsten Mal neu öffnen.
+        if !list.is_null() {
+            WlanFreeMemory(list as _);
+        }
+        WlanCloseHandle(h.wlan, null_mut());
+        h.wlan = null_mut();
         return None;
     }
     let count = (*list).dwNumberOfItems as usize;

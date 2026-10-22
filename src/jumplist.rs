@@ -177,21 +177,55 @@ unsafe fn parse(bytes: &[u8]) -> Vec<Category> {
 
 /// `n` serialisierte Objekte ab der aktuellen Position. Trennlinien werden zu
 /// Einträgen ohne Titel.
+/// Alle `n` Objekte werden gelesen (sonst stünde der Leser mitten in der
+/// Kategorie und die folgenden gingen verloren), behalten nur die ersten 100.
+/// Geladen werden nur Verknüpfungen und Shell-Elemente: Ein unbekanntes Objekt
+/// hat keine bekannte Länge – dann endet das Lesen (`None`).
 unsafe fn read_entries(stream: &IStream, r: &mut Reader, n: u32) -> Option<Vec<Entry>> {
+    const KEEP: usize = 100;
     let mut entries = Vec::new();
-    for _ in 0..n.min(100) {
+    // Jedes Objekt belegt mindestens seine Klassen-ID (16 Byte).
+    let n = (n as usize).min(r.b.len().saturating_sub(r.pos) / 16);
+    for _ in 0..n {
+        if !allowed_class(r.b.get(r.pos..r.pos + 16)?) {
+            return None;
+        }
         stream.Seek(r.pos as i64, STREAM_SEEK_SET, None).ok()?;
         let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
         OleLoadFromStream(stream, &windows::core::IUnknown::IID, &mut raw).ok()?;
         let object = windows::core::IUnknown::from_raw(raw);
         let mut pos = 0u64;
         stream.Seek(0, STREAM_SEEK_CUR, Some(&mut pos)).ok()?;
+        if pos as usize <= r.pos {
+            return None; // kein Fortschritt: kaputt
+        }
         r.pos = pos as usize;
-        if let Some(e) = entry_of(&object) {
-            entries.push(e);
+        if entries.len() < KEEP {
+            if let Some(e) = entry_of(&object) {
+                entries.push(e);
+            }
         }
     }
     Some(entries)
+}
+
+/// CLSID_ShellLink {00021401-0000-0000-C000-000000000046}.
+const CLSID_SHELL_LINK: u128 = 0x00021401_0000_0000_c000_000000000046;
+/// CLSID_ShellItem {9AC9FBE1-E0A2-4AD6-B4EE-E212013EA917} (IShellItem, z. B.
+/// angeheftete Dateien in eigenen Kategorien).
+const CLSID_SHELL_ITEM: u128 = 0x9ac9fbe1_e0a2_4ad6_b4ee_e212013ea917;
+
+/// Darf ein Objekt mit dieser serialisierten Klassen-ID (16 Byte wie von
+/// `WriteClassStm`, d. h. GUID-Speicherlayout) geladen werden?
+fn allowed_class(raw: &[u8]) -> bool {
+    let Ok(raw): Result<[u8; 16], _> = raw.try_into() else { return false };
+    let g = windows::core::GUID {
+        data1: u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+        data2: u16::from_le_bytes([raw[4], raw[5]]),
+        data3: u16::from_le_bytes([raw[6], raw[7]]),
+        data4: [raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]],
+    };
+    [CLSID_SHELL_LINK, CLSID_SHELL_ITEM].contains(&g.to_u128())
 }
 
 /// Text aus einem Eigenschaftsspeicher.
@@ -589,6 +623,68 @@ mod tests {
         let cats = vec![Category { name: "X".into(), entries: vec![e("a")], known: None }, Category { name: String::new(), entries: vec![e("t")], known: None }];
         let s = arrange(Some(cats), vec![d("p")], vec![d("r")], vec![], 10, true);
         assert_eq!(names(&s), ["Tasks1"]);
+    }
+
+    #[test]
+    fn only_known_classes_load() {
+        let link = [0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46];
+        assert!(allowed_class(&link));
+        let item = [0xE1, 0xFB, 0xC9, 0x9A, 0xA2, 0xE0, 0xD6, 0x4A, 0xB4, 0xEE, 0xE2, 0x12, 0x01, 0x3E, 0xA9, 0x17];
+        assert!(allowed_class(&item));
+        assert!(!allowed_class(&[0u8; 16]));
+        assert!(!allowed_class(&link[..15]));
+    }
+
+    /// Serialisierte Verknüpfung wie in der Datei: Klassen-ID + IPersistStream-Daten.
+    unsafe fn link_bytes(target: &str) -> Vec<u8> {
+        use windows::Win32::System::Com::{CoCreateInstance, IPersistStream, CLSCTX_INPROC_SERVER, STREAM_SEEK_END};
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+        link.SetPath(&HSTRING::from(target)).unwrap();
+        let stream = SHCreateMemStream(None).unwrap();
+        link.cast::<IPersistStream>().unwrap().Save(&stream, true).unwrap();
+        let mut size = 0u64;
+        stream.Seek(0, STREAM_SEEK_END, Some(&mut size)).unwrap();
+        stream.Seek(0, STREAM_SEEK_SET, None).unwrap();
+        let mut data = vec![0u8; size as usize];
+        let _ = stream.Read(data.as_mut_ptr() as _, size as u32, None);
+        let mut out = vec![0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46];
+        out.extend(data);
+        out
+    }
+
+    #[test]
+    fn categories_after_long_task_list_survive() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+            let one = link_bytes(r"C:\Windows\notepad.exe");
+            let mut file = Vec::new();
+            file.extend(2u32.to_le_bytes()); // Version
+            file.extend(2u32.to_le_bytes()); // Kategorien
+            file.extend(0u32.to_le_bytes());
+            // Aufgaben mit 105 Einträgen …
+            file.extend(2u32.to_le_bytes());
+            file.extend(105u32.to_le_bytes());
+            (0..105).for_each(|_| file.extend(&one));
+            file.extend(FOOTER.to_le_bytes());
+            // … danach eine eigene Kategorie mit einem Eintrag.
+            file.extend(0u32.to_le_bytes());
+            let name: Vec<u16> = "Zuletzt".encode_utf16().collect();
+            file.extend((name.len() as u16).to_le_bytes());
+            name.iter().for_each(|u| file.extend(u.to_le_bytes()));
+            file.extend(1u32.to_le_bytes());
+            file.extend(&one);
+            file.extend(FOOTER.to_le_bytes());
+            let cats = parse(&file);
+            assert_eq!(cats.len(), 2);
+            assert_eq!(cats[0].entries.len(), 100);
+            assert_eq!(cats[1].name, "Zuletzt");
+            assert_eq!(cats[1].entries.len(), 1);
+
+            // Unbekannte Klasse: Lesen endet, nichts Falsches.
+            let mut bad = file.clone();
+            bad[20..36].fill(0xAB);
+            assert!(parse(&bad).is_empty());
+        }
     }
 
     #[test]
