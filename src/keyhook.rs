@@ -30,6 +30,9 @@ const VK_KEY_T: u16 = b'T' as u16;
 
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 static COMBO: AtomicBool = AtomicBool::new(false);
+/// Eine Kombi-Taste wurde von uns geschluckt – Windows hat dann nur Win
+/// gesehen und würde beim Loslassen sein Startmenü öffnen.
+static SWALLOWED: AtomicBool = AtomicBool::new(false);
 
 /// Tatsächlicher Zustand vor dem aktuellen Ereignis (im LL-Hook verlässlich).
 unsafe fn win_physically_down() -> bool {
@@ -55,10 +58,16 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                     // Festhalten zählt nicht als neuer Druck.
                     if !WIN_DOWN.swap(true, Ordering::Relaxed) || !win_physically_down() {
                         COMBO.store(false, Ordering::Relaxed);
+                        SWALLOWED.store(false, Ordering::Relaxed);
                     }
                 } else {
                     WIN_DOWN.store(false, Ordering::Relaxed);
-                    send_keys(&[(VK_MASK, false), (VK_MASK, true)]);
+                    // Nur maskieren, wenn Windows sonst sein Startmenü öffnen
+                    // würde. Bei durchgelassenen Kombis (Win+V, Win+.) würde der
+                    // zusätzliche Tastendruck deren Fenster gleich wieder schließen.
+                    if !COMBO.load(Ordering::Relaxed) || SWALLOWED.load(Ordering::Relaxed) {
+                        send_keys(&[(VK_MASK, false), (VK_MASK, true)]);
+                    }
                     if !COMBO.load(Ordering::Relaxed) {
                         PostMessageW(start::hwnd(), start::WM_TOGGLE, 0, 0);
                     }
@@ -85,6 +94,7 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 if down {
                     PostMessageW(target, msg, wp, 0);
                 }
+                SWALLOWED.store(true, Ordering::Relaxed);
                 return 1;
             }
         }
