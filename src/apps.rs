@@ -31,9 +31,48 @@ pub fn enumerate() -> Vec<App> {
 }
 
 unsafe fn enumerate_inner() -> windows::core::Result<Vec<App>> {
+    let mut apps = Vec::new();
+    walk(|item, name, id| apps.push(App { lower: name.to_lowercase(), name, id, item }))?;
+    apps.sort_by(|a, b| a.lower.cmp(&b.lower));
+    apps.dedup_by(|a, b| a.id == b.id);
+    Ok(apps)
+}
+
+/// Nur Namen und Kennungen des Katalogs, ohne Shell-Elemente – lässt sich
+/// aus einem Hintergrund-Thread (mit eigenem COM-Apartment) aufrufen und
+/// über Threads reichen. Für die Prüfung, ob sich der Katalog geändert hat.
+pub fn enumerate_ids() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let _ = unsafe { walk(|_, name, id| out.push((name, id))) };
+    out
+}
+
+/// Suchbarer Kern einer App-Kennung, klein geschrieben: bei Store-Apps der
+/// Paketname ohne Herausgeber ("Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"
+/// → "windowsnotepad"), bei Pfaden der Dateiname ohne ".exe"
+/// ("{GUID}\cmd.exe" → "cmd"), sonst die ganze Kennung.
+pub fn id_key(id: &str) -> String {
+    let id = id.to_lowercase();
+    if let Some((pkg, _)) = id.split_once('!') {
+        let pkg = pkg.split('_').next().unwrap_or(pkg);
+        return pkg.rsplit('.').next().unwrap_or(pkg).to_string();
+    }
+    exe_stem(&id)
+}
+
+/// Dateiname ohne Verzeichnis und ohne ".exe", klein geschrieben.
+pub fn exe_stem(path: &str) -> String {
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase();
+    match file.strip_suffix(".exe") {
+        Some(stem) => stem.to_string(),
+        None => file,
+    }
+}
+
+/// Alle Einträge von `shell:AppsFolder` als (Element, Anzeigename, Kennung).
+unsafe fn walk(mut f: impl FnMut(IShellItem, String, String)) -> windows::core::Result<()> {
     let folder: IShellItem = SHCreateItemFromParsingName(w!("shell:AppsFolder"), None::<&IBindCtx>)?;
     let items: IEnumShellItems = folder.BindToHandler(None::<&IBindCtx>, &BHID_EnumItems)?;
-    let mut apps = Vec::new();
     loop {
         let mut batch: [Option<IShellItem>; 1] = [None];
         let mut fetched = 0u32;
@@ -47,11 +86,9 @@ unsafe fn enumerate_inner() -> windows::core::Result<Vec<App>> {
         else {
             continue;
         };
-        apps.push(App { lower: name.to_lowercase(), name, id, item });
+        f(item, name, id);
     }
-    apps.sort_by(|a, b| a.lower.cmp(&b.lower));
-    apps.dedup_by(|a, b| a.id == b.id);
-    Ok(apps)
+    Ok(())
 }
 
 unsafe fn display(item: &IShellItem, kind: SIGDN) -> Option<String> {
@@ -346,5 +383,20 @@ pub fn folder_items(parsing: &str, max: usize) -> Vec<(String, String)> {
             Ok(out)
         };
         run().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_keys() {
+        assert_eq!(id_key("Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"), "windowsnotepad");
+        assert_eq!(id_key("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"), "windowscalculator");
+        assert_eq!(id_key(r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\cmd.exe"), "cmd");
+        assert_eq!(id_key(r"C:\Program Files\App\Tool.EXE"), "tool");
+        assert_eq!(id_key("MSEdge"), "msedge");
+        assert_eq!(exe_stem("C:/x/Code.exe"), "code");
     }
 }
