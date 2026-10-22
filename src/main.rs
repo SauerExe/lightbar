@@ -10,6 +10,7 @@ mod anim;
 mod apps;
 mod bar;
 mod calendar;
+mod chat;
 mod display;
 mod glow;
 mod jumplist;
