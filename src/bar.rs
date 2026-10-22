@@ -833,7 +833,33 @@ unsafe fn group_icon(key: &str, exe: Option<&str>, sample: Option<HWND>, size: i
 /// (in Anheft-Reihenfolge), danach die übrigen in stabiler Reihenfolge.
 /// Icons werden nur für neue Gruppen, nach DPI-Wechsel oder für `refetch`
 /// (Fenster hat sein Icon geändert) neu erzeugt.
+///
+/// Nicht wiedereintrittsfähig: Icon-Abfragen (SendMessageTimeout WM_GETICON,
+/// COM) pumpen Nachrichten, ein DPI- oder Bildschirmwechsel dazwischen würde
+/// ein zweites `refresh` starten – Icons würden doppelt zerstört, nach dem
+/// Zerstören benutzt oder gingen verloren. Läuft schon eines, wird das neue
+/// per TIMER_REFRESH nachgeholt.
 unsafe fn refresh(hwnd: HWND, refetch: Option<HWND>) {
+    thread_local! {
+        static IN_REFRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            IN_REFRESH.with(|f| f.set(false));
+        }
+    }
+    if IN_REFRESH.with(|f| f.replace(true)) {
+        // `refetch` geht dabei verloren; nach einem DPI-Wechsel werden ohnehin
+        // alle Icons neu geholt, sonst holt der nächste Icon-Wechsel es nach.
+        SetTimer(self::hwnd(), TIMER_REFRESH, 150, None);
+        return;
+    }
+    let _guard = Guard;
+    refresh_inner(hwnd, refetch);
+}
+
+unsafe fn refresh_inner(hwnd: HWND, refetch: Option<HWND>) {
     prof(2);
     let mut found: Vec<HWND> = Vec::new();
     EnumWindows(Some(enum_cb), &mut found as *mut _ as LPARAM);
@@ -1730,7 +1756,9 @@ unsafe fn set_pos(hwnd: HWND) {
         set_pos_secondary(hwnd);
         return;
     }
-    let dpi = GetDpiForWindow(hwnd);
+    // DPI des eigenen Monitors, nicht des Fensters: ausgeblendet liegt die
+    // Leiste evtl. auf dem Nachbarmonitor.
+    let dpi = monitor_dpi(hwnd);
     let (font, icons) = (make_font(dpi, 12, FW_NORMAL), icon_font(dpi, 16));
     with(|s| {
         s.dpi = dpi;
@@ -2391,7 +2419,9 @@ unsafe fn bar_dpi(hwnd: HWND) -> u32 {
     if hwnd == self::hwnd() {
         with(|s| s.dpi).unwrap_or(96)
     } else {
-        GetDpiForWindow(hwnd).max(96)
+        // Monitor-DPI statt Fenster-DPI: ausgeblendet liegt die Leiste ggf.
+        // auf dem Nachbarmonitor.
+        monitor_dpi(hwnd)
     }
 }
 
@@ -2448,10 +2478,37 @@ pub fn anchor() -> HWND {
     }
 }
 
+/// Monitor, zu dem eine Leiste gehört. Ausgeblendet liegt sie größtenteils
+/// neben ihrem Bildschirm – oft auf dem Nachbarmonitor –, MonitorFromWindow
+/// läge dann daneben. Maßgeblich ist deshalb ihre angedockte Lage.
+unsafe fn bar_monitor(hwnd: HWND) -> HMONITOR {
+    match SLIDES.with(|s| s.borrow().get(&(hwnd as isize)).map(|sl| sl.full)) {
+        Some(full) => MonitorFromRect(&full, MONITOR_DEFAULTTONEAREST),
+        None => MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+    }
+}
+
+/// Skalierung des Monitors, zu dem eine Leiste gehört (siehe `bar_monitor`).
+unsafe fn monitor_dpi(hwnd: HWND) -> u32 {
+    let (mut x, mut y) = (0u32, 0u32);
+    if GetDpiForMonitor(bar_monitor(hwnd), MDT_EFFECTIVE_DPI, &mut x, &mut y) == 0 && x > 0 {
+        x.max(96)
+    } else {
+        GetDpiForWindow(hwnd).max(96)
+    }
+}
+
+/// Wird die Leiste gerade (ganz oder teilweise) ausgeblendet oder gleitet sie?
+/// Dann liegt sie womöglich auf dem Nachbarmonitor, und dessen WM_DPICHANGED
+/// gehört nicht zu ihr.
+fn slid_or_sliding(hwnd: HWND) -> bool {
+    SLIDES.with(|s| s.borrow().get(&(hwnd as isize)).is_some_and(|sl| sl.moving || sl.shown < 1.0))
+}
+
 unsafe fn monitor_rect(h: HWND, work: bool) -> RECT {
     let mut mi: MONITORINFO = zeroed();
     mi.cbSize = size_of::<MONITORINFO>() as u32;
-    GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi);
+    GetMonitorInfoW(bar_monitor(h), &mut mi);
     if work {
         mi.rcWork
     } else {
@@ -2496,6 +2553,8 @@ unsafe fn dock(hwnd: HWND, dpi: u32) {
     use crate::display::Edge;
     let edge = crate::display::edge();
     let t = thickness(dpi);
+    // Monitor bestimmen, solange der Gleit-Zustand noch da ist (unten wird er
+    // ggf. entfernt): Eine ausgeblendete Leiste liegt neben ihrem Bildschirm.
     let m = monitor_rect(hwnd, false);
     if autohide_on() {
         // Automatisch ausblenden: kein Platz reservieren (kein ABM_SETPOS), die
@@ -2604,6 +2663,10 @@ fn autohide_wanted() -> bool {
     if seen != 0 && seen != now && crate::shell::active() && !crate::shell::forced_recently() {
         crate::util::log(&format!("Taskleiste automatisch ausblenden in Windows umgestellt: {}", if reg { "an" } else { "aus" }));
         crate::shell::remember_autohide(reg);
+        // Explorer hat die Einstellung damit auch für seine versteckte Leiste
+        // übernommen; bei "aus" reservierte sie wieder Platz. Zurück auf
+        // Ausblenden (wie bei der Übernahme) – das zählt nicht als Nutzerwahl.
+        unsafe { crate::shell::force_autohide() };
     }
     crate::shell::remembered_autohide().unwrap_or(reg)
 }
@@ -2805,6 +2868,13 @@ unsafe fn autohide_tick(hwnd: HWND) {
     }
     apply_slide(hwnd);
     if was_full != fully_shown(hwnd) {
+        // Während des Gleitens wird WM_DPICHANGED ignoriert. Hat sich die
+        // Skalierung des eigenen Monitors inzwischen wirklich geändert, jetzt
+        // nachholen.
+        if !was_full && hwnd == self::hwnd() && with(|s| s.dpi) != Some(monitor_dpi(hwnd)) {
+            set_pos(hwnd);
+            refresh(hwnd, None);
+        }
         crate::glow::sync();
     }
     SetTimer(hwnd, TIMER_AUTOHIDE, if moving { FRAME_MS } else { POLL_MS }, None);
@@ -2944,7 +3014,7 @@ unsafe fn ensure_work_area(bar: HWND) {
         return;
     }
     let edge = crate::display::edge();
-    let mon = MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST) as isize;
+    let mon = bar_monitor(bar) as isize;
     // Leiste an eine andere Kante gezogen: unseren alten Platz zuerst freigeben.
     if set_by_us(mon).is_some_and(|(e, _)| e != edge) {
         release_work_area(bar);
@@ -2992,7 +3062,7 @@ unsafe fn set_work_area(mut work: RECT) {
 unsafe fn release_work_area(bar: HWND) {
     let mut work = monitor_rect(bar, true);
     let m = monitor_rect(bar, false);
-    let mon = MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST) as isize;
+    let mon = bar_monitor(bar) as isize;
     // Nur zurückgeben, was wir selbst gesetzt haben (die Leiste kann beim
     // Abstecken eines Monitors schon woanders hingeschoben worden sein).
     if let Some((edge, side)) = set_by_us(mon) {
@@ -3043,7 +3113,13 @@ pub unsafe fn sync_monitors() {
     let existing = secondaries();
     let mut keep = Vec::new();
     for h in existing {
-        let mon = MonitorFromWindow(h, MONITOR_DEFAULTTONULL);
+        // Ausgeblendete Leisten nach ihrer angedockten Lage zuordnen. NULL statt
+        // NEAREST: Ist ihr Monitor abgesteckt, soll die Leiste verschwinden.
+        let full = SLIDES.with(|s| s.borrow().get(&(h as isize)).map(|sl| sl.full));
+        let mon = match full {
+            Some(full) => MonitorFromRect(&full, MONITOR_DEFAULTTONULL),
+            None => MonitorFromWindow(h, MONITOR_DEFAULTTONULL),
+        };
         if let Some(i) = monitors.iter().position(|(m, _)| *m == mon) {
             monitors.remove(i);
             set_pos_secondary(h);
@@ -4080,6 +4156,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        // Gleitet die Leiste oder ist sie ausgeblendet, kommt WM_DPICHANGED vom
+        // Nachbarmonitor, auf dem sie gerade größtenteils liegt – ignorieren.
+        WM_DPICHANGED if slid_or_sliding(hwnd) => 0,
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
             set_pos(hwnd);
             if hwnd == self::hwnd() {
@@ -4500,6 +4579,8 @@ const _: () = assert!(size_of::<AppBarData32>() == 0x28 && size_of::<AppBarMsg>(
 /// als Heap-Zeiger. Explorer kann ihn nicht öffnen und verwirft SETPOS still;
 /// dann zieht er keine AppBar vom Arbeitsbereich ab. Also den Block für
 /// Explorer neu anlegen und das Ergebnis zurückkopieren (wie ManagedShell).
+/// GETTASKBARPOS beantworten wir selbst (Lage der Hauptleiste, nicht
+/// Explorers versteckte Leiste).
 unsafe fn forward_appbar(ex: HWND, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
     use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
     let cds = &*(lp as *const COPYDATASTRUCT);
@@ -4510,12 +4591,20 @@ unsafe fn forward_appbar(ex: HWND, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
     if !matches!(m.message, ABM_QUERYPOS | ABM_SETPOS | ABM_GETTASKBARPOS) || m.shared == 0 {
         return None;
     }
-    let mut ex_pid = 0u32;
-    GetWindowThreadProcessId(ex, &mut ex_pid);
     let old = SHLockShared(m.shared as HANDLE, m.pid) as *mut AppBarData32;
     if old.is_null() {
         return Some(0);
     }
+    // GETTASKBARPOS selbst beantworten: Explorer meldete seine versteckte
+    // Leiste, gefragt ist aber die sichtbare Taskleiste – unsere Hauptleiste.
+    let main = self::hwnd();
+    if m.message == ABM_GETTASKBARPOS && !main.is_null() {
+        fill_taskbar_pos(&mut *old, docked_rect(main), crate::display::edge().abe());
+        SHUnlockShared(old as *const c_void);
+        return Some(1);
+    }
+    let mut ex_pid = 0u32;
+    GetWindowThreadProcessId(ex, &mut ex_pid);
     let new = SHAllocShared(old as *const c_void, size_of::<AppBarData32>() as u32, ex_pid);
     if new.is_null() {
         SHUnlockShared(old as *const c_void);
@@ -4525,14 +4614,46 @@ unsafe fn forward_appbar(ex: HWND, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
     m.pid = ex_pid;
     let fwd = COPYDATASTRUCT { dwData: 0, cbData: size_of::<AppBarMsg>() as u32, lpData: &mut m as *mut _ as *mut c_void };
     let mut result = 0usize;
-    SendMessageTimeoutW(ex, WM_COPYDATA, wp, &fwd as *const _ as LPARAM, SMTO_ABORTIFHUNG, 3000, &mut result);
-    // QUERYPOS/SETPOS: Explorer passt das Rechteck ggf. an.
-    let back = SHLockShared(new, ex_pid) as *const AppBarData32;
-    if !back.is_null() {
-        *old = *back;
-        SHUnlockShared(back as *const c_void);
+    let sent = SendMessageTimeoutW(ex, WM_COPYDATA, wp, &fwd as *const _ as LPARAM, SMTO_ABORTIFHUNG, 3000, &mut result) != 0;
+    if sent {
+        // QUERYPOS/SETPOS: Explorer passt das Rechteck ggf. an.
+        let back = SHLockShared(new, ex_pid) as *const AppBarData32;
+        if !back.is_null() {
+            *old = *back;
+            SHUnlockShared(back as *const c_void);
+        }
     }
     SHUnlockShared(old as *const c_void);
-    SHFreeShared(new, ex_pid);
+    // Nur nach erfolgreicher Zustellung freigeben. Bei Zeitüberschreitung
+    // bearbeitet Explorer die Nachricht evtl. noch später und griffe dann auf
+    // einen freigegebenen (oder schon neu vergebenen) Block zu. Lieber diese
+    // paar Bytes in Explorers Prozess liegen lassen (kleines Leck).
+    if sent {
+        SHFreeShared(new, ex_pid);
+    }
     Some(result as LRESULT)
+}
+
+/// Antwort auf ABM_GETTASKBARPOS: Lage und Kante (ABE_*) der Taskleiste.
+fn fill_taskbar_pos(abd: &mut AppBarData32, rc: RECT, edge: u32) {
+    abd.rc = rc;
+    abd.edge = edge;
+}
+
+#[cfg(test)]
+mod appbar_tests {
+    use super::*;
+
+    #[test]
+    fn taskbar_pos_reports_our_bar() {
+        let mut abd: AppBarData32 = unsafe { zeroed() };
+        abd.cb_size = size_of::<AppBarData32>() as u32;
+        abd.hwnd = 0x1234;
+        let rc = RECT { left: 0, top: 1032, right: 1920, bottom: 1080 };
+        fill_taskbar_pos(&mut abd, rc, ABE_BOTTOM);
+        assert!(same_rect(&abd.rc, &rc));
+        assert_eq!(abd.edge, ABE_BOTTOM);
+        // Übrige Felder bleiben, wie der Aufrufer sie geschickt hat.
+        assert_eq!(abd.hwnd, 0x1234);
+    }
 }

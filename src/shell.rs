@@ -131,8 +131,7 @@ pub unsafe fn takeover() {
         }
     }
     if remembered {
-        FORCED_AT.store(windows_sys::Win32::System::SystemInformation::GetTickCount64(), Ordering::Relaxed);
-        appbar_state(Some(ABS_AUTOHIDE));
+        force_autohide();
     } else {
         crate::util::log("Originalzustand der Windows-Taskleiste nicht speicherbar – kein automatisches Ausblenden");
     }
@@ -192,6 +191,16 @@ pub fn remember_autohide(on: bool) {
     if state != old {
         let _ = std::fs::write(&f, state.to_string());
     }
+}
+
+/// Explorers (versteckte) Leiste auf "automatisch ausblenden" stellen, damit
+/// sie keinen Platz reserviert, und den Zeitpunkt merken: Die folgende
+/// Registry-Änderung stammt von uns, nicht vom Nutzer (`forced_recently`).
+/// Nach der Übernahme und nachdem der Nutzer die Einstellung umgestellt hat –
+/// sonst reservierte Explorers unsichtbare Leiste wieder Platz.
+pub unsafe fn force_autohide() {
+    FORCED_AT.store(windows_sys::Win32::System::SystemInformation::GetTickCount64(), Ordering::Relaxed);
+    appbar_state(Some(ABS_AUTOHIDE));
 }
 
 /// Originalzustand zurück und Explorers Leisten wieder zeigen.

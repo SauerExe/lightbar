@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
@@ -36,6 +36,7 @@ pub const PROGRESS_MAX: u32 = 0xFFFE;
 
 /// TBPFLAG-Werte.
 pub const TBPF_INDETERMINATE: u32 = 1;
+pub const TBPF_NORMAL: u32 = 2;
 pub const TBPF_ERROR: u32 = 4;
 pub const TBPF_PAUSED: u32 = 8;
 
@@ -64,6 +65,32 @@ thread_local! {
 }
 
 static BUTTON_CREATED: AtomicU32 = AtomicU32::new(0);
+/// Unser Taskband-Fenster (Besitzer des TIMER_SPIN).
+static BAND: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(null_mut());
+
+/// Status nach einem SetProgressValue: Apps, die nur den Wert melden (ohne
+/// SetProgressState), sollen trotzdem einen Balken zeigen – wie in Windows
+/// wird "kein Fortschritt" dann zu "normal".
+fn state_after_value(state: u32) -> u32 {
+    if state == 0 {
+        TBPF_NORMAL
+    } else {
+        state
+    }
+}
+
+/// Animations-Zeitgeber nur laufen lassen, solange ein Fortschritt unbestimmt ist.
+unsafe fn sync_spin(band: HWND) {
+    if band.is_null() {
+        return;
+    }
+    let spinning = BADGES.with(|b| b.borrow().values().any(|e| e.state & TBPF_INDETERMINATE != 0));
+    if spinning {
+        SetTimer(band, TIMER_SPIN, 50, None);
+    } else {
+        KillTimer(band, TIMER_SPIN);
+    }
+}
 
 unsafe fn redraw() {
     for b in crate::bar::all_bars() {
@@ -87,18 +114,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     let target = wp as HWND;
     match msg {
         MSG_PROGRESS_VALUE => {
-            update(target, |e| e.value = (lp as u32).min(PROGRESS_MAX));
+            update(target, |e| {
+                e.value = (lp as u32).min(PROGRESS_MAX);
+                e.state = state_after_value(e.state);
+            });
             0
         }
         MSG_PROGRESS_STATE => {
             update(target, |e| e.state = lp as u32);
             // Unbestimmter Fortschritt läuft als Animation.
-            let spinning = BADGES.with(|b| b.borrow().values().any(|e| e.state & TBPF_INDETERMINATE != 0));
-            if spinning {
-                SetTimer(hwnd, TIMER_SPIN, 50, None);
-            } else {
-                KillTimer(hwnd, TIMER_SPIN);
-            }
+            sync_spin(hwnd);
             0
         }
         MSG_OVERLAY => {
@@ -114,6 +139,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER if wp == TIMER_SPIN => {
             redraw();
+            // Fenster mit unbestimmtem Fortschritt kann inzwischen weg sein.
+            sync_spin(hwnd);
             0
         }
         // Übrige TaskbarList-Nachrichten (Vorschau-Buttons, Tooltips, Tabs …)
@@ -134,6 +161,7 @@ pub unsafe fn create(inst: HINSTANCE, bar: HWND) {
         log("Taskband konnte nicht angelegt werden");
         return;
     }
+    BAND.store(band, Ordering::Relaxed);
     SetPropW(bar, w16("TaskbandHWND").as_ptr(), band as HANDLE);
 }
 
@@ -160,6 +188,8 @@ pub unsafe fn announce(windows: &[HWND]) {
             alive
         })
     });
+    // Mit einem geschlossenen Fenster kann der letzte unbestimmte Fortschritt weg sein.
+    sync_spin(BAND.load(Ordering::Relaxed));
 }
 
 /// Zähler-Symbol und Fortschritt für einen Button (seine Fenster): das zuletzt
@@ -231,3 +261,16 @@ pub unsafe fn self_test() {
 }
 
 static TASKBAR_BUTTON_CREATED: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_without_state_shows_normal_progress() {
+        assert_eq!(state_after_value(0), TBPF_NORMAL);
+        assert_eq!(state_after_value(TBPF_PAUSED), TBPF_PAUSED);
+        assert_eq!(state_after_value(TBPF_ERROR), TBPF_ERROR);
+        assert_eq!(state_after_value(TBPF_INDETERMINATE), TBPF_INDETERMINATE);
+    }
+}

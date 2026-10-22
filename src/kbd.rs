@@ -195,13 +195,26 @@ unsafe fn describe(hkl: isize) -> Raw {
 
 const LAYOUTS: &str = r"SYSTEM\CurrentControlSet\Control\Keyboard Layouts";
 
-/// Registry-Schlüssel (KLID, z. B. "00000407") eines HKL. Obere 16 Bit
-/// 0xFxxx = Layout-ID ("Layout Id" in der Registry), sonst die Geräte-ID selbst.
-unsafe fn klid(hkl: isize) -> Option<String> {
+/// KLID, der sich direkt aus dem HKL ergibt (ohne Registry). Obere 16 Bit
+/// 0xExxx = IME: Der KLID ist das ganze HKL (z. B. "E0010411"); 0xFxxx =
+/// Layout-ID, die erst in der Registry gesucht werden muss (`None`); sonst die
+/// Geräte-ID selbst.
+fn klid_direct(hkl: isize) -> Option<String> {
     let device = ((hkl as usize >> 16) & 0xFFFF) as u32;
-    if device & 0xF000 != 0xF000 {
-        return Some(format!("{device:08X}"));
+    match device & 0xF000 {
+        0xE000 => Some(format!("{:08X}", hkl as u32)),
+        0xF000 => None,
+        _ => Some(format!("{device:08X}")),
     }
+}
+
+/// Registry-Schlüssel (KLID, z. B. "00000407") eines HKL. Obere 16 Bit
+/// 0xFxxx = Layout-ID ("Layout Id" in der Registry), siehe `klid_direct`.
+unsafe fn klid(hkl: isize) -> Option<String> {
+    if let Some(k) = klid_direct(hkl) {
+        return Some(k);
+    }
+    let device = ((hkl as usize >> 16) & 0xFFFF) as u32;
     let wanted = device & 0x0FFF;
     let mut key: HKEY = null_mut();
     if RegOpenKeyExW(HKEY_LOCAL_MACHINE, w16(LAYOUTS).as_ptr(), 0, KEY_READ, &mut key) != ERROR_SUCCESS {
@@ -357,5 +370,20 @@ mod tests {
             assert_eq!(klid(0x04070407).as_deref(), Some("00000407"));
             assert_eq!(klid(0x08070407).as_deref(), Some("00000807"));
         }
+    }
+}
+
+#[cfg(test)]
+mod klid_tests {
+    use super::klid_direct;
+
+    #[test]
+    fn klid_from_hkl() {
+        // Deutsch: Gerät 0407.
+        assert_eq!(klid_direct(0x0407_0407).as_deref(), Some("00000407"));
+        // Japanisch (IME): KLID ist das ganze HKL.
+        assert_eq!(klid_direct(0xE001_0411u32 as i32 as isize).as_deref(), Some("E0010411"));
+        // Layout-ID (Dvorak u. Ä.): erst in der Registry nachschlagen.
+        assert_eq!(klid_direct(0xF002_0409u32 as i32 as isize), None);
     }
 }

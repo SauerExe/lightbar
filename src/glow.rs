@@ -42,6 +42,8 @@ struct Flash {
 struct Surface {
     hwnd: HWND,
     bar: HWND,
+    /// Skalierung der Leiste darunter (Zweitleisten können anders skaliert sein).
+    dpi: u32,
     /// Position auf dem Bildschirm; w × h ist die Puffergröße (seitlich hochkant).
     x: i32,
     y: i32,
@@ -185,7 +187,10 @@ pub unsafe fn sync() {
     } else {
         Vec::new()
     };
-    let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(crate::bar::hwnd()).max(96);
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    // Muster (Verlauf, Komet) läuft in der Skalierung der Hauptleiste über alle
+    // Leisten; Höhe von Leuchten und Linie richtet sich nach der jeweiligen Leiste.
+    let dpi = GetDpiForWindow(crate::bar::hwnd()).max(96);
     let span = if edge.vertical() {
         (GetSystemMetrics(SM_YVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1))
     } else {
@@ -195,7 +200,8 @@ pub unsafe fn sync() {
     for bar in bars {
         let mut br: RECT = zeroed();
         GetWindowRect(bar, &mut br);
-        let r = surface_rect(edge, br, px(dpi, GLOW_H), px(dpi, LINE_H));
+        let bar_dpi = GetDpiForWindow(bar).max(96);
+        let r = surface_rect(edge, br, px(bar_dpi, GLOW_H), px(bar_dpi, LINE_H));
         let (w, h) = (r.right - r.left, r.bottom - r.top);
         let mut sf = match old.iter().position(|o| o.bar == bar) {
             Some(i) => old.remove(i),
@@ -204,9 +210,10 @@ pub unsafe fn sync() {
                 if hwnd.is_null() {
                     continue;
                 }
-                Surface { hwnd, bar, x: 0, y: 0, w: 0, h: 0, bmp: null_mut(), bits: null_mut() }
+                Surface { hwnd, bar, dpi: bar_dpi, x: 0, y: 0, w: 0, h: 0, bmp: null_mut(), bits: null_mut() }
             }
         };
+        sf.dpi = bar_dpi;
         ensure_buffer(&mut sf, w, h);
         sf.x = r.left;
         sf.y = r.top;
@@ -329,7 +336,6 @@ unsafe fn frame() {
         let comet = (ct < 1.0).then(|| span_l + ct * (span_w + 400.0 * scale) - 200.0 * scale);
         let pulse = 0.5 + 0.5 * (t * 6.0).sin();
         let flashes: Vec<(f32, f32)> = s.flashes.iter().map(|f| (f.at as f32, f.start.elapsed().as_secs_f32() / 1.2)).collect();
-        let line = px(d, LINE_H).max(1);
 
         let mut jobs = Vec::new();
         for sf in &s.surfaces {
@@ -337,6 +343,7 @@ unsafe fn frame() {
                 continue;
             }
             let (w, h) = (sf.w, sf.h);
+            let line = px(sf.dpi, LINE_H).max(1);
             // Länge entlang der Leiste und Tiefe quer dazu.
             let (len, depth, origin) = if vertical { (h, w, sf.y) } else { (w, h, sf.x) };
             let glow = depth - line;
