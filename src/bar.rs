@@ -25,6 +25,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim;
 use crate::menus::{self, Item};
+use crate::settings::BarSize;
 use crate::status::{self, Status};
 use crate::tray::{self, Click};
 use crate::util::*;
@@ -37,6 +38,11 @@ const BTN_W: i32 = 44;
 const BTN_H: i32 = 40;
 const BTN_GAP: i32 = 4;
 const ICON: i32 = 24;
+/// Rand der Uhr je Seite (innerhalb der Hover-Fläche) und Abstand zur
+/// Desktop-Ecke – wie bei Windows knapp.
+const CLOCK_PAD: i32 = 4;
+const CLOCK_EDGE_GAP: i32 = 2;
+/// Uhrbreite, wenn es zu eng wird (sehr schmale Leiste), bei Schrift 12 px.
 const CLOCK_W: i32 = 84;
 const TRAY_W: i32 = 28;
 const TRAY_ICON: i32 = 16;
@@ -293,8 +299,6 @@ struct State {
     /// bis sie aktiviert werden oder das Blinken beenden.
     attention: Vec<(HWND, Instant)>,
     start: Instant,
-    font: HFONT,
-    icons: HFONT,
 }
 
 impl State {
@@ -600,21 +604,68 @@ struct Layout {
     desktop: RECT,
 }
 
-/// Maße der Leiste (logische Pixel): normal oder mit kleineren Schaltflächen
-/// (Windows-Einstellung "Kleinere Taskleistenschaltflächen anzeigen").
+/// Maße der Leiste (logische Pixel) je Größe. "Klein" entspricht der
+/// Windows-Einstellung "Kleinere Taskleistenschaltflächen anzeigen", "Normal"
+/// der Standard-Taskleiste; "Groß" und "Sehr groß" skalieren alles mit.
+#[derive(Debug)]
 struct Metrics {
     bar_h: i32,
+    /// Breite einer senkrechten Leiste.
+    bar_w_v: i32,
     btn_w: i32,
     btn_h: i32,
     icon: i32,
+    /// Textschrift (Uhr, Eingabesprache, Usage) und Symbolschrift.
+    font: i32,
+    icon_font: i32,
+    tray_w: i32,
+    tray_icon: i32,
+    glyph_w: i32,
+    kbd_w: i32,
+    /// Senkrechte Leiste: Zeilenhöhen von Uhr, Status und Eingabesprache.
+    clock_h_v: i32,
+    status_h_v: i32,
+    kbd_h_v: i32,
 }
 
-const fn metrics(small: bool) -> Metrics {
-    if small {
-        Metrics { bar_h: 40, btn_w: 36, btn_h: 32, icon: 20 }
-    } else {
-        Metrics { bar_h: BAR_H, btn_w: BTN_W, btn_h: BTN_H, icon: ICON }
+const fn metrics(size: BarSize) -> Metrics {
+    let normal = Metrics {
+        bar_h: BAR_H,
+        bar_w_v: BAR_W_V,
+        btn_w: BTN_W,
+        btn_h: BTN_H,
+        icon: ICON,
+        font: 12,
+        icon_font: 16,
+        tray_w: TRAY_W,
+        tray_icon: TRAY_ICON,
+        glyph_w: STATUS_GLYPH_W,
+        kbd_w: KBD_W,
+        clock_h_v: 44,
+        status_h_v: 36,
+        kbd_h_v: KBD_H_V,
+    };
+    match size {
+        BarSize::Small => Metrics { bar_h: 40, btn_w: 36, btn_h: 32, icon: 20, ..normal },
+        BarSize::Large => Metrics { bar_h: 56, bar_w_v: 84, btn_w: 52, btn_h: 48, icon: 28, font: 14, icon_font: 18, tray_w: 32, tray_icon: 20, glyph_w: 30, kbd_w: 46, clock_h_v: 50, status_h_v: 40, kbd_h_v: 46 },
+        BarSize::XLarge => Metrics { bar_h: 64, bar_w_v: 96, btn_w: 60, btn_h: 56, icon: 32, font: 16, icon_font: 20, tray_w: 36, tray_icon: 24, glyph_w: 34, kbd_w: 52, clock_h_v: 56, status_h_v: 44, kbd_h_v: 52 },
+        BarSize::Normal | BarSize::Auto => normal,
     }
+}
+
+/// Größe der Leisten: eigene Wahl, sonst wie Windows (klein oder normal).
+fn bar_size() -> BarSize {
+    crate::settings::get().bar_size.resolve(crate::display::small_buttons())
+}
+
+/// Breite der Usage-Anzeige: wächst mit der Schrift.
+const fn usage_w(m: &Metrics) -> i32 {
+    USAGE_W * m.font / 12
+}
+
+/// Breite der Uhr, wenn es eng wird: das frühere feste Maß, mit der Schrift skaliert.
+const fn clock_fallback_w(m: &Metrics) -> i32 {
+    CLOCK_W * m.font / 12
 }
 
 struct LayoutInput {
@@ -637,12 +688,15 @@ struct LayoutInput {
     primary: bool,
     usage: bool,
     align_left: bool,
-    /// Kleinere Schaltflächen (Windows-Einstellung).
-    small: bool,
+    /// Größe der Leiste (nie `Auto`, siehe `bar_size`).
+    size: BarSize,
+    /// "Desktop anzeigen"-Ecke ganz außen (Windows-Einstellung).
+    desktop_corner: bool,
     /// Suche: 0 aus, 1 Symbol, 2 Suchfeld, 3 Symbol mit Beschriftung.
     search: u32,
     task_view: bool,
-    /// Breite der Uhr (logische Pixel), je nach Regionalformat (12 h ist breiter).
+    /// Breite der Uhr samt Rand (logische Pixel): gemessen in Format, Schrift
+    /// und Größe der Leiste (12 h ist breiter, "nur Uhrzeit" schmaler).
     clock_w: i32,
 }
 
@@ -654,16 +708,45 @@ const BTN_MIN_W: i32 = 32;
 /// dann verschwindet die Usage-Anzeige, dann werden die Buttons schmaler und
 /// zuletzt fallen Buttons am Ende weg, statt sich mit dem Rest zu überlappen.
 fn layout(i: &LayoutInput) -> Layout {
+    // Große Leiste auf kleinem Bildschirm: Passt nicht einmal der "…"-Knopf,
+    // bekommen die Elemente normale Größe (die Leiste bleibt so dick).
+    let big = matches!(i.size, BarSize::Large | BarSize::XLarge);
     if i.vertical {
-        return layout_vertical(i);
+        let l = layout_vertical(i);
+        if big && l.tasks.len() < i.n_tasks && l.more.is_none() {
+            return layout_vertical(&LayoutInput { size: BarSize::Normal, ..*i });
+        }
+        return l;
     }
     let l = layout_horizontal(i);
+    if !cramped(&l, i) {
+        return l;
+    }
     // Reicht der Platz selbst nach allem Ausweichen nicht (sehr schmale Leiste:
     // kein Platz mehr für den "…"-Knopf), bekommt eine breite Uhr
-    // (12-Stunden-Format) nur das Standardmaß.
-    if i.clock_w > CLOCK_W && cramped(&l, i) {
-        return layout_horizontal(&LayoutInput { clock_w: CLOCK_W, ..*i });
+    // (12-Stunden-Format, Wochentag, eigenes Format) nur das Standardmaß.
+    let fallback = clock_fallback_w(&metrics(i.size));
+    let i2 = LayoutInput { clock_w: i.clock_w.min(fallback), ..*i };
+    let l = if i.clock_w > fallback { layout_horizontal(&i2) } else { l };
+    if !big || !cramped(&l, &i2) {
+        return l;
     }
+    let normal = LayoutInput { size: BarSize::Normal, clock_w: i2.clock_w.min(clock_fallback_w(&metrics(BarSize::Normal))), ..*i };
+    let mut l = layout_horizontal(&normal);
+    // Mittig in der dickeren Leiste; die Desktop-Ecke reicht über die ganze Höhe.
+    let h = px(i.dpi, metrics(i.size).bar_h);
+    let dy = (h - px(i.dpi, BAR_H)) / 2;
+    let down = |r: &mut RECT| {
+        r.top += dy;
+        r.bottom += dy;
+    };
+    for r in [&mut l.usage, &mut l.taskmgr, &mut l.start, &mut l.search, &mut l.taskview, &mut l.kbd, &mut l.status, &mut l.clock] {
+        down(r);
+    }
+    for r in l.tasks.iter_mut().chain(l.tray.iter_mut()).chain(l.chevron.iter_mut()).chain(l.more.iter_mut()) {
+        down(r);
+    }
+    l.desktop.bottom = h;
     l
 }
 
@@ -680,20 +763,21 @@ fn cramped(l: &Layout, i: &LayoutInput) -> bool {
 fn layout_horizontal(i: &LayoutInput) -> Layout {
     let (w, dpi) = (i.width, i.dpi);
     let gap = px(dpi, BTN_GAP);
-    let m = metrics(i.small);
+    let m = metrics(i.size);
     let h = px(dpi, m.bar_h);
     let top = (h - px(dpi, m.btn_h)) / 2;
     let bottom = top + px(dpi, m.btn_h);
     let empty = RECT { left: 0, top, right: 0, bottom };
 
-    // Rechte Seite von außen nach innen.
-    let desktop = RECT { left: w - px(dpi, DESKTOP_W), top: 0, right: w, bottom: h };
-    let clock_r = desktop.left - px(dpi, 4);
+    // Rechte Seite von außen nach innen. Die Desktop-Ecke nur, wenn sie in
+    // Windows eingeschaltet ist; die Uhr sitzt knapp daneben.
+    let desktop = RECT { left: w - if i.desktop_corner { px(dpi, DESKTOP_W) } else { 0 }, top: 0, right: w, bottom: h };
+    let clock_r = desktop.left - px(dpi, CLOCK_EDGE_GAP);
     let clock = RECT { left: clock_r - px(dpi, i.clock_w), top, right: clock_r, bottom };
     let status = if i.primary {
         let glyphs = 2 + i.battery as i32;
         let status_r = clock.left - px(dpi, 4);
-        RECT { left: status_r - glyphs * px(dpi, STATUS_GLYPH_W) - px(dpi, 16), top, right: status_r, bottom }
+        RECT { left: status_r - glyphs * px(dpi, m.glyph_w) - px(dpi, 16), top, right: status_r, bottom }
     } else {
         RECT { left: clock.left, right: clock.left, ..empty }
     };
@@ -701,13 +785,13 @@ fn layout_horizontal(i: &LayoutInput) -> Layout {
     let kbd_rect = |on: bool| {
         if on {
             let r = status.left - px(dpi, 4);
-            RECT { left: r - px(dpi, KBD_W), top, right: r, bottom }
+            RECT { left: r - px(dpi, m.kbd_w), top, right: r, bottom }
         } else {
             RECT { left: status.left, right: status.left, ..empty }
         }
     };
     let tray_r = |kbd: bool| kbd_rect(kbd).left - px(dpi, 4);
-    let tw = px(dpi, TRAY_W);
+    let tw = px(dpi, m.tray_w);
     let n_tray = if i.primary { i.n_tray } else { 0 };
     let chevron_needed = |shown: usize| i.primary && (i.hidden_tray || shown < n_tray);
     let right_start = |kbd: bool, shown: usize| tray_r(kbd) - (shown as i32 + chevron_needed(shown) as i32) * tw;
@@ -716,7 +800,7 @@ fn layout_horizontal(i: &LayoutInput) -> Layout {
     let margin = px(dpi, 8);
     let left_end = |usage: bool| match (i.primary, usage) {
         (false, _) => 0,
-        (true, true) => margin + px(dpi, USAGE_W) + px(dpi, 4) + px(dpi, TASKMGR_W),
+        (true, true) => margin + px(dpi, usage_w(&m)) + px(dpi, 4) + px(dpi, TASKMGR_W),
         (true, false) => margin + px(dpi, TASKMGR_W),
     };
 
@@ -788,7 +872,7 @@ fn layout_horizontal(i: &LayoutInput) -> Layout {
     let tray_l = tray_r - shown as i32 * tw;
     let tray = (0..shown as i32).map(|n| RECT { left: tray_l + n * tw, top, right: tray_l + (n + 1) * tw, bottom }).collect();
     let chevron = chevron_needed(shown).then(|| RECT { left: tray_l - tw, top, right: tray_l, bottom });
-    let usage_r = if usage { RECT { left: margin, top, right: margin + px(dpi, USAGE_W), bottom } } else { empty };
+    let usage_r = if usage { RECT { left: margin, top, right: margin + px(dpi, usage_w(&m)), bottom } } else { empty };
     let taskmgr = if i.primary {
         // Direkt rechts neben der Usage-Anzeige (oder ganz links, wenn die aus ist).
         let tm_left = if usage { usage_r.right + px(dpi, 4) } else { margin };
@@ -808,22 +892,23 @@ fn layout_horizontal(i: &LayoutInput) -> Layout {
 fn layout_vertical(i: &LayoutInput) -> Layout {
     let (w, len, dpi) = (i.width, i.length, i.dpi);
     let gap = px(dpi, BTN_GAP);
+    let m = metrics(i.size);
     let margin = px(dpi, 4);
     let (left, right) = (margin, w - margin);
     let row = |top: i32, h: i32| RECT { left, top, right, bottom: top + h };
     let empty = RECT { left, top: 0, right: left, bottom: 0 };
 
     // Unten von außen nach innen.
-    let desktop = RECT { left: 0, top: len - px(dpi, DESKTOP_W), right: w, bottom: len };
-    let clock = row(desktop.top - px(dpi, 4) - px(dpi, 44), px(dpi, 44));
-    let status = if i.primary { row(clock.top - px(dpi, 4) - px(dpi, 36), px(dpi, 36)) } else { RECT { top: clock.top, bottom: clock.top, ..empty } };
+    let desktop = RECT { left: 0, top: len - if i.desktop_corner { px(dpi, DESKTOP_W) } else { 0 }, right: w, bottom: len };
+    let clock = row(desktop.top - px(dpi, CLOCK_EDGE_GAP) - px(dpi, m.clock_h_v), px(dpi, m.clock_h_v));
+    let status = if i.primary { row(clock.top - px(dpi, 4) - px(dpi, m.status_h_v), px(dpi, m.status_h_v)) } else { RECT { top: clock.top, bottom: clock.top, ..empty } };
     let n_tray = if i.primary { i.n_tray } else { 0 };
-    let cell = px(dpi, TRAY_W);
+    let cell = px(dpi, m.tray_w);
     let cols = ((right - left) / cell).max(1);
     let chevron_needed = |shown: usize| i.primary && (i.hidden_tray || shown < n_tray);
     let tray_rows = |shown: usize| (shown as i32 + chevron_needed(shown) as i32 + cols - 1) / cols;
     // Eingabesprache als eigene Zeile über den Status-Symbolen.
-    let kbd = if i.primary && i.kbd { row(status.top - px(dpi, 4) - px(dpi, KBD_H_V), px(dpi, KBD_H_V)) } else { RECT { top: status.top, bottom: status.top, ..empty } };
+    let kbd = if i.primary && i.kbd { row(status.top - px(dpi, 4) - px(dpi, m.kbd_h_v), px(dpi, m.kbd_h_v)) } else { RECT { top: status.top, bottom: status.top, ..empty } };
     let tray_top = |shown: usize| kbd.top - px(dpi, 4) - tray_rows(shown) * cell;
 
     let top_end = if i.primary { px(dpi, 8) + px(dpi, TASKMGR_W) } else { 0 };
@@ -836,7 +921,7 @@ fn layout_vertical(i: &LayoutInput) -> Layout {
     let (shown, bh, fit, fixed) = loop {
         let fixed = srch as i32 + tv as i32;
         let count = i.n_tasks as i32 + 1 + fixed;
-        let (mut shown, mut bh) = (n_tray, px(dpi, metrics(i.small).btn_h));
+        let (mut shown, mut bh) = (n_tray, px(dpi, m.btn_h));
         while need(count, bh) > room(shown) {
             if shown > 0 {
                 shown -= 1;
@@ -891,6 +976,22 @@ fn layout_vertical(i: &LayoutInput) -> Layout {
     Layout { usage: empty, show_usage: false, taskmgr, start, search, search_mode: srch as u32, taskview, tasks, tray, chevron, more, kbd, status, clock, desktop }
 }
 
+/// Schriftfamilie der Leiste: die gewählte, sonst (nicht installiert)
+/// Segoe UI Variable, zuletzt Segoe UI.
+fn text_face(f: crate::settings::BarFont) -> &'static str {
+    [f.face(), crate::settings::BarFont::SegoeVariable.face()].into_iter().find(|n| font_installed(n)).unwrap_or("Segoe UI")
+}
+
+/// Schrift der Uhr: Familie und Größe der Leiste, Uhrzeit ggf. fett.
+fn clock_font(s: &crate::settings::Settings, size: BarSize) -> crate::clockfmt::Font {
+    crate::clockfmt::Font { face: text_face(s.bar_font), size: metrics(size).font, bold: s.clock_bold }
+}
+
+/// Was die Uhr zeigt (Anzeige, eigenes Format, Sekunden); senkrecht ohne Jahr.
+fn clock_spec(s: &crate::settings::Settings, vertical: bool) -> crate::clockfmt::Spec {
+    crate::clockfmt::spec(s.clock_display, &s.clock_format, clock_seconds(), vertical)
+}
+
 /// Layout einer Leiste und die Tray-Icons, die darin Platz haben. Tray-Icons,
 /// die nicht mehr passen, zeigt der Überlauf.
 unsafe fn current_layout(hwnd: HWND) -> Option<(Layout, Vec<(usize, HICON)>)> {
@@ -901,9 +1002,11 @@ unsafe fn current_layout(hwnd: HWND) -> Option<(Layout, Vec<(usize, HICON)>)> {
     let mut rc: RECT = zeroed();
     GetClientRect(hwnd, &mut rc);
     let settings = crate::settings::get();
+    let vertical = crate::display::edge().vertical();
+    let size = settings.bar_size.resolve(crate::display::small_buttons());
     let l = layout(&LayoutInput {
         width: rc.right,
-        vertical: crate::display::edge().vertical(),
+        vertical,
         length: rc.bottom,
         dpi,
         n_tasks: n,
@@ -914,12 +1017,13 @@ unsafe fn current_layout(hwnd: HWND) -> Option<(Layout, Vec<(usize, HICON)>)> {
         primary,
         usage: settings.show_usage && !settings.presentation && (settings.usage_claude || settings.usage_codex),
         align_left: crate::display::align_left(),
-        small: crate::display::small_buttons(),
+        size,
+        desktop_corner: crate::display::desktop_corner(),
         // Suche und Aufgabenansicht nur auf der Hauptleiste (wie bei Windows
         // zeigen Zweitleisten nur Start und Apps).
         search: if primary && settings.taskbar_search { crate::display::search_mode() } else { 0 },
         task_view: primary && crate::display::task_view_button(),
-        clock_w: crate::clockfmt::width(clock_seconds(), CLOCK_W),
+        clock_w: crate::clockfmt::width(&clock_spec(&settings, vertical), &clock_font(&settings, size), dpi) + 2 * CLOCK_PAD,
     });
     if primary {
         tray::set_shown(l.tray.len());
@@ -1140,8 +1244,9 @@ unsafe fn refresh_inner(hwnd: HWND, refetch: Option<HWND>) {
     let mut found: Vec<HWND> = Vec::new();
     EnumWindows(Some(enum_cb), &mut found as *mut _ as LPARAM);
     found.reverse();
+    let icon_size = metrics(bar_size()).icon;
     let Some((mut old, size, cached_size, mut pins, mut info, user_order, hints)) = with(|s| {
-        let size = px(s.dpi, ICON);
+        let size = px(s.dpi, icon_size);
         let cached = s.icon_px;
         s.icon_px = size;
         // Kopie statt take: Icon-Abfragen können Nachrichten pumpen, ein Paint
@@ -1660,6 +1765,7 @@ unsafe fn set_language(l: crate::i18n::LangSetting) {
 const MONITOR_IDS: usize = 50;
 
 unsafe fn bar_menu(hwnd: HWND) {
+    manual_edits();
     use crate::i18n::LangSetting;
     use crate::settings::{GlowStyle, StartLogo};
     let s = crate::settings::get();
@@ -1701,7 +1807,8 @@ unsafe fn bar_menu(hwnd: HWND) {
                 ],
             ),
             Item::Sub(t!("Startmenü", "Start menu"), vec![Item::Check(22, t!("Profilbild anzeigen", "Show profile picture"), s.start_avatar)]),
-            Item::Check(14, t!("Uhr mit Sekunden", "Show seconds in clock"), clock_seconds()),
+            Item::Sub(t!("Größe", "Size"), size_items(&s)),
+            Item::Sub(t!("Uhr", "Clock"), clock_items(&s)),
             Item::Check(23, t!("Suche anzeigen", "Show search"), s.taskbar_search && crate::display::search_mode() > 0),
             Item::Check(24, t!("Aufgabenansicht anzeigen", "Show Task view"), crate::display::task_view_button()),
             Item::Check(29, t!("Automatisch ausblenden", "Auto-hide"), autohide_on()),
@@ -1730,14 +1837,7 @@ unsafe fn bar_menu(hwnd: HWND) {
         11 => crate::glow::set_style(GlowStyle::Accent),
         12 => crate::glow::set_style(GlowStyle::Neon),
         13 => crate::glow::set_style(GlowStyle::Off),
-        14 => {
-            // Gleiche Einstellung wie in Windows (Personalisierung → Taskleiste).
-            let on = !clock_seconds();
-            crate::settings::update(|s| s.clock_seconds = on);
-            crate::display::set_clock_seconds(on);
-            // Der Uhr-Takt läuft an der Hauptleiste, auch wenn das Menü auf einer Zweitleiste kam.
-            schedule_clock(self::hwnd());
-        }
+        n if style_item(n) => {}
         16 => crate::settings::update(|s| s.start_logo = StartLogo::Orb),
         17 => crate::settings::update(|s| s.start_logo = StartLogo::Windows),
         21 => crate::settings::update(|s| s.start_logo = StartLogo::Tux),
@@ -1990,12 +2090,18 @@ fn clock_seconds() -> bool {
     crate::display::clock_seconds().unwrap_or_else(|| crate::settings::get().clock_seconds)
 }
 
+/// Muss die Uhr jede Sekunde neu gezeichnet werden (Sekunden oder eigenes
+/// Format mit Sekunden)?
+fn clock_ticks_seconds() -> bool {
+    clock_spec(&crate::settings::get(), false).shows_seconds()
+}
+
 /// Uhr-Zeitgeber auf den nächsten Sekunden- bzw. Minutenwechsel stellen.
 unsafe fn schedule_clock(hwnd: HWND) {
     let mut st: SYSTEMTIME = zeroed();
     GetLocalTime(&mut st);
     let ms = st.wMilliseconds as u32;
-    let due = if clock_seconds() { 1000 - ms } else { (60 - st.wSecond as u32) * 1000 - ms };
+    let due = if clock_ticks_seconds() { 1000 - ms } else { (60 - st.wSecond as u32) * 1000 - ms };
     SetTimer(hwnd, TIMER_TICK, due.max(20), None);
 }
 
@@ -2211,16 +2317,146 @@ unsafe fn kbd_menu(hwnd: HWND) {
     }
 }
 
+// Menü-IDs für Größe, Uhr und Schrift (in Leisten- und Uhrmenü gleich).
+const ID_CLOCK_DISPLAY: usize = 100; // 100–103: Anzeige der Uhr
+const ID_SECONDS: usize = 104;
+const ID_CUSTOM_FORMAT: usize = 105;
+const ID_CLOCK_BOLD: usize = 106;
+const ID_FONT: usize = 110; // 110–114: Schriftart (Index in BarFont::ALL)
+const ID_SIZE: usize = 120; // 120 Automatisch, 121–124: feste Größen
+
+const CLOCK_DISPLAYS: [crate::settings::ClockDisplay; 4] = {
+    use crate::settings::ClockDisplay::*;
+    [DateTime, TimeOnly, WeekdayDate, ShortDate]
+};
+
+/// Untermenü "Größe": Automatisch (wie Windows) oder eine feste Größe.
+fn size_items(s: &crate::settings::Settings) -> Vec<Item<'static>> {
+    let label = |b: BarSize| match b {
+        BarSize::Auto => t!("Automatisch (Windows)", "Automatic (Windows)"),
+        BarSize::Small => t!("Klein", "Small"),
+        BarSize::Normal => "Normal",
+        BarSize::Large => t!("Groß", "Large"),
+        BarSize::XLarge => t!("Sehr groß", "Extra large"),
+    };
+    let mut items = vec![Item::Check(ID_SIZE, label(BarSize::Auto), s.bar_size == BarSize::Auto), Item::Sep];
+    items.extend(BarSize::ALL.iter().enumerate().map(|(n, &b)| Item::Check(ID_SIZE + 1 + n, label(b), s.bar_size == b)));
+    items
+}
+
+/// Einträge für die Uhr: Anzeige, Sekunden, eigenes Format, Schrift, fett.
+/// Stehen im Leistenmenü unter "Uhr" und im Rechtsklickmenü der Uhr.
+fn clock_items(s: &crate::settings::Settings) -> Vec<Item<'static>> {
+    use crate::settings::{BarFont, ClockDisplay};
+    let label = |d: ClockDisplay| match d {
+        ClockDisplay::DateTime => t!("Uhrzeit und Datum", "Time and date"),
+        ClockDisplay::TimeOnly => t!("Nur Uhrzeit", "Time only"),
+        ClockDisplay::WeekdayDate => t!("Uhrzeit, Wochentag und Datum", "Time, weekday and date"),
+        ClockDisplay::ShortDate => t!("Uhrzeit und Datum ohne Jahr", "Time and date without year"),
+    };
+    let mut items: Vec<Item> = CLOCK_DISPLAYS.iter().enumerate().map(|(n, &d)| Item::Check(ID_CLOCK_DISPLAY + n, label(d), s.clock_display == d)).collect();
+    items.push(Item::Sep);
+    items.push(Item::Check(ID_SECONDS, t!("Sekunden anzeigen", "Show seconds"), clock_seconds()));
+    // Kein Eingabefeld: Das Muster steht in settings.txt (Klick öffnet die Datei).
+    items.push(Item::Check(ID_CUSTOM_FORMAT, t!("Eigenes Format (settings.txt)", "Custom format (settings.txt)"), !s.clock_format.trim().is_empty()));
+    items.push(Item::Sep);
+    // Nur installierte Schriften; fehlt die gewählte, gilt Segoe UI Variable.
+    let face = text_face(s.bar_font);
+    let fonts = BarFont::ALL.iter().enumerate().filter(|(_, f)| font_installed(f.face())).map(|(n, f)| Item::Check(ID_FONT + n, f.label(), f.face() == face)).collect();
+    items.push(Item::Sub(t!("Schriftart", "Font"), fonts));
+    items.push(Item::Check(ID_CLOCK_BOLD, t!("Uhrzeit fett", "Bold time"), s.clock_bold));
+    items
+}
+
+/// Gewählten Eintrag aus `size_items`/`clock_items` ausführen. `false`, wenn
+/// die ID nicht dazugehört.
+unsafe fn style_item(id: usize) -> bool {
+    use crate::settings::BarFont;
+    match id {
+        n if (ID_CLOCK_DISPLAY..ID_CLOCK_DISPLAY + CLOCK_DISPLAYS.len()).contains(&n) => {
+            let d = CLOCK_DISPLAYS[n - ID_CLOCK_DISPLAY];
+            crate::settings::update(|s| s.clock_display = d);
+            apply_style(false);
+        }
+        ID_SECONDS => {
+            // Gleiche Einstellung wie in Windows (Personalisierung → Taskleiste).
+            let on = !clock_seconds();
+            crate::settings::update(|s| s.clock_seconds = on);
+            crate::display::set_clock_seconds(on);
+            apply_style(false);
+        }
+        ID_CUSTOM_FORMAT => {
+            // settings.txt im Editor öffnen. Gespeicherte Änderungen übernimmt die
+            // Leiste beim nächsten Öffnen eines Menüs, spätestens nach 30 s
+            // (`manual_edits`).
+            if let Some(dir) = crate::util::data_dir() {
+                shell_open(&dir.join("settings.txt").to_string_lossy(), "", SW_SHOWNORMAL);
+            }
+        }
+        ID_CLOCK_BOLD => {
+            crate::settings::update(|s| s.clock_bold = !s.clock_bold);
+            apply_style(false);
+        }
+        n if (ID_FONT..ID_FONT + BarFont::ALL.len()).contains(&n) => {
+            let f = BarFont::ALL[n - ID_FONT];
+            crate::settings::update(|s| s.bar_font = f);
+            apply_style(false);
+        }
+        ID_SIZE => {
+            crate::settings::update(|s| s.bar_size = BarSize::Auto);
+            apply_style(true);
+        }
+        n if (ID_SIZE + 1..=ID_SIZE + BarSize::ALL.len()).contains(&n) => {
+            let b = BarSize::ALL[n - ID_SIZE - 1];
+            crate::settings::update(|s| s.bar_size = b);
+            apply_style(true);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// settings.txt von Hand geändert (z. B. `clock_format`): übernehmen.
+unsafe fn manual_edits() {
+    if crate::settings::reload_if_changed() {
+        crate::util::log("settings.txt von Hand geändert – neu gelesen");
+        apply_style(true);
+    }
+}
+
+/// Größe, Schrift oder Uhr geändert: sofort übernehmen. Schriften und
+/// Uhrbreite neu; bei neuer Größe alle Leisten neu andocken (Dicke,
+/// Arbeitsbereich, maximierte Fenster) und App-Symbole in der neuen Größe holen.
+unsafe fn apply_style(resized: bool) {
+    reset_fonts();
+    crate::tooltip::hide();
+    if resized {
+        crate::preview::hide();
+        tray::hide_overflow();
+        set_pos(self::hwnd());
+        sync_monitors();
+        refresh(self::hwnd(), None);
+        SetTimer(self::hwnd(), TIMER_REFIT, 500, None);
+    }
+    // Der Uhr-Takt läuft an der Hauptleiste (Sekunden ja/nein).
+    schedule_clock(self::hwnd());
+    for b in all_bars() {
+        InvalidateRect(b, null(), 0);
+    }
+}
+
 unsafe fn clock_menu(hwnd: HWND) {
-    let id = menus::popup(
-        hwnd,
-        &[
-            Item::Cmd(1, t!("Datum und Uhrzeit anpassen", "Adjust date and time")),
-            Item::Cmd(2, t!("Benachrichtigungseinstellungen", "Notification settings")),
-            Item::Sep,
-            Item::Check(3, t!("Kalenderwochen anzeigen", "Show week numbers"), crate::settings::get().week_numbers),
-        ],
-    );
+    manual_edits();
+    let s = crate::settings::get();
+    let mut items = vec![
+        Item::Cmd(1, t!("Datum und Uhrzeit anpassen", "Adjust date and time")),
+        Item::Cmd(2, t!("Benachrichtigungseinstellungen", "Notification settings")),
+        Item::Sep,
+        Item::Check(3, t!("Kalenderwochen anzeigen", "Show week numbers"), s.week_numbers),
+        Item::Sep,
+    ];
+    items.extend(clock_items(&s));
+    let id = menus::popup(hwnd, &items);
     match id {
         1 => shell_open("ms-settings:dateandtime", "", SW_SHOWNORMAL),
         2 => shell_open("ms-settings:notifications", "", SW_SHOWNORMAL),
@@ -2228,7 +2464,9 @@ unsafe fn clock_menu(hwnd: HWND) {
             crate::settings::update(|s| s.week_numbers = !s.week_numbers);
             crate::calendar::refresh();
         }
-        _ => {}
+        n => {
+            style_item(n);
+        }
     }
 }
 
@@ -2268,17 +2506,9 @@ unsafe fn set_pos(hwnd: HWND) {
     // DPI des eigenen Monitors, nicht des Fensters: ausgeblendet liegt die
     // Leiste evtl. auf dem Nachbarmonitor.
     let dpi = monitor_dpi(hwnd);
-    let (font, icons) = (make_font(dpi, 12, FW_NORMAL), icon_font(dpi, 16));
-    with(|s| {
-        s.dpi = dpi;
-        for f in [s.font, s.icons] {
-            if !f.is_null() {
-                DeleteObject(f);
-            }
-        }
-        s.font = font;
-        s.icons = icons;
-    });
+    with(|s| s.dpi = dpi);
+    // Skalierung, Größe oder Schrift können sich geändert haben.
+    reset_fonts();
     dock(hwnd, dpi);
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
     let icon = exe_icon(&format!("{root}\\System32\\Taskmgr.exe"), px(dpi, 20));
@@ -2937,6 +3167,9 @@ unsafe fn draw_usage(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
     let line = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
     // Nur eingeschaltete Dienste; zeilenweise auf die Höhe verteilt.
     let s = crate::settings::get();
+    // Spalten wachsen mit der Schrift (Größe der Leiste).
+    let f = metrics(s.bar_size.resolve(crate::display::small_buttons())).font;
+    let col = |v: i32| px(dpi, v * f / 12);
     let rows: Vec<_> = [
         ("Claude", &u.claude, u.claude_paused_until, s.usage_claude, u.claude_label),
         ("Codex", &u.codex, u.codex_paused_until, s.usage_codex, u.codex_label),
@@ -2950,13 +3183,13 @@ unsafe fn draw_usage(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
         let i = i as i32;
         let h = inner.bottom - inner.top;
         let row = RECT { left: r.left + px(dpi, 8), right: r.right - px(dpi, 8), top: inner.top + h * i / n, bottom: inner.top + h * (i + 1) / n };
-        text(dc, name, &RECT { right: row.left + px(dpi, 46), ..row }, font, SUBTEXT, line);
-        let rest = RECT { left: row.left + px(dpi, 48), ..row };
+        text(dc, name, &RECT { right: row.left + col(46), ..row }, font, SUBTEXT, line);
+        let rest = RECT { left: row.left + col(48), ..row };
         match res {
             Some(Ok(l)) => {
                 let cy = (row.top + row.bottom) / 2;
                 let five = l.five_hour.map(|w| w.used);
-                let track = RECT { left: rest.left, top: cy - px(dpi, 2), right: rest.left + px(dpi, 56), bottom: cy + px(dpi, 2) };
+                let track = RECT { left: rest.left, top: cy - px(dpi, 2), right: rest.left + col(56), bottom: cy + px(dpi, 2) };
                 round(dc, &track, rgb(64, 64, 64), px(dpi, 4));
                 if let Some(p) = five {
                     let w = ((track.right - track.left) as f32 * (p / 100.0).clamp(0.0, 1.0)) as i32;
@@ -3007,30 +3240,53 @@ unsafe fn bar_dpi(hwnd: HWND) -> u32 {
     }
 }
 
-thread_local! {
-    /// Schriften für Zweitleisten mit anderer Skalierung (dpi → Text, Symbole).
-    static FONTS: RefCell<HashMap<u32, (HFONT, HFONT)>> = RefCell::new(HashMap::new());
+/// Schriften einer Leiste in ihrer Skalierung, Größe und Schriftart.
+#[derive(Clone, Copy)]
+struct BarFonts {
+    /// Text (Eingabesprache, Usage, Suche) und Datumszeile der Uhr.
+    text: HFONT,
+    /// Uhrzeit (ggf. fett).
+    time: HFONT,
+    icons: HFONT,
+    /// Zweite Zeile der Eingabesprache.
+    small: HFONT,
 }
 
-/// Text- und Symbolschrift für eine Leiste in ihrer Skalierung.
-unsafe fn bar_fonts(hwnd: HWND) -> (u32, HFONT, HFONT) {
-    let dpi = bar_dpi(hwnd);
-    if let Some((main_dpi, font, icons)) = with(|s| (s.dpi, s.font, s.icons)) {
-        if main_dpi == dpi {
-            return (dpi, font, icons);
+impl BarFonts {
+    unsafe fn new(dpi: u32) -> Self {
+        let s = crate::settings::get();
+        let m = metrics(s.bar_size.resolve(crate::display::small_buttons()));
+        let face = text_face(s.bar_font);
+        BarFonts {
+            text: font_face(dpi, m.font, FW_NORMAL, face),
+            time: font_face(dpi, m.font, if s.clock_bold { FW_BOLD } else { FW_NORMAL }, face),
+            icons: icon_font(dpi, m.icon_font),
+            small: font_face(dpi, m.font - 2, FW_NORMAL, face),
         }
     }
-    let (font, icons) = FONTS.with(|f| *f.borrow_mut().entry(dpi).or_insert_with(|| (make_font(dpi, 12, FW_NORMAL), icon_font(dpi, 16))));
-    (dpi, font, icons)
 }
 
 thread_local! {
-    /// Kleine Schrift je DPI (zweite Zeile der Eingabesprache), einmal erzeugt.
-    static SMALL_FONTS: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
+    /// Schriften je Skalierung (Haupt- und Zweitleisten, Monitore mit
+    /// unterschiedlicher Skalierung), erzeugt beim ersten Zeichnen.
+    static FONTS: RefCell<HashMap<u32, BarFonts>> = RefCell::new(HashMap::new());
 }
 
-unsafe fn small_font(dpi: u32) -> HFONT {
-    SMALL_FONTS.with(|f| *f.borrow_mut().entry(dpi).or_insert_with(|| make_font(dpi, 10, FW_NORMAL) as usize)) as HFONT
+/// Schriften einer Leiste in ihrer Skalierung.
+unsafe fn bar_fonts(hwnd: HWND) -> (u32, BarFonts) {
+    let dpi = bar_dpi(hwnd);
+    (dpi, FONTS.with(|f| *f.borrow_mut().entry(dpi).or_insert_with(|| BarFonts::new(dpi))))
+}
+
+/// Größe, Schriftart oder Skalierung geändert: Schriften neu erzeugen (beim
+/// nächsten Zeichnen) und die Uhrbreite neu messen.
+unsafe fn reset_fonts() {
+    for (_, f) in FONTS.with(|f| std::mem::take(&mut *f.borrow_mut())) {
+        for h in [f.text, f.time, f.icons, f.small] {
+            DeleteObject(h);
+        }
+    }
+    crate::clockfmt::invalidate();
 }
 
 fn secondaries() -> Vec<HWND> {
@@ -3100,11 +3356,8 @@ unsafe fn monitor_rect(h: HWND, work: bool) -> RECT {
 
 /// Dicke einer Leiste: Höhe oben/unten, Breite links/rechts.
 fn thickness(dpi: u32) -> i32 {
-    if crate::display::edge().vertical() {
-        px(dpi, BAR_W_V)
-    } else {
-        px(dpi, metrics(crate::display::small_buttons()).bar_h)
-    }
+    let m = metrics(bar_size());
+    px(dpi, if crate::display::edge().vertical() { m.bar_w_v } else { m.bar_h })
 }
 
 /// Liegt die Leiste schon an ihrer Kante, über die ganze Breite bzw. Höhe und
@@ -3757,6 +4010,13 @@ unsafe fn apply_taskbar_settings() {
     if moved {
         relocate();
     }
+    // Kleinere Schaltflächen an/aus (zählt bei Größe "Automatisch"): andere
+    // Dicke, Schrift und Symbolgröße. Zweitleisten dockt `sync_monitors` an.
+    reset_fonts();
+    if !moved && !docked_correctly(self::hwnd()) {
+        set_pos(self::hwnd());
+        refresh(self::hwnd(), None);
+    }
     // Sekunden an/aus: Uhr-Takt neu stellen.
     schedule_clock(self::hwnd());
     sync_monitors();
@@ -4055,22 +4315,35 @@ unsafe fn render_tux(dc: HDC, dpi: u32, accent: COLORREF) -> Option<(i32, i32, H
 }
 
 /// Uhr samt Hover-Fläche zeichnen (volles Zeichnen und Schnellweg).
-unsafe fn draw_clock(dc: HDC, r: &RECT, dpi: u32, font: HFONT, hover: f32) {
+unsafe fn draw_clock(dc: HDC, r: &RECT, dpi: u32, fonts: &BarFonts, hover: f32) {
+    let mut st: SYSTEMTIME = zeroed();
+    GetLocalTime(&mut st);
+    let vertical = crate::display::edge().vertical();
+    draw_clock_at(dc, r, dpi, fonts, hover, &clock_spec(&crate::settings::get(), vertical), vertical, &st);
+}
+
+/// Uhr für eine bestimmte Zeit zeichnen. Waagerecht rechtsbündig mit
+/// `CLOCK_PAD` Rand (die Breite ist auf den breitesten Text gemessen),
+/// senkrecht mittig.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_clock_at(dc: HDC, r: &RECT, dpi: u32, fonts: &BarFonts, hover: f32, spec: &crate::clockfmt::Spec, vertical: bool, st: &SYSTEMTIME) {
     if hover > 0.01 {
         round(dc, r, mix(BG, HOVER, hover), px(dpi, 6));
     }
-    let mut st: SYSTEMTIME = zeroed();
-    GetLocalTime(&mut st);
     let mid = (r.top + r.bottom) / 2;
-    // Schmale Uhr (senkrechte Leiste): mittig und Datum ohne Jahr.
-    let narrow = r.right - r.left < px(dpi, CLOCK_W);
-    let flags = if narrow { DT_CENTER } else { DT_RIGHT } | DT_SINGLELINE;
-    let cr = if narrow { *r } else { RECT { right: r.right - px(dpi, 10), ..*r } };
+    let flags = if vertical { DT_CENTER } else { DT_RIGHT } | DT_SINGLELINE;
+    let pad = px(dpi, CLOCK_PAD);
+    let cr = RECT { left: r.left + pad, right: r.right - pad, ..*r };
     // Regionalformat von Windows (12/24 h, Datumsreihenfolge), nicht die UI-Sprache.
-    let time = crate::clockfmt::time(&st, clock_seconds());
-    text(dc, &time, &RECT { bottom: mid, ..cr }, font, TEXT, flags | DT_BOTTOM);
-    let date = crate::clockfmt::short_date(&st, narrow);
-    text(dc, &date, &RECT { top: mid, ..cr }, font, TEXT, flags | DT_TOP);
+    let time = crate::clockfmt::line(st, &spec.time, spec.seconds);
+    match &spec.date {
+        None => text(dc, &time, &cr, fonts.time, TEXT, flags | DT_VCENTER),
+        Some(d) => {
+            text(dc, &time, &RECT { bottom: mid, ..cr }, fonts.time, TEXT, flags | DT_BOTTOM);
+            let date = crate::clockfmt::line(st, d, spec.seconds);
+            text(dc, &date, &RECT { top: mid, ..cr }, fonts.text, TEXT, flags | DT_TOP);
+        }
+    }
 }
 
 /// Fingerabdruck dessen, was Zweitleisten außer der Uhr zeigen: Buttons
@@ -4109,7 +4382,7 @@ fn secondary_signature() -> u64 {
 fn clock_key() -> u64 {
     let mut st: SYSTEMTIME = unsafe { zeroed() };
     unsafe { GetLocalTime(&mut st) };
-    let sec = if clock_seconds() { st.wSecond as u64 } else { 0 };
+    let sec = if clock_ticks_seconds() { st.wSecond as u64 } else { 0 };
     ((((st.wYear as u64 * 13 + st.wMonth as u64) * 32 + st.wDay as u64) * 24 + st.wHour as u64) * 60 + st.wMinute as u64) * 60 + sec
 }
 
@@ -4183,17 +4456,17 @@ unsafe fn clock_only_update(hwnd: HWND) -> Option<RECT> {
 
 /// Schnellweg: nur die Uhr in einen kleinen Puffer zeichnen statt der ganzen Leiste.
 unsafe fn paint_clock_only(hwnd: HWND, c: RECT) {
-    let Some((_, _, k)) = with(|s| {
+    let Some(k) = with(|s| {
         let hover = if s.hover_hwnd == hwnd { s.anim.hover.get("clock").copied().unwrap_or(0.0) } else { 0.0 };
-        (s.dpi, s.font, if crate::calendar::visible() { 1.0 } else { hover })
+        if crate::calendar::visible() { 1.0 } else { hover }
     }) else {
         return;
     };
-    let (dpi, font, _) = bar_fonts(hwnd);
+    let (dpi, fonts) = bar_fonts(hwnd);
     // Der Puffer ist nur so groß wie der ungültige Bereich (die Uhr).
     paint_buffered(hwnd, |dc, _, _| {
         fill(dc, &c, BG);
-        draw_clock(dc, &c, dpi, font, k);
+        draw_clock(dc, &c, dpi, &fonts, k);
     });
 }
 
@@ -4244,7 +4517,9 @@ unsafe fn paint(hwnd: HWND) {
         EndPaint(hwnd, &ps);
         return;
     };
-    let (dpi, font, icons) = bar_fonts(hwnd);
+    let (dpi, fonts) = bar_fonts(hwnd);
+    let (font, icons) = (fonts.text, fonts.icons);
+    let m = metrics(bar_size());
     let slide = animates_positions(hwnd);
     let edge = crate::display::edge();
     let vertical = edge.vertical();
@@ -4298,7 +4573,7 @@ unsafe fn paint(hwnd: HWND) {
         }
 
         let fg = GetForegroundWindow();
-        let is = px(dpi, metrics(crate::display::small_buttons()).icon);
+        let is = px(dpi, m.icon);
         for (i, PaintGroup { id, windows, icon, attention, x: anim_x, appear: anim_appear, ind: anim_ind }) in groups.iter().enumerate() {
             let Some(base) = l.tasks.get(i) else { continue };
             // Weich nachrutschende Position (entlang der Leiste).
@@ -4328,6 +4603,8 @@ unsafe fn paint(hwnd: HWND) {
                 }
                 _ => 1.0,
             };
+            // Große Symbole in schmal gewordenen Buttons (viele Apps) nicht überstehen lassen.
+            let is = is.min((r.right - r.left).min(r.bottom - r.top) - px(dpi, 8));
             let size = ((is as f32) * (0.55 + 0.45 * appear) * press).round() as i32;
             if size > 2 {
                 let cx = (r.left + r.right) / 2;
@@ -4392,7 +4669,7 @@ unsafe fn paint(hwnd: HWND) {
         }
 
         // Infobereich
-        let ts = px(dpi, TRAY_ICON);
+        let ts = px(dpi, m.tray_icon);
         for (n, &(index, icon)) in tray.iter().enumerate() {
             let r = l.tray[n];
             hover_bg(dc, &r, hv(&format!("t:{index}")));
@@ -4415,7 +4692,7 @@ unsafe fn paint(hwnd: HWND) {
                     Some(sub) => {
                         let mid = (l.kbd.top + l.kbd.bottom) / 2;
                         text(dc, &e.abbr, &RECT { bottom: mid, ..l.kbd }, font, TEXT, flags | DT_BOTTOM);
-                        text(dc, sub, &RECT { top: mid, ..l.kbd }, small_font(dpi), TEXT, flags | DT_TOP);
+                        text(dc, sub, &RECT { top: mid, ..l.kbd }, fonts.small, TEXT, flags | DT_TOP);
                     }
                 }
             }
@@ -4427,7 +4704,7 @@ unsafe fn paint(hwnd: HWND) {
             // Symbolbreite nach Platz (schmale senkrechte Leiste), mittig verteilt.
             let n = 2 + battery.is_some() as i32;
             let avail = l.status.right - l.status.left;
-            let gw = px(dpi, STATUS_GLYPH_W).min(avail / n);
+            let gw = px(dpi, m.glyph_w).min(avail / n);
             let mut gx = l.status.left + (avail - n * gw) / 2;
             let mut glyph = |g: &str| {
                 text(dc, g, &RECT { left: gx, right: gx + gw, ..l.status }, icons, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -4442,7 +4719,7 @@ unsafe fn paint(hwnd: HWND) {
 
         // Uhr
         let k = if crate::calendar::visible() { 1.0 } else { hv("clock") };
-        draw_clock(dc, &l.clock, dpi, font, k);
+        draw_clock(dc, &l.clock, dpi, &fonts, k);
 
         if l.show_usage {
             draw_usage(dc, &l.usage, dpi, font, hv("usage"));
@@ -4862,6 +5139,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             update_kbd(hwnd, false);
             tray::tick();
             crate::shell::ensure_hidden();
+            manual_edits();
             // Position oder automatisches Ausblenden in Windows geändert, ohne
             // dass eine Meldung kam?
             let moved = crate::display::reload();
@@ -5312,10 +5590,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             release_work_area(hwnd);
             let mut abd = appbar_data(hwnd);
             SHAppBarMessage(ABM_REMOVE, &mut abd);
-            with(|s| {
-                DeleteObject(s.font);
-                DeleteObject(s.icons);
-            });
+            reset_fonts();
             PostQuitMessage(0);
             0
         }
@@ -5374,8 +5649,6 @@ pub unsafe fn create(inst: HINSTANCE) -> HWND {
             taskmgr_icon: null_mut(),
             attention: Vec::new(),
             start: Instant::now(),
-            font: null_mut(),
-            icons: null_mut(),
         })
     });
     // Vor dem Andocken: Mit "automatisch ausblenden" wird kein Platz reserviert.
@@ -5562,49 +5835,52 @@ mod tests {
     }
 
     /// Breiten in physischen Pixeln (auch hochkant), gängige Skalierungen,
-    /// wenige bis sehr viele Apps und Tray-Icons: nichts überlappt, nichts
-    /// ragt aus der Leiste, Buttons bleiben bedienbar breit.
+    /// alle Größen der Leiste, wenige bis sehr viele Apps und Tray-Icons:
+    /// nichts überlappt, nichts ragt aus der Leiste, Buttons bleiben bedienbar breit.
     #[test]
     fn layout_fits_every_resolution() {
         let mut dropped = Vec::new();
         for width in [720, 768, 800, 1024, 1080, 1200, 1280, 1366, 1440, 1600, 1920, 2160, 2560, 3440, 3840] {
             for dpi in [96, 120, 144, 168, 192] {
-                for n_tasks in [0, 3, 8, 15, 25, 40] {
-                    for n_tray in [0, 4, 12] {
-                        let small = (n_tasks + n_tray + dpi as usize) % 2 == 1;
-                        for (primary, usage, align_left, hidden_tray) in [(true, true, false, true), (true, false, true, false), (true, true, true, false), (false, false, false, false), (false, false, true, false)] {
-                            let i = LayoutInput { width, vertical: false, length: px(dpi, BAR_H), dpi, n_tasks, n_tray, hidden_tray, battery: true, kbd: (n_tasks + n_tray) % 3 != 0, primary, usage, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0, clock_w: if n_tasks % 2 == 0 { CLOCK_W } else { 116 } };
-                            let l = layout(&i);
-                            let ctx = format!("w={width} dpi={dpi} tasks={n_tasks} tray={n_tray} primary={primary} usage={usage} left={align_left}");
-                            let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("kbd", l.kbd), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr)];
-                            if l.show_usage {
-                                all.push(("usage", l.usage));
-                            }
-                            all.extend(l.tasks.iter().map(|r| ("task", *r)));
-                            all.extend(l.tray.iter().map(|r| ("tray", *r)));
-                            all.extend(l.chevron.iter().map(|r| ("chevron", *r)));
-                            all.extend(l.more.iter().map(|r| ("more", *r)));
-                            if l.tasks.len() < n_tasks {
-                                assert!(l.more.is_some(), "Apps ohne Platz und ohne …-Knopf: {ctx}");
-                            }
-                            for (name, r) in &all {
-                                if non_empty(r) {
-                                    assert!(r.left >= 0 && r.right <= width, "{name} außerhalb: {ctx}");
+                for size in BarSize::ALL {
+                    let m = metrics(size);
+                    for n_tasks in [0, 3, 8, 15, 25, 40] {
+                        for n_tray in [0, 4, 12] {
+                            for (primary, usage, align_left, hidden_tray) in [(true, true, false, true), (true, false, true, false), (true, true, true, false), (false, false, false, false), (false, false, true, false)] {
+                                let clock_w = [clock_fallback_w(&m), 116 * m.font / 12, 44][n_tasks % 3];
+                                let i = LayoutInput { width, vertical: false, length: px(dpi, m.bar_h), dpi, n_tasks, n_tray, hidden_tray, battery: true, kbd: (n_tasks + n_tray) % 3 != 0, primary, usage, align_left, size, desktop_corner: n_tray != 4, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0, clock_w };
+                                let l = layout(&i);
+                                let ctx = format!("w={width} dpi={dpi} size={size:?} tasks={n_tasks} tray={n_tray} primary={primary} usage={usage} left={align_left}");
+                                let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("kbd", l.kbd), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr)];
+                                if l.show_usage {
+                                    all.push(("usage", l.usage));
                                 }
-                            }
-                            for a in 0..all.len() {
-                                for b in a + 1..all.len() {
-                                    assert!(!overlap(&all[a].1, &all[b].1), "{} überlappt {}: {ctx}", all[a].0, all[b].0);
+                                all.extend(l.tasks.iter().map(|r| ("task", *r)));
+                                all.extend(l.tray.iter().map(|r| ("tray", *r)));
+                                all.extend(l.chevron.iter().map(|r| ("chevron", *r)));
+                                all.extend(l.more.iter().map(|r| ("more", *r)));
+                                if l.tasks.len() < n_tasks {
+                                    assert!(l.more.is_some(), "Apps ohne Platz und ohne …-Knopf: {ctx}");
                                 }
-                            }
-                            for r in &l.tasks {
-                                assert!(r.right - r.left >= px(dpi, BTN_MIN_W), "Button zu schmal: {ctx}");
-                            }
-                            if !primary {
-                                assert!(l.tray.is_empty() && !l.show_usage && !non_empty(&l.taskmgr) && !non_empty(&l.kbd), "Zweitleiste mit Hauptleisten-Elementen: {ctx}");
-                            }
-                            if l.tasks.len() < n_tasks {
-                                dropped.push(ctx);
+                                for (name, r) in &all {
+                                    if non_empty(r) {
+                                        assert!(r.left >= 0 && r.right <= width && r.top >= 0 && r.bottom <= i.length, "{name} außerhalb: {ctx}");
+                                    }
+                                }
+                                for a in 0..all.len() {
+                                    for b in a + 1..all.len() {
+                                        assert!(!overlap(&all[a].1, &all[b].1), "{} überlappt {}: {ctx}", all[a].0, all[b].0);
+                                    }
+                                }
+                                for r in &l.tasks {
+                                    assert!(r.right - r.left >= px(dpi, BTN_MIN_W), "Button zu schmal: {ctx}");
+                                }
+                                if !primary {
+                                    assert!(l.tray.is_empty() && !l.show_usage && !non_empty(&l.taskmgr) && !non_empty(&l.kbd), "Zweitleiste mit Hauptleisten-Elementen: {ctx}");
+                                }
+                                if l.tasks.len() < n_tasks {
+                                    dropped.push(ctx);
+                                }
                             }
                         }
                     }
@@ -5666,44 +5942,114 @@ mod tests {
     }
 
     /// Eingabesprache sitzt wie bei Windows zwischen Infobereich und Status
-    /// (senkrecht: über dem Status), auf Zweitleisten nie.
+    /// (senkrecht: über dem Status), auf Zweitleisten nie – in jeder Größe.
     #[test]
     fn input_language_next_to_status() {
-        for small in [false, true] {
+        for size in BarSize::ALL {
+            let m = metrics(size);
             for dpi in [96, 144] {
-                let l = layout(&kbd_input(dpi, small));
-                assert_eq!(l.kbd.right - l.kbd.left, px(dpi, KBD_W));
+                let l = layout(&kbd_input(dpi, size));
+                assert_eq!(l.kbd.right - l.kbd.left, px(dpi, m.kbd_w));
                 assert!(l.kbd.right <= l.status.left && l.tray.last().unwrap().right <= l.kbd.left);
                 assert_eq!((l.kbd.top, l.kbd.bottom), (l.status.top, l.status.bottom));
-                let off = layout(&LayoutInput { kbd: false, ..kbd_input(dpi, small) });
+                let off = layout(&LayoutInput { kbd: false, ..kbd_input(dpi, size) });
                 assert!(!non_empty(&off.kbd));
                 assert!(off.tray.last().unwrap().right > l.tray.last().unwrap().right, "ohne Eingabesprache rückt der Infobereich nach");
-                let sec = layout(&LayoutInput { primary: false, ..kbd_input(dpi, small) });
+                let sec = layout(&LayoutInput { primary: false, ..kbd_input(dpi, size) });
                 assert!(!non_empty(&sec.kbd));
-                let v = layout(&LayoutInput { width: px(dpi, BAR_W_V), vertical: true, length: 1080, ..kbd_input(dpi, small) });
+                let v = layout(&LayoutInput { width: px(dpi, m.bar_w_v), vertical: true, length: 1080, ..kbd_input(dpi, size) });
                 assert!(v.kbd.bottom <= v.status.top && v.kbd.bottom > v.kbd.top);
                 assert!(v.tray.iter().all(|r| r.bottom <= v.kbd.top));
             }
         }
     }
 
-    /// Breite Uhr (12-Stunden-Format): bekommt ihren Platz, auch bei vielen
-    /// Apps ("…"-Knopf); nur wenn gar nichts mehr geht, das Standardmaß.
+    /// Breite Uhr (12-Stunden-Format, Wochentag): bekommt ihren Platz, auch bei
+    /// vielen Apps ("…"-Knopf); nur wenn gar nichts mehr geht, das Standardmaß.
     #[test]
     fn wide_clock_gets_its_width() {
-        for dpi in [96, 144] {
-            for n_tasks in [6, 40] {
-                let l = layout(&LayoutInput { clock_w: 116, n_tasks, ..kbd_input(dpi, false) });
-                assert_eq!(l.clock.right - l.clock.left, px(dpi, 116), "dpi={dpi} tasks={n_tasks}");
-                assert!(l.status.right <= l.clock.left);
+        for size in BarSize::ALL {
+            let wide = 116 * metrics(size).font / 12;
+            for dpi in [96, 144] {
+                for n_tasks in [6, 40] {
+                    let l = layout(&LayoutInput { clock_w: wide, n_tasks, ..kbd_input(dpi, size) });
+                    assert_eq!(l.clock.right - l.clock.left, px(dpi, wide), "dpi={dpi} tasks={n_tasks} {size:?}");
+                    assert!(l.status.right <= l.clock.left);
+                }
             }
+            let tight = layout(&LayoutInput { width: 720, clock_w: wide, n_tasks: 3, usage: true, n_tray: 0, ..kbd_input(192, size) });
+            // Standardmaß der Größe; große Leisten weichen dort ganz auf "Normal" aus.
+            let w = tight.clock.right - tight.clock.left;
+            assert!(w == px(192, clock_fallback_w(&metrics(size))) || w == px(192, CLOCK_W), "{size:?}: {w}");
+            // Schmale Uhr ("nur Uhrzeit") bleibt schmal, auch wenn es eng wird.
+            let narrow = layout(&LayoutInput { width: 720, clock_w: 40, n_tasks: 3, usage: true, n_tray: 0, ..kbd_input(192, size) });
+            assert_eq!(narrow.clock.right - narrow.clock.left, px(192, 40));
         }
-        let tight = layout(&LayoutInput { width: 720, clock_w: 116, n_tasks: 3, usage: true, n_tray: 0, ..kbd_input(192, false) });
-        assert_eq!(tight.clock.right - tight.clock.left, px(192, CLOCK_W));
     }
 
-    fn kbd_input(dpi: u32, small: bool) -> LayoutInput {
-        LayoutInput { width: 1920, vertical: false, length: px(dpi, BAR_H), dpi, n_tasks: 6, n_tray: 4, hidden_tray: true, battery: true, kbd: true, primary: true, usage: false, align_left: false, small, search: 1, task_view: true, clock_w: CLOCK_W }
+    /// Abstände an der Uhr: zum Status derselbe wie zwischen den anderen
+    /// Elementen, zur Desktop-Ecke knapp; ohne Ecke rückt die Uhr an den Rand.
+    #[test]
+    fn clock_spacing_is_tight() {
+        for size in BarSize::ALL {
+            for dpi in [96, 120, 144, 192] {
+                for corner in [true, false] {
+                    let l = layout(&LayoutInput { desktop_corner: corner, width: 3840, ..kbd_input(dpi, size) });
+                    let ctx = format!("{size:?} dpi={dpi} corner={corner}");
+                    assert_eq!(l.desktop.right - l.desktop.left, if corner { px(dpi, DESKTOP_W) } else { 0 }, "{ctx}");
+                    assert_eq!(l.desktop.left - l.clock.right, px(dpi, CLOCK_EDGE_GAP), "{ctx}");
+                    let gap = l.clock.left - l.status.right;
+                    assert_eq!(gap, l.status.left - l.kbd.right, "{ctx}");
+                    assert_eq!(gap, l.kbd.left - l.tray.last().unwrap().right, "{ctx}");
+                    // Senkrecht: gleiche Regel nach unten.
+                    let v = layout(&LayoutInput { desktop_corner: corner, width: px(dpi, metrics(size).bar_w_v), vertical: true, length: 1080, ..kbd_input(dpi, size) });
+                    assert_eq!(v.desktop.top - v.clock.bottom, px(dpi, CLOCK_EDGE_GAP), "{ctx}");
+                    assert_eq!(v.desktop.bottom, 1080);
+                }
+            }
+        }
+    }
+
+    /// Größen: "Klein" ist Windows' kleinere Schaltflächen, "Normal" die
+    /// Standardleiste, darüber wächst alles mit; Text und Symbole passen.
+    #[test]
+    fn size_metrics_scale_and_fit() {
+        let s = metrics(BarSize::Small);
+        assert_eq!((s.bar_h, s.btn_w, s.btn_h, s.icon), (40, 36, 32, 20));
+        let n = metrics(BarSize::Normal);
+        assert_eq!((n.bar_h, n.btn_w, n.btn_h, n.icon, n.font), (BAR_H, BTN_W, BTN_H, ICON, 12));
+        assert_eq!(metrics(BarSize::Auto).bar_h, BAR_H);
+        for pair in BarSize::ALL.windows(2) {
+            let (a, b) = (metrics(pair[0]), metrics(pair[1]));
+            let grows = [(a.bar_h, b.bar_h), (a.bar_w_v, b.bar_w_v), (a.btn_w, b.btn_w), (a.btn_h, b.btn_h), (a.icon, b.icon), (a.font, b.font), (a.icon_font, b.icon_font), (a.tray_w, b.tray_w), (a.tray_icon, b.tray_icon), (a.kbd_w, b.kbd_w), (a.clock_h_v, b.clock_h_v)];
+            assert!(grows.iter().all(|(x, y)| x <= y) && a.bar_h < b.bar_h, "{:?} → {:?}", pair[0], pair[1]);
+        }
+        for size in BarSize::ALL {
+            let m = metrics(size);
+            // Zwei Textzeilen (Zeilenhöhe etwa 4/3 der Schrift) im Button und in der senkrechten Uhr.
+            assert!(2 * m.font * 4 / 3 <= m.btn_h && 2 * m.font * 4 / 3 <= m.clock_h_v, "{size:?}");
+            assert!(m.btn_h < m.bar_h && m.icon + 8 <= m.btn_w && m.tray_icon + 8 <= m.tray_w && m.icon_font <= m.glyph_w, "{size:?}");
+            assert!(m.btn_w >= BTN_MIN_W && m.bar_w_v >= m.btn_w + 8, "{size:?}");
+        }
+    }
+
+    /// Schriftwahl: nur installierte Schriften, sonst Segoe UI Variable bzw. Segoe UI.
+    #[test]
+    fn fonts_fall_back_when_missing() {
+        use crate::settings::BarFont;
+        assert!(font_installed("Segoe UI"));
+        assert!(!font_installed("Lightbar Gibt Es Nicht"));
+        assert_eq!(text_face(BarFont::Segoe), "Segoe UI");
+        // Jede Wahl ergibt eine installierte Schrift (oder Segoe UI als letzte Rückfallebene).
+        for f in BarFont::ALL {
+            let face = text_face(f);
+            assert!(font_installed(face) || face == "Segoe UI", "{f:?} → {face}");
+        }
+    }
+
+    fn kbd_input(dpi: u32, size: BarSize) -> LayoutInput {
+        let length = px(dpi, metrics(size).bar_h);
+        LayoutInput { width: 1920, vertical: false, length, dpi, n_tasks: 6, n_tray: 4, hidden_tray: true, battery: true, kbd: true, primary: true, usage: false, align_left: false, size, desktop_corner: true, search: 1, task_view: true, clock_w: clock_fallback_w(&metrics(size)) }
     }
 }
 
@@ -5716,7 +6062,7 @@ mod vertical_tests {
     #[test]
     fn drag_reorders_along_bar() {
         let dpi = 96;
-        let i = LayoutInput { width: px(dpi, BAR_W_V), vertical: true, length: 1080, dpi, n_tasks: 4, n_tray: 0, hidden_tray: false, battery: true, kbd: false, primary: false, usage: false, align_left: true, small: false, search: 0, task_view: false, clock_w: CLOCK_W };
+        let i = LayoutInput { width: px(dpi, BAR_W_V), vertical: true, length: 1080, dpi, n_tasks: 4, n_tray: 0, hidden_tray: false, battery: true, kbd: false, primary: false, usage: false, align_left: true, size: BarSize::Normal, desktop_corner: true, search: 0, task_view: false, clock_w: CLOCK_W };
         let l = layout(&i);
         assert_eq!(l.tasks.len(), 4);
         let t = &l.tasks;
@@ -5771,35 +6117,36 @@ mod vertical_tests {
     fn vertical_layout_fits() {
         for length in [600, 768, 900, 1080, 1200, 1440, 1600, 1920, 2160] {
             for dpi in [96, 120, 144, 192] {
-                let width = px(dpi, BAR_W_V);
-                for n_tasks in [0, 5, 12, 25, 40] {
-                    for n_tray in [0, 3, 10] {
-                        let small = (n_tasks + n_tray + dpi as usize) % 2 == 1;
-                        for (primary, align_left, hidden_tray) in [(true, false, true), (true, true, false), (false, false, false)] {
-                            let i = LayoutInput { width, vertical: true, length, dpi, n_tasks, n_tray, hidden_tray, battery: true, kbd: (n_tasks + n_tray) % 3 != 0, primary, usage: true, align_left, small, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0, clock_w: if n_tasks % 2 == 0 { CLOCK_W } else { 116 } };
-                            let l = layout(&i);
-                            let ctx = format!("len={length} dpi={dpi} tasks={n_tasks} tray={n_tray} primary={primary} top={align_left}");
-                            let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("kbd", l.kbd), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr), ("desktop", l.desktop)];
-                            all.extend(l.tasks.iter().map(|r| ("task", *r)));
-                            all.extend(l.tray.iter().map(|r| ("tray", *r)));
-                            all.extend(l.chevron.iter().map(|r| ("chevron", *r)));
-                            all.extend(l.more.iter().map(|r| ("more", *r)));
-                            assert!(!l.show_usage, "Usage in senkrechter Leiste: {ctx}");
-                            for (name, r) in &all {
-                                if r.right > r.left && r.bottom > r.top {
-                                    assert!(r.left >= 0 && r.right <= width && r.top >= 0 && r.bottom <= length, "{name} außerhalb: {ctx}");
+                for size in BarSize::ALL {
+                    let width = px(dpi, metrics(size).bar_w_v);
+                    for n_tasks in [0, 5, 12, 25, 40] {
+                        for n_tray in [0, 3, 10] {
+                            for (primary, align_left, hidden_tray) in [(true, false, true), (true, true, false), (false, false, false)] {
+                                let i = LayoutInput { width, vertical: true, length, dpi, n_tasks, n_tray, hidden_tray, battery: true, kbd: (n_tasks + n_tray) % 3 != 0, primary, usage: true, align_left, size, desktop_corner: n_tray != 3, search: (n_tasks % 4) as u32, task_view: n_tray % 2 == 0, clock_w: if n_tasks % 2 == 0 { CLOCK_W } else { 116 } };
+                                let l = layout(&i);
+                                let ctx = format!("len={length} dpi={dpi} size={size:?} tasks={n_tasks} tray={n_tray} primary={primary} top={align_left}");
+                                let mut all: Vec<(&str, RECT)> = vec![("start", l.start), ("kbd", l.kbd), ("status", l.status), ("clock", l.clock), ("taskmgr", l.taskmgr), ("desktop", l.desktop)];
+                                all.extend(l.tasks.iter().map(|r| ("task", *r)));
+                                all.extend(l.tray.iter().map(|r| ("tray", *r)));
+                                all.extend(l.chevron.iter().map(|r| ("chevron", *r)));
+                                all.extend(l.more.iter().map(|r| ("more", *r)));
+                                assert!(!l.show_usage, "Usage in senkrechter Leiste: {ctx}");
+                                for (name, r) in &all {
+                                    if r.right > r.left && r.bottom > r.top {
+                                        assert!(r.left >= 0 && r.right <= width && r.top >= 0 && r.bottom <= length, "{name} außerhalb: {ctx}");
+                                    }
                                 }
-                            }
-                            for a in 0..all.len() {
-                                for b in a + 1..all.len() {
-                                    assert!(!overlap(&all[a].1, &all[b].1), "{} überlappt {}: {ctx}", all[a].0, all[b].0);
+                                for a in 0..all.len() {
+                                    for b in a + 1..all.len() {
+                                        assert!(!overlap(&all[a].1, &all[b].1), "{} überlappt {}: {ctx}", all[a].0, all[b].0);
+                                    }
                                 }
-                            }
-                            if l.tasks.len() < n_tasks {
-                                assert!(l.more.is_some(), "Apps ohne Platz und ohne …-Knopf: {ctx}");
-                            }
-                            if !primary {
-                                assert!(l.tray.is_empty() && l.chevron.is_none(), "Zweitleiste mit Tray: {ctx}");
+                                if l.tasks.len() < n_tasks {
+                                    assert!(l.more.is_some(), "Apps ohne Platz und ohne …-Knopf: {ctx}");
+                                }
+                                if !primary {
+                                    assert!(l.tray.is_empty() && l.chevron.is_none(), "Zweitleiste mit Tray: {ctx}");
+                                }
                             }
                         }
                     }
@@ -5959,5 +6306,145 @@ mod appbar_tests {
         assert_eq!(abd.edge, ABE_BOTTOM);
         // Übrige Felder bleiben, wie der Aufrufer sie geschickt hat.
         assert_eq!(abd.hwnd, 0x1234);
+    }
+}
+
+#[cfg(test)]
+mod render {
+    use super::*;
+    use crate::clockfmt::{self, Spec};
+    use crate::settings::{BarFont, ClockDisplay};
+
+    /// Rechter Teil der Leiste (Infobereich, Eingabesprache, Status, Uhr,
+    /// Desktop-Ecke) in allen Größen und Uhr-Varianten nach `LIGHTBAR_SHOT`
+    /// (BMP), zum Prüfen der Abstände; gibt die Abstände an der Uhr aus.
+    /// Nur von Hand: `LIGHTBAR_SHOT=bar.bmp cargo test render_bar -- --ignored --nocapture`
+    /// (`LIGHTBAR_DPI=144` für andere Skalierungen).
+    #[test]
+    #[ignore]
+    fn render_bar() {
+        let Ok(path) = std::env::var("LIGHTBAR_SHOT") else { return };
+        let dpi: u32 = std::env::var("LIGHTBAR_DPI").ok().and_then(|d| d.parse().ok()).unwrap_or(96);
+        let mut st: SYSTEMTIME = unsafe { zeroed() };
+        (st.wYear, st.wMonth, st.wDay, st.wDayOfWeek, st.wHour, st.wMinute, st.wSecond) = (2026, 10, 22, 4, 14, 5, 9);
+        let spec = |d, custom: &str| clockfmt::spec(d, custom, false, false);
+        // (Größe, Anzeige, Schrift, fett, Desktop-Ecke)
+        let mut rows: Vec<(BarSize, Spec, BarFont, bool, bool)> = BarSize::ALL.iter().map(|&s| (s, spec(ClockDisplay::DateTime, ""), BarFont::SegoeVariable, false, true)).collect();
+        rows.push((BarSize::Normal, spec(ClockDisplay::TimeOnly, ""), BarFont::SegoeVariable, false, true));
+        rows.push((BarSize::Normal, spec(ClockDisplay::WeekdayDate, ""), BarFont::SegoeVariable, false, true));
+        rows.push((BarSize::Normal, spec(ClockDisplay::ShortDate, ""), BarFont::SegoeVariable, true, false));
+        rows.push((BarSize::Normal, spec(ClockDisplay::DateTime, "HH:mm|ddd dd.MM."), BarFont::Bahnschrift, false, true));
+        rows.push((BarSize::Large, spec(ClockDisplay::DateTime, ""), BarFont::CascadiaMono, true, true));
+        let w = px(dpi, 560);
+        let h: i32 = rows.iter().map(|r| px(dpi, metrics(r.0).bar_h) + px(dpi, 6)).sum();
+        unsafe {
+            let screen = GetDC(null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(dc, bmp);
+            fill(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, rgb(90, 90, 90));
+            let mut y = 0;
+            for (size, spec, font, bold, corner) in rows {
+                let m = metrics(size);
+                let face = text_face(font);
+                let fonts = BarFonts {
+                    text: font_face(dpi, m.font, FW_NORMAL, face),
+                    time: font_face(dpi, m.font, if bold { FW_BOLD } else { FW_NORMAL }, face),
+                    icons: icon_font(dpi, m.icon_font),
+                    small: font_face(dpi, m.font - 2, FW_NORMAL, face),
+                };
+                let text_w = clockfmt::width(&spec, &clockfmt::Font { face, size: m.font, bold }, dpi);
+                let i = LayoutInput { width: w, vertical: false, length: px(dpi, m.bar_h), dpi, n_tasks: 2, n_tray: 3, hidden_tray: true, battery: true, kbd: true, primary: true, usage: false, align_left: true, size, desktop_corner: corner, search: 0, task_view: false, clock_w: text_w + 2 * CLOCK_PAD };
+                let l = layout(&i);
+                // Leiste in einen eigenen Puffer zeichnen, dann an ihre Stelle kopieren.
+                let bh = i.length;
+                let bar = CreateCompatibleBitmap(screen, w, bh);
+                let bdc = CreateCompatibleDC(screen);
+                let prev = SelectObject(bdc, bar);
+                fill(bdc, &RECT { left: 0, top: 0, right: w, bottom: bh }, BG);
+                fill(bdc, &RECT { left: 0, top: 0, right: w, bottom: px(dpi, 1).max(1) }, BORDER);
+                let radius = px(dpi, 6);
+                for r in [l.start].iter().chain(l.tasks.iter()) {
+                    round(bdc, r, ACTIVE, radius);
+                }
+                let ts = px(dpi, m.tray_icon);
+                for r in &l.tray {
+                    let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+                    round(bdc, &RECT { left: cx - ts / 2, top: cy - ts / 2, right: cx + ts / 2, bottom: cy + ts / 2 }, rgb(120, 160, 220), px(dpi, 3));
+                }
+                if let Some(r) = l.chevron {
+                    text(bdc, "\u{E70E}", &r, fonts.icons, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+                text(bdc, "DEU", &l.kbd, fonts.text, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                let n = 3;
+                let avail = l.status.right - l.status.left;
+                let gw = px(dpi, m.glyph_w).min(avail / n);
+                let mut gx = l.status.left + (avail - n * gw) / 2;
+                for g in ["\u{E701}", "\u{E767}", "\u{E83F}"] {
+                    text(bdc, g, &RECT { left: gx, right: gx + gw, ..l.status }, fonts.icons, TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                    gx += gw;
+                }
+                draw_clock_at(bdc, &l.clock, dpi, &fonts, 1.0, &spec, false, &st);
+                if corner {
+                    let line = RECT { left: l.desktop.left + px(dpi, 3), top: l.desktop.top + px(dpi, 12), right: l.desktop.left + px(dpi, 4), bottom: l.desktop.bottom - px(dpi, 12) };
+                    fill(bdc, &line, DIM);
+                }
+                BitBlt(dc, 0, y, w, bh, bdc, 0, 0, SRCCOPY);
+                SelectObject(bdc, prev);
+                DeleteObject(bar);
+                DeleteDC(bdc);
+                // Abstände: sichtbarer Text der Uhr gegenüber Status-Symbol und Rand.
+                let mdc = CreateCompatibleDC(screen);
+                let lines = [Some(clockfmt::line(&st, &spec.time, false)), spec.date.as_ref().map(|d| clockfmt::line(&st, d, false))];
+                let shown = lines.iter().zip([fonts.time, fonts.text]).filter_map(|(s, f)| s.as_ref().map(|s| text_width(mdc, s, f))).max().unwrap_or(0);
+                DeleteDC(mdc);
+                let text_l = l.clock.right - px(dpi, CLOCK_PAD) - shown;
+                let text_r = l.clock.right - px(dpi, CLOCK_PAD);
+                let glyph_r = gx - (gw - px(dpi, m.icon_font)) / 2;
+                println!(
+                    "{size:?} {face} bold={bold} corner={corner} {}: Uhr {} px (Text breitester {} / jetzt {}) | Status-Symbol bis Text {} | Text bis Desktop-Ecke {} | Text bis Rand {} | Status-Uhr {} = Eingabesprache-Status {}",
+                    if spec.date.is_some() { "2 Zeilen" } else { "1 Zeile" },
+                    l.clock.right - l.clock.left,
+                    px(dpi, text_w),
+                    shown,
+                    text_l - glyph_r,
+                    l.desktop.left - text_r,
+                    w - text_r,
+                    l.clock.left - l.status.right,
+                    l.status.left - l.kbd.right
+                );
+                for f in [fonts.text, fonts.time, fonts.icons, fonts.small] {
+                    DeleteObject(f);
+                }
+                y += bh + px(dpi, 6);
+            }
+            // 24-bit-BMP schreiben (wie in start.rs).
+            let row = ((w * 3 + 3) & !3) as usize;
+            let mut bi: BITMAPINFO = zeroed();
+            bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+            bi.bmiHeader.biWidth = w;
+            bi.bmiHeader.biHeight = h;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 24;
+            let mut pixels = vec![0u8; row * h as usize];
+            SelectObject(dc, old);
+            GetDIBits(dc, bmp, 0, h as u32, pixels.as_mut_ptr() as _, &mut bi, DIB_RGB_COLORS);
+            let mut out = Vec::new();
+            out.extend_from_slice(b"BM");
+            out.extend_from_slice(&((54 + pixels.len()) as u32).to_le_bytes());
+            out.extend_from_slice(&[0; 4]);
+            out.extend_from_slice(&54u32.to_le_bytes());
+            out.extend_from_slice(&40u32.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&24u16.to_le_bytes());
+            out.extend_from_slice(&[0; 24]);
+            out.extend_from_slice(&pixels);
+            std::fs::write(path, out).unwrap();
+            DeleteObject(bmp);
+            DeleteDC(dc);
+            ReleaseDC(null_mut(), screen);
+        }
     }
 }

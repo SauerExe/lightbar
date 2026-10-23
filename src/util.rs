@@ -251,7 +251,36 @@ pub unsafe fn mono_font(dpi: u32, size: i32) -> HFONT {
     font_face(dpi, size, FW_NORMAL, "Courier New")
 }
 
-unsafe fn font_face(dpi: u32, size: i32, weight: u32, face: &str) -> HFONT {
+/// Ist eine Schriftfamilie installiert? GDI liefert für unbekannte Namen
+/// stillschweigend eine Ersatzschrift, deshalb vorher fragen. Gemerkt je Name
+/// (neu installierte Schriften zählen erst nach einem Neustart von Lightbar).
+pub fn font_installed(face: &str) -> bool {
+    thread_local! {
+        static KNOWN: std::cell::RefCell<std::collections::HashMap<String, bool>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(v) = KNOWN.with(|k| k.borrow().get(face).copied()) {
+        return v;
+    }
+    unsafe extern "system" fn found(_: *const LOGFONTW, _: *const TEXTMETRICW, _: u32, lp: LPARAM) -> i32 {
+        *(lp as *mut bool) = true;
+        0
+    }
+    let mut hit = false;
+    unsafe {
+        let mut lf: LOGFONTW = zeroed();
+        lf.lfCharSet = DEFAULT_CHARSET as _;
+        for (d, c) in lf.lfFaceName.iter_mut().zip(face.encode_utf16().take(31)) {
+            *d = c;
+        }
+        let dc = GetDC(null_mut());
+        EnumFontFamiliesExW(dc, &lf, Some(found), &mut hit as *mut bool as LPARAM, 0);
+        ReleaseDC(null_mut(), dc);
+    }
+    KNOWN.with(|k| k.borrow_mut().insert(face.to_string(), hit));
+    hit
+}
+
+pub unsafe fn font_face(dpi: u32, size: i32, weight: u32, face: &str) -> HFONT {
     CreateFontW(
         -px(dpi, size),
         0,

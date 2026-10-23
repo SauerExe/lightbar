@@ -62,6 +62,7 @@ Honest answer, based on what was measured and built – including where it is *n
 - **Follows your Windows settings** – taskbar alignment (left or centred, also where the Start menu opens) and "Show my taskbar on all displays"
 - **Multiple monitors** – taskbars on other displays show Start, apps and the clock, like Windows; choose per display which ones get a taskbar and whether new displays get one (right-click → Bildschirme); flyouts open on the display you clicked; full-screen apps hide only the taskbar on their display
 - **Small and portrait screens** – when space runs out, tray icons move into the overflow, the usage display hides, buttons get narrower, and remaining apps go behind a "…" button instead of overlapping
+- **Size and clock style** – right-click → Größe: small, normal, large or extra large (Automatic follows Windows' "small taskbar buttons"); right-click → Uhr or right-click the clock: time and date, time only, with weekday, or without year, seconds, font (Segoe UI Variable, Segoe UI, Bahnschrift, Cascadia Mono, Consolas – only installed ones are offered) and bold time
 - Hides the Windows taskbar while running and restores it on exit; maximised windows and full-screen apps are handled
 - **Watchdog** – a small companion process restarts Lightbar if it crashes or stops responding, and brings back the Windows taskbar if that keeps failing, so you are never left without a taskbar
 - Start button: Lightbar orb, Windows logo or Tux (right-click → Startsymbol)
@@ -110,7 +111,7 @@ target\release\lightbar.exe --install
 | `lightbar.exe --usage-test` | query usage once, write the result to `%APPDATA%\Lightbar\usage-test.txt` |
 | `lightbar.exe --search-test <term>` | run an index search, write the result to `%APPDATA%\Lightbar\search-test.txt` |
 
-Settings (right-click the taskbar) are stored in `%APPDATA%\Lightbar\settings.txt`. Starts, exits, watchdog restarts and work-area corrections are logged to `%APPDATA%\Lightbar\lightbar.log` (no personal data). To quit Lightbar for good, use right-click → "Lightbar beenden" or `--uninstall`; killing the process makes the watchdog restart it.
+Settings (right-click the taskbar) are stored in `%APPDATA%\Lightbar\settings.txt`. A custom clock format can only be set there, e.g. `clock_format=HH:mm|ddd dd.MM.`: the picture syntax of Windows' `GetTimeFormatEx`/`GetDateFormatEx` (`H`/`HH` hours, `h` 12-hour, `mm` minutes, `ss` seconds, `tt` AM/PM, `d`/`dd` day, `ddd`/`dddd` weekday, `M`/`MM`/`MMM` month, `yy`/`yyyy` year, text in single quotes). The part after `|` is the second line (empty = one line; without `|` the date follows the menu choice); an empty value uses the regional format. The clock menu shows "Eigenes Format (settings.txt)" checked while one is set and opens the file. Edits are picked up the next time a taskbar menu opens, or within 30 seconds. Starts, exits, watchdog restarts and work-area corrections are logged to `%APPDATA%\Lightbar\lightbar.log` (no personal data). To quit Lightbar for good, use right-click → "Lightbar beenden" or `--uninstall`; killing the process makes the watchdog restart it.
 
 ## Notes
 
