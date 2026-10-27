@@ -16,7 +16,7 @@ use windows::core::{implement, PCWSTR};
 use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl};
 use windows::Win32::Media::Audio::{EDataFlow, ERole, IMMNotificationClient, IMMNotificationClient_Impl, AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE};
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
-use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+use windows::Win32::Media::Audio::{eCapture, eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::NetworkManagement::WiFi::*;
@@ -45,6 +45,8 @@ struct Handles {
     audio: Option<IMMDeviceEnumerator>,
     /// Offenes Standard-Audiogerät; alle 10 s neu ermittelt (Kopfhörer-Wechsel).
     endpoint: Option<(IAudioEndpointVolume, Instant)>,
+    /// Offenes Standard-Aufnahmegerät (Mikrofon) für die Stummschaltung.
+    capture: Option<(IAudioEndpointVolume, Instant)>,
     /// Letztes WLAN-Ergebnis; WLAN ändert sich selten, Abfrage alle 5 s.
     wifi: Option<(Option<(u32, String)>, Instant)>,
     /// Rückmeldungen von Windows (nur gesetzt, wenn watch lief).
@@ -64,7 +66,7 @@ impl Drop for Handles {
 }
 
 thread_local! {
-    static HANDLES: RefCell<Handles> = const { RefCell::new(Handles { wlan: null_mut(), audio: None, endpoint: None, wifi: None, volume_watch: None, device_watch: None }) };
+    static HANDLES: RefCell<Handles> = const { RefCell::new(Handles { wlan: null_mut(), audio: None, endpoint: None, capture: None, wifi: None, volume_watch: None, device_watch: None }) };
 }
 
 unsafe fn wifi(h: &mut Handles) -> Option<(u32, String)> {
@@ -150,9 +152,21 @@ unsafe fn endpoint(h: &mut Handles) -> Option<IAudioEndpointVolume> {
 static NOTIFY: AtomicIsize = AtomicIsize::new(0);
 /// Standard-Audiogerät gewechselt: beim nächsten Abruf neu öffnen.
 static DEVICE_CHANGED: AtomicBool = AtomicBool::new(false);
+/// Standard-Aufnahmegerät gewechselt: beim nächsten Abruf neu öffnen.
+static CAPTURE_CHANGED: AtomicBool = AtomicBool::new(false);
 
 /// wParam von WM_BAR_STATUS: Netzwerk (gebündelt, WLAN neu lesen) statt Audio.
 pub const NOTIFY_NETWORK: usize = 1;
+/// wParam von WM_BAR_STATUS: Audiogeräte dazugekommen, entfernt oder
+/// Standardgerät gewechselt (Gerätelisten neu lesen).
+pub const NOTIFY_DEVICES: usize = 2;
+
+/// Standardgerät wurde (von uns) umgestellt: Ausgabe und Aufnahme beim
+/// nächsten Abruf neu öffnen, ohne auf die Rückmeldung von Windows zu warten.
+pub fn default_changed() {
+    DEVICE_CHANGED.store(true, Ordering::Relaxed);
+    CAPTURE_CHANGED.store(true, Ordering::Relaxed);
+}
 
 fn notify_kind(kind: usize) {
     let h = NOTIFY.load(Ordering::Relaxed);
@@ -181,20 +195,31 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeWatch_Impl {
 struct DeviceWatch;
 
 impl IMMNotificationClient_Impl for DeviceWatch_Impl {
+    // Kopfhörer an/ab, Bluetooth verbunden/getrennt: Gerätelisten neu lesen.
     fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> windows::core::Result<()> {
+        notify_kind(NOTIFY_DEVICES);
         Ok(())
     }
     fn OnDeviceAdded(&self, _: &PCWSTR) -> windows::core::Result<()> {
+        notify_kind(NOTIFY_DEVICES);
         Ok(())
     }
     fn OnDeviceRemoved(&self, _: &PCWSTR) -> windows::core::Result<()> {
+        notify_kind(NOTIFY_DEVICES);
         Ok(())
     }
     fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, _: &PCWSTR) -> windows::core::Result<()> {
-        if flow == eRender && role == eConsole {
+        // Kommt je Rolle einmal; die Konsolen-Rolle genügt.
+        if role != eConsole {
+            return Ok(());
+        }
+        if flow == eRender {
             DEVICE_CHANGED.store(true, Ordering::Relaxed);
             notify();
+        } else if flow == eCapture {
+            CAPTURE_CHANGED.store(true, Ordering::Relaxed);
         }
+        notify_kind(NOTIFY_DEVICES);
         Ok(())
     }
     fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> windows::core::Result<()> {
@@ -297,6 +322,47 @@ pub fn set_volume(v: f32) {
 pub fn set_mute(on: bool) {
     HANDLES.with(|cell| unsafe {
         if let Some(ep) = endpoint(&mut cell.borrow_mut()) {
+            let _ = ep.SetMute(on, std::ptr::null());
+        }
+    })
+}
+
+/// Standard-Aufnahmegerät: wie `endpoint`, aber ohne Lautstärke-Rückmeldung
+/// (die Leiste zeigt kein Mikrofon). Wechsel kommen über CAPTURE_CHANGED.
+unsafe fn capture(h: &mut Handles) -> Option<IAudioEndpointVolume> {
+    let changed = CAPTURE_CHANGED.swap(false, Ordering::Relaxed);
+    if let Some((ep, at)) = &h.capture {
+        if !changed && (h.device_watch.is_some() || at.elapsed() < Duration::from_secs(10)) {
+            return Some(ep.clone());
+        }
+    }
+    if h.audio.is_none() {
+        h.audio = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok();
+    }
+    let device = h.audio.as_ref()?.GetDefaultAudioEndpoint(eCapture, eConsole).ok();
+    let Some(ep) = device.and_then(|d| d.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok()) else {
+        h.capture = None;
+        // Wie beim Ausgabegerät: Wechsel nicht "verbrauchen", solange das neue fehlt.
+        if changed {
+            CAPTURE_CHANGED.store(true, Ordering::Relaxed);
+        }
+        return None;
+    };
+    h.capture = Some((ep.clone(), Instant::now()));
+    Some(ep)
+}
+
+/// Mikrofon stumm? None, wenn es kein Aufnahmegerät gibt.
+pub fn mic_muted() -> Option<bool> {
+    HANDLES.with(|cell| unsafe {
+        let ep = capture(&mut cell.borrow_mut())?;
+        ep.GetMute().ok().map(|b| b.as_bool())
+    })
+}
+
+pub fn set_mic_mute(on: bool) {
+    HANDLES.with(|cell| unsafe {
+        if let Some(ep) = capture(&mut cell.borrow_mut()) {
             let _ = ep.SetMute(on, std::ptr::null());
         }
     })

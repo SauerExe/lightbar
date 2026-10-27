@@ -148,6 +148,7 @@ mod tests {
         ("ai.rs", include_str!("ai.rs")),
         ("ai_tools.rs", include_str!("ai_tools.rs")),
         ("apps.rs", include_str!("apps.rs")),
+        ("audio.rs", include_str!("audio.rs")),
         ("bar.rs", include_str!("bar.rs")),
         ("calendar.rs", include_str!("calendar.rs")),
         ("chat.rs", include_str!("chat.rs")),

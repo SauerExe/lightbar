@@ -24,6 +24,7 @@ static DRY_RUN: AtomicBool = AtomicBool::new(false);
 
 pub fn set_dry_run(on: bool) {
     DRY_RUN.store(on, Ordering::Relaxed);
+    crate::audio::set_dry_run(on);
 }
 
 /// Beschreibung aller Werkzeuge im OpenAI-Format (`tools` der Anfrage).
@@ -40,7 +41,9 @@ pub fn schema() -> Value {
         f("get_system_info", t!("Aktuelle Uhrzeit und Datum, Akkustand, Lautstärke, Netzwerk und freier Speicherplatz der Laufwerke.", "Current time and date, battery level, volume, network and free disk space of the drives."), none.clone()),
         f("set_volume", t!("Stellt die Systemlautstärke ein (0–100 %).", "Sets the system volume (0-100 %)."), one("percent", "integer", t!("Lautstärke in Prozent, 0–100", "Volume in percent, 0-100"))),
         f("mute", t!("Schaltet den Ton stumm oder wieder an.", "Mutes or unmutes the sound."), json!({ "type": "object", "properties": { "on": { "type": "boolean", "description": t!("true = stumm, false = Ton wieder an (Standard: true)", "true = mute, false = unmute (default: true)") } } })),
-        f("list_windows", t!("Listet die offenen Fenster (Titel und Programm).", "Lists the open windows (title and program)."), none.clone()),
+        f("list_audio_devices", t!("Listet die Audiogeräte (Ausgabe und Eingabe) mit dem aktuellen Standardgerät.", "Lists the audio devices (output and input) with the current default device."), none.clone()),
+        f("set_audio_output", t!("Macht ein Ausgabegerät zum Standard (Name oder Teil davon, z. B. \"Kopfhörer\", \"HDMI\"; Namen aus list_audio_devices).", "Makes an output device the default (name or part of it, e.g. \"headphones\", \"HDMI\"; names from list_audio_devices)."), one("name", "string", t!("Name des Ausgabegeräts", "Name of the output device"))),
+        f("list_windows",t!("Listet die offenen Fenster (Titel und Programm).", "Lists the open windows (title and program)."), none.clone()),
         f("focus_window", t!("Holt ein offenes Fenster in den Vordergrund (Teil des Titels oder Programmname genügt).", "Brings an open window to the front (part of the title or the program name is enough)."), one("title", "string", t!("Teil des Fenstertitels oder Programmname", "Part of the window title or program name"))),
         f("clipboard_get", t!("Liest den Text in der Zwischenablage. Nur benutzen, wenn der Nutzer danach fragt.", "Reads the text in the clipboard. Only use when the user asks for it."), none),
         f("clipboard_set", t!("Legt Text in die Zwischenablage (zum Einfügen mit Strg+V).", "Puts text on the clipboard (to paste with Ctrl+V)."), one("text", "string", t!("Der Text", "The text"))),
@@ -59,6 +62,8 @@ pub enum Call {
     SystemInfo,
     SetVolume(u8),
     Mute(bool),
+    ListAudioDevices,
+    SetAudioOutput(String),
     ListWindows,
     FocusWindow(String),
     ClipboardGet,
@@ -101,6 +106,8 @@ pub fn parse(name: &str, args: &str) -> Result<Call, String> {
             Call::SetVolume(n.round() as u8)
         }
         "mute" => Call::Mute(v["on"].as_bool().unwrap_or(true)),
+        "list_audio_devices" => Call::ListAudioDevices,
+        "set_audio_output" => Call::SetAudioOutput(text("name")?),
         "list_windows" => Call::ListWindows,
         "focus_window" => Call::FocusWindow(text("title")?),
         "clipboard_get" => Call::ClipboardGet,
@@ -216,7 +223,7 @@ fn settings_page(page: &str) -> Result<(String, String), String> {
 impl Call {
     /// Ändert etwas am PC (im Testlauf nicht ausführen).
     fn changes_state(&self) -> bool {
-        !matches!(self, Call::SearchFiles(_) | Call::SystemInfo | Call::ListWindows | Call::ClipboardGet)
+        !matches!(self, Call::SearchFiles(_) | Call::SystemInfo | Call::ListAudioDevices | Call::ListWindows | Call::ClipboardGet)
     }
 
     /// Kurze Zeile fürs Startmenü.
@@ -232,6 +239,8 @@ impl Call {
             Call::SetVolume(p) => tf!("Lautstärke auf {p} %", "Volume to {p} %"),
             Call::Mute(true) => t!("Ton aus", "Sound off").into(),
             Call::Mute(false) => t!("Ton an", "Sound on").into(),
+            Call::ListAudioDevices => t!("Sehe Audiogeräte an …", "Looking at audio devices ...").into(),
+            Call::SetAudioOutput(n) => tf!("Tonausgabe auf {} …", "Sound output to {} ...", short(n)),
             Call::ListWindows => t!("Sehe offene Fenster an …", "Looking at open windows ...").into(),
             Call::FocusWindow(t) => tf!("Wechsle zu {} …", "Switching to {} ...", short(t)),
             Call::ClipboardGet => t!("Lese Zwischenablage …", "Reading clipboard ...").into(),
@@ -284,6 +293,19 @@ impl Call {
                     crate::status::set_mute(*on);
                     Ok(if *on { t!("Ton ist aus", "Sound is off").into() } else { t!("Ton ist an", "Sound is on").into() })
                 }
+                Call::ListAudioDevices => Ok(audio_devices()),
+                Call::SetAudioOutput(name) => {
+                    use crate::audio::{self, Flow};
+                    let devices = audio::list(Flow::Output);
+                    let Some(d) = audio::find(&devices, name) else {
+                        return Err(tf!("Kein Ausgabegerät zu \"{name}\" gefunden. Vorhanden: {}", "No output device found for \"{name}\". Available: {}", devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")));
+                    };
+                    if d.default {
+                        return Ok(tf!("{} ist schon die Tonausgabe.", "{} is already the sound output.", d.name));
+                    }
+                    audio::set_default(&d.id)?;
+                    Ok(tf!("Tonausgabe ist jetzt {}", "Sound output is now {}", d.name))
+                }
                 Call::ListWindows => {
                     let list = windows();
                     if list.is_empty() {
@@ -303,6 +325,23 @@ impl Call {
             }
         }
     }
+}
+
+/// Audiogeräte als Text fürs Modell, Standardgerät markiert.
+fn audio_devices() -> String {
+    use crate::audio::{list, Flow};
+    let mut out = Vec::new();
+    for (flow, head) in [(Flow::Output, t!("Ausgabe:", "Output:")), (Flow::Input, t!("Eingabe:", "Input:"))] {
+        out.push(head.to_string());
+        let devices = list(flow);
+        if devices.is_empty() {
+            out.push(t!("- (keine)", "- (none)").to_string());
+        }
+        for d in devices {
+            out.push(if d.default { tf!("- {} (Standard)", "- {} (default)", d.name) } else { format!("- {}", d.name) });
+        }
+    }
+    out.join("\n")
 }
 
 /// App per Name: genauer Treffer vor Anfang vor Teilwort; Deinstallierer nie.
@@ -442,7 +481,7 @@ mod tests {
     fn schema_lists_every_tool_and_parses() {
         let s = schema();
         let names: Vec<&str> = s.as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 14);
         // Jedes Werkzeug aus dem Schema muss parse kennen (Fehler wegen fehlender
         // Argumente ja, "unbekannt" nein).
         for n in names {
@@ -461,6 +500,9 @@ mod tests {
         assert_eq!(parse("focus_window", r#"{"title":"Editor"}"#), Ok(Call::FocusWindow("Editor".into())));
         assert_eq!(parse("clipboard_set", r#"{"text":"Hallo"}"#), Ok(Call::ClipboardSet("Hallo".into())));
         assert_eq!(parse("clipboard_get", "{}"), Ok(Call::ClipboardGet));
+        assert_eq!(parse("list_audio_devices", "{}"), Ok(Call::ListAudioDevices));
+        assert_eq!(parse("set_audio_output", r#"{"name":" Kopfhörer "}"#), Ok(Call::SetAudioOutput("Kopfhörer".into())));
+        assert!(parse("set_audio_output", "{}").is_err());
         assert!(parse("open_app", "{}").is_err());
         assert!(parse("open_app", "{kaputt").is_err());
         let e = parse("run_shell", r#"{"cmd":"del"}"#).unwrap_err();
@@ -561,7 +603,7 @@ mod tests {
         assert!(!Call::SystemInfo.changes_state());
         // Im Testlauf passiert bei verändernden Werkzeugen nichts.
         set_dry_run(true);
-        for c in [Call::OpenApp("Rechner".into()), Call::SetVolume(10), Call::Mute(true), Call::FocusWindow("x".into()), Call::ClipboardSet("x".into()), Call::OpenUrl("https://example.com".into())] {
+        for c in [Call::OpenApp("Rechner".into()), Call::SetVolume(10), Call::Mute(true), Call::FocusWindow("x".into()), Call::ClipboardSet("x".into()), Call::OpenUrl("https://example.com".into()), Call::SetAudioOutput("HDMI".into())] {
             let r = c.run().unwrap();
             assert!(r.starts_with("(Testlauf") || r.starts_with("(Dry run"));
         }

@@ -84,6 +84,9 @@ const KBD_POLL_MS: u32 = 2000;
 /// Netzwerkmeldungen bündeln: erst nach dieser Ruhe Status (und WLAN) neu lesen.
 const TIMER_NET: usize = 14;
 const NET_DEBOUNCE_MS: u32 = 400;
+/// Audiogeräte-Meldungen (Bluetooth verbindet: mehrere hintereinander) bündeln.
+const TIMER_AUDIO: usize = 15;
+const AUDIO_DEBOUNCE_MS: u32 = 300;
 
 /// Energieeinstellung "Bildschirm an/aus" (GUID_CONSOLE_DISPLAY_STATE).
 const GUID_CONSOLE_DISPLAY_STATE: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
@@ -2304,6 +2307,68 @@ unsafe fn status_menu(hwnd: HWND) {
         _ => return,
     };
     shell_open(uri, "", SW_SHOWNORMAL);
+}
+
+/// Index des Status-Symbols (0 = Netz, 1 = Lautstärke, 2 = Akku) an x; gleiche
+/// Aufteilung wie beim Zeichnen (n Symbole à gw, mittig im Bereich).
+fn status_glyph_at(left: i32, right: i32, n: i32, glyph_w: i32, x: i32) -> Option<usize> {
+    let avail = right - left;
+    let gw = glyph_w.min(avail / n.max(1));
+    if gw <= 0 {
+        return None;
+    }
+    let start = left + (avail - n * gw) / 2;
+    let i = (x - start).div_euclid(gw);
+    (x >= start && i < n).then_some(i as usize)
+}
+
+/// Rechtsklick traf das Lautstärkesymbol (nicht Netz/Akku)?
+unsafe fn on_volume_glyph(hwnd: HWND, x: i32) -> bool {
+    let Some((l, _)) = current_layout(hwnd) else { return false };
+    let battery = with(|s| s.status.as_ref().and_then(|s| s.battery)).flatten().is_some();
+    let n = 2 + battery as i32;
+    status_glyph_at(l.status.left, l.status.right, n, px(bar_dpi(hwnd), metrics(bar_size()).glyph_w), x) == Some(1)
+}
+
+/// Rechtsklick auf das Lautstärkesymbol: Ausgabe- und Eingabegeräte (Haken =
+/// Standard) zum schnellen Umschalten, dazu Sound-Einstellungen und Mixer.
+unsafe fn audio_menu(hwnd: HWND) {
+    use crate::audio::{self, Flow};
+    const OUT: usize = 100;
+    const IN: usize = 300;
+    let outputs = audio::list(Flow::Output);
+    let inputs = audio::list(Flow::Input);
+    let mut items: Vec<Item> = Vec::new();
+    if outputs.is_empty() {
+        items.push(Item::Label(t!("Keine Ausgabegeräte", "No output devices")));
+    }
+    for (i, d) in outputs.iter().enumerate().take(IN - OUT) {
+        items.push(Item::Check(OUT + i, &d.name, d.default));
+    }
+    if !inputs.is_empty() {
+        items.push(Item::Sep);
+        items.push(Item::Label(t!("Eingabe", "Input")));
+        for (i, d) in inputs.iter().enumerate().take(200) {
+            items.push(Item::Check(IN + i, &d.name, d.default));
+        }
+    }
+    items.push(Item::Sep);
+    items.push(Item::Cmd(1, t!("Soundeinstellungen", "Sound settings")));
+    items.push(Item::Cmd(2, t!("Lautstärkemixer", "Volume mixer")));
+    let id = menus::popup(hwnd, &items);
+    let device = match id {
+        1 => return shell_open("ms-settings:sound", "", SW_SHOWNORMAL),
+        2 => return shell_open("ms-settings:apps-volume", "", SW_SHOWNORMAL),
+        id if (OUT..IN).contains(&id) => outputs.get(id - OUT),
+        id if id >= IN => inputs.get(id - IN),
+        _ => None,
+    };
+    if let Some(d) = device.filter(|d| !d.default) {
+        if let Err(e) = audio::set_default(&d.id) {
+            log(&format!("Audiogerät umschalten fehlgeschlagen: {e}"));
+        }
+        update_status(hwnd);
+    }
 }
 
 /// Klick auf die Eingabesprache: Layout wählen oder Spracheinstellungen öffnen.
@@ -5196,6 +5261,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             update_status(hwnd);
             0
         }
+        // Audiogeräte dazu/weg oder Standard gewechselt: offene Gerätelisten auffrischen.
+        WM_BAR_STATUS if wp == status::NOTIFY_DEVICES => {
+            prof(6);
+            SetTimer(hwnd, TIMER_AUDIO, AUDIO_DEBOUNCE_MS, None);
+            0
+        }
+        WM_TIMER if wp == TIMER_AUDIO => {
+            KillTimer(hwnd, TIMER_AUDIO);
+            update_status(hwnd);
+            crate::quick::devices_changed();
+            0
+        }
         WM_BAR_STATUS | WM_POWERBROADCAST => {
             prof(6);
             // Lautstärke/Gerät sofort; das WLAN-Ergebnis bleibt gültig (5 s).
@@ -5487,6 +5564,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Hit::Tray(i) => tray_click(hwnd, i, Click::Right),
                 Hit::Chevron => bar_menu(hwnd),
                 Hit::More => more_menu(hwnd),
+                Hit::Status if on_volume_glyph(hwnd, x) => audio_menu(hwnd),
                 Hit::Status => status_menu(hwnd),
                 Hit::Kbd => kbd_menu(hwnd),
                 Hit::Clock => clock_menu(hwnd),
@@ -5705,6 +5783,20 @@ mod tests {
 
     const TERMINAL_OLD: &str = r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.21.2361.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe";
     const TERMINAL_NEW: &str = r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.22.10352.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe";
+
+    #[test]
+    fn status_glyph_hit() {
+        // 100 px Bereich, 3 Symbole à 30 px → Start bei 5.
+        assert_eq!(status_glyph_at(0, 100, 3, 30, 4), None);
+        assert_eq!(status_glyph_at(0, 100, 3, 30, 5), Some(0));
+        assert_eq!(status_glyph_at(0, 100, 3, 30, 35), Some(1));
+        assert_eq!(status_glyph_at(0, 100, 3, 30, 64), Some(1));
+        assert_eq!(status_glyph_at(0, 100, 3, 30, 65), Some(2));
+        assert_eq!(status_glyph_at(0, 100, 3, 30, 95), None);
+        // Schmaler Bereich: Symbole werden enger.
+        assert_eq!(status_glyph_at(10, 50, 2, 30, 31), Some(1));
+        assert_eq!(status_glyph_at(10, 10, 2, 30, 10), None);
+    }
 
     #[test]
     fn packaged_exe_normalizes_to_family() {

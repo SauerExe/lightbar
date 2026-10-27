@@ -1,5 +1,9 @@
 //! Schnelleinstellungen (Klick auf Netz/Lautstärke/Akku): WLAN, Bluetooth,
-//! Projizieren, Lautstärkeregler, Akkustand, Einstellungen.
+//! Projizieren, Lautstärkeregler, Mikrofon, Akkustand, Einstellungen.
+//!
+//! „>“ neben Lautstärke bzw. Mikrofon schaltet auf eine zweite Seite mit den
+//! Ausgabe- bzw. Eingabegeräten um (wie „Tonausgabe auswählen“ bei Windows 11);
+//! ein Klick macht das Gerät zum Standard (`audio.rs`).
 //!
 //! Funk-Schalter laufen über die WinRT-Radio-API auf einem eigenen Thread,
 //! weil deren Aufrufe asynchron sind und den UI-Thread nicht blockieren sollen.
@@ -18,6 +22,7 @@ use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use crate::audio::{self, Device, Flow};
 use crate::status::{self, Net, Status};
 use crate::util::*;
 
@@ -30,7 +35,22 @@ const PAD: i32 = 20;
 const TILE_W: i32 = 100;
 const TILE_H: i32 = 48;
 const FOOT: i32 = 52;
-const H: i32 = PAD + TILE_H + 28 + 16 + 40 + 16 + FOOT;
+/// Zeile für Lautstärke bzw. Mikrofon.
+const ROW: i32 = 40;
+const ROW_GAP: i32 = 8;
+/// Breite des „>“-Knopfs.
+const CHEV: i32 = 32;
+/// Zeile in der Geräteliste.
+const DEV_ROW: i32 = 44;
+/// Höchstens so viele Geräte zeigen (Fenster soll auf den Bildschirm passen).
+const MAX_DEVICES: usize = 10;
+const H: i32 = PAD + TILE_H + 28 + 16 + ROW + ROW_GAP + ROW + 16 + FOOT;
+
+/// Höhe (logisch) der Geräteseite mit n Geräten; nie kleiner als die Hauptseite.
+fn list_height(n: usize) -> i32 {
+    let rows = n.clamp(1, MAX_DEVICES) as i32;
+    (PAD + ROW + ROW_GAP + rows * DEV_ROW + 16 + FOOT).max(H)
+}
 
 // Bits für den Funkstatus.
 const WIFI_PRESENT: usize = 1;
@@ -59,6 +79,15 @@ enum Act {
     Slider,
     Settings,
     Battery,
+    /// „>“ neben Lautstärke bzw. Mikrofon: Geräteliste öffnen.
+    List(Flow),
+    MicMute,
+    /// Zurück von der Geräteliste.
+    Back,
+    /// Gerät Nr. i der offenen Liste zum Standard machen.
+    Device(usize),
+    /// „Weitere Lautstärkeeinstellungen“ unten auf der Geräteseite.
+    MoreSound,
 }
 
 struct State {
@@ -66,6 +95,14 @@ struct State {
     fonts: Option<(HFONT, HFONT, HFONT)>, // normal, small, icons
     radios: Option<usize>,
     status: Option<Status>,
+    /// Offene Geräteliste (None = Hauptseite).
+    page: Option<Flow>,
+    devices: Vec<Device>,
+    /// Mikrofon stumm? None = kein Aufnahmegerät.
+    mic: Option<bool>,
+    mic_name: Option<String>,
+    /// Aktuelle Fensterhöhe (logisch).
+    height: i32,
     mouse: (i32, i32),
     tracking: bool,
     dragging: bool,
@@ -156,11 +193,70 @@ unsafe fn tile(st: &mut State, dc: HDC, fonts: (HFONT, HFONT, HFONT), x: i32, y:
     }
 }
 
+/// Runder Knopf mit Symbol (Hover-Hintergrund), als Trefferfläche eingetragen.
+unsafe fn icon_button(st: &mut State, dc: HDC, font: HFONT, r: RECT, glyph: &str, color: COLORREF, act: Act) {
+    if inside(&r, st.mouse.0, st.mouse.1) {
+        round(dc, &r, HOVER, px(st.dpi, 6));
+    }
+    text(dc, glyph, &r, font, color, CENTER);
+    st.hits.push((r, act));
+}
+
 unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     let Some(fonts) = st.fonts else { return };
-    let d = st.dpi;
     st.hits.clear();
     fill(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, BG);
+    match st.page {
+        Some(flow) => draw_list(st, dc, fonts, w, flow),
+        None => draw_main(st, dc, fonts, w),
+    }
+    draw_footer(st, dc, fonts, w, h);
+}
+
+/// Geräteseite: Zurück, Überschrift, Geräte mit Symbol und Haken am Standard.
+unsafe fn draw_list(st: &mut State, dc: HDC, fonts: (HFONT, HFONT, HFONT), w: i32, flow: Flow) {
+    let d = st.dpi;
+    let x0 = px(d, PAD);
+    let y = px(d, PAD);
+    let back = RECT { left: x0 - px(d, 6), top: y, right: x0 - px(d, 6) + px(d, CHEV), bottom: y + px(d, ROW) };
+    icon_button(st, dc, fonts.2, back, "\u{E72B}", TEXT, Act::Back);
+    let title = match flow {
+        Flow::Output => t!("Tonausgabe auswählen", "Select a sound output"),
+        Flow::Input => t!("Toneingabe auswählen", "Select a sound input"),
+    };
+    text(dc, title, &RECT { left: back.right + px(d, 8), top: y, right: w - x0, bottom: y + px(d, ROW) }, fonts.0, TEXT, LINE);
+    let mut ry = y + px(d, ROW + ROW_GAP);
+    if st.devices.is_empty() {
+        let r = RECT { left: x0, top: ry, right: w - x0, bottom: ry + px(d, DEV_ROW) };
+        text(dc, t!("Keine Geräte gefunden", "No devices found"), &r, fonts.0, DIM, LINE);
+        return;
+    }
+    let rows: Vec<(String, &'static str, bool)> = st.devices.iter().take(MAX_DEVICES).map(|dv| (dv.name.clone(), audio::glyph(dv.kind), dv.default)).collect();
+    for (i, (name, glyph, default)) in rows.into_iter().enumerate() {
+        let r = RECT { left: x0 - px(d, 6), top: ry, right: w - x0 + px(d, 6), bottom: ry + px(d, DEV_ROW - 4) };
+        let hov = inside(&r, st.mouse.0, st.mouse.1);
+        if hov || default {
+            round(dc, &r, if hov { ACTIVE } else { HOVER }, px(d, 6));
+        }
+        if default {
+            // Akzentstrich links wie bei Windows.
+            let m = (r.top + r.bottom) / 2;
+            round(dc, &RECT { left: r.left + px(d, 2), top: m - px(d, 8), right: r.left + px(d, 5), bottom: m + px(d, 8) }, accent(), px(d, 3));
+        }
+        let ir = RECT { left: r.left + px(d, 8), right: r.left + px(d, 40), ..r };
+        text(dc, glyph, &ir, fonts.2, TEXT, CENTER);
+        let check = RECT { left: r.right - px(d, 36), right: r.right - px(d, 4), ..r };
+        if default {
+            text(dc, "\u{E73E}", &check, fonts.2, TEXT, CENTER);
+        }
+        text(dc, &name, &RECT { left: ir.right + px(d, 8), right: check.left - px(d, 4), ..r }, fonts.0, TEXT, LINE);
+        st.hits.push((r, Act::Device(i)));
+        ry += px(d, DEV_ROW);
+    }
+}
+
+unsafe fn draw_main(st: &mut State, dc: HDC, fonts: (HFONT, HFONT, HFONT), w: i32) {
+    let d = st.dpi;
     let s = st.status.clone().unwrap_or(Status { net: Net::Offline, volume: 0.0, muted: true, battery: None });
     let bits = st.radios.unwrap_or(0);
 
@@ -179,15 +275,13 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
 
     // Lautstärke
     let vy = y + px(d, TILE_H + 28 + 16);
-    let mute = RECT { left: x0, top: vy, right: x0 + px(d, 40), bottom: vy + px(d, 40) };
-    if inside(&mute, st.mouse.0, st.mouse.1) {
-        round(dc, &mute, HOVER, px(d, 6));
-    }
-    text(dc, status::volume_glyph(s.volume, s.muted), &mute, fonts.2, TEXT, CENTER);
-    st.hits.push((mute, Act::Mute));
-    let pct = RECT { left: w - px(d, PAD + 40), top: vy, right: w - px(d, PAD), bottom: vy + px(d, 40) };
+    let mute = RECT { left: x0, top: vy, right: x0 + px(d, ROW), bottom: vy + px(d, ROW) };
+    icon_button(st, dc, fonts.2, mute, status::volume_glyph(s.volume, s.muted), TEXT, Act::Mute);
+    let chev = RECT { left: w - px(d, PAD + CHEV), top: vy, right: w - px(d, PAD), bottom: vy + px(d, ROW) };
+    icon_button(st, dc, fonts.2, chev, "\u{E76C}", TEXT, Act::List(Flow::Output));
+    let pct = RECT { left: chev.left - px(d, 40), top: vy, right: chev.left - px(d, 4), bottom: vy + px(d, ROW) };
     text(dc, &format!("{}", (s.volume * 100.0).round() as i32), &pct, fonts.0, TEXT, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-    let track = RECT { left: mute.right + px(d, 12), top: vy, right: pct.left - px(d, 12), bottom: vy + px(d, 40) };
+    let track = RECT { left: mute.right + px(d, 12), top: vy, right: pct.left - px(d, 12), bottom: vy + px(d, ROW) };
     st.track = track;
     let cy = (track.top + track.bottom) / 2;
     let th = px(d, 4).max(2);
@@ -201,11 +295,46 @@ unsafe fn draw(st: &mut State, dc: HDC, w: i32, h: i32) {
     round(dc, &RECT { left: kx - ki, top: cy - ki, right: kx + ki, bottom: cy + ki }, accent(), 2 * ki);
     st.hits.push((track, Act::Slider));
 
-    // Fußleiste
+    // Mikrofon: Stummschalter, Name des Standardgeräts, „>“ zur Liste.
+    let my = vy + px(d, ROW + ROW_GAP);
+    let mic = RECT { left: x0, top: my, right: x0 + px(d, ROW), bottom: my + px(d, ROW) };
+    match st.mic {
+        Some(muted) => {
+            if muted {
+                round(dc, &mic, ACTIVE, px(d, 6));
+            }
+            icon_button(st, dc, fonts.2, mic, if muted { "\u{EC54}" } else { "\u{E720}" }, TEXT, Act::MicMute);
+        }
+        None => text(dc, "\u{E720}", &mic, fonts.2, DIM, CENTER),
+    }
+    let mchev = RECT { left: w - px(d, PAD + CHEV), top: my, right: w - px(d, PAD), bottom: my + px(d, ROW) };
+    let label = RECT { left: mic.right + px(d, 12), top: my, right: mchev.left - px(d, 4), bottom: my + px(d, ROW) };
+    let name = match (&st.mic_name, st.mic) {
+        (_, None) => t!("Kein Mikrofon", "No microphone").to_string(),
+        (Some(n), Some(true)) => tf!("{n} (stumm)", "{n} (muted)"),
+        (Some(n), Some(false)) => n.clone(),
+        (None, Some(_)) => t!("Mikrofon", "Microphone").to_string(),
+    };
+    text(dc, &name, &label, fonts.1, if st.mic.is_some() { TEXT } else { DIM }, LINE);
+    // Name und „>“ öffnen beide die Liste.
+    st.hits.push((label, Act::List(Flow::Input)));
+    icon_button(st, dc, fonts.2, mchev, "\u{E76C}", TEXT, Act::List(Flow::Input));
+}
+
+unsafe fn draw_footer(st: &mut State, dc: HDC, fonts: (HFONT, HFONT, HFONT), w: i32, h: i32) {
+    let d = st.dpi;
+    let s = st.status.clone().unwrap_or(Status { net: Net::Offline, volume: 0.0, muted: true, battery: None });
     let foot = RECT { left: 0, top: h - px(d, FOOT), right: w, bottom: h };
     fill(dc, &foot, PANEL);
     fill(dc, &RECT { bottom: foot.top + 1, ..foot }, BORDER);
-    if let Some((p, charging)) = s.battery {
+    if st.page.is_some() {
+        let r = RECT { left: px(d, PAD - 6), top: foot.top + px(d, 8), right: w - px(d, PAD + 44), bottom: h - px(d, 8) };
+        if inside(&r, st.mouse.0, st.mouse.1) {
+            round(dc, &r, HOVER, px(d, 6));
+        }
+        text(dc, t!("Weitere Lautstärkeeinstellungen", "More volume settings"), &RECT { left: r.left + px(d, 8), ..r }, fonts.0, TEXT, LINE);
+        st.hits.push((r, Act::MoreSound));
+    } else if let Some((p, charging)) = s.battery {
         let br = RECT { left: px(d, PAD - 6), top: foot.top + px(d, 8), right: px(d, PAD + 110), bottom: h - px(d, 8) };
         if inside(&br, st.mouse.0, st.mouse.1) {
             round(dc, &br, HOVER, px(d, 6));
@@ -250,17 +379,72 @@ pub unsafe fn toggle() {
             st.dpi = dpi;
         }
         st.status = Some(status);
+        st.page = None;
+        st.devices.clear();
+        st.height = H;
     });
+    read_mic();
     query_radios();
-    // Angedockte Lage – beim automatischen Ausblenden kann die Leiste gerade weggeschoben sein.
-    let br = crate::bar::docked_rect(bar);
-    let (w, hh) = (px(dpi, W), px(dpi, H));
-    // Am Ende der Leiste (rechts bzw. bei einer seitlichen Leiste unten).
-    let (x, y) = crate::display::place_near(br, w, hh, px(dpi, 12), crate::display::Along::End);
+    let (x, y, w, hh) = placement(dpi, H);
     crate::anim::pop_in(h, x, y, w, hh, crate::display::pop_offset(px(dpi, 18)));
     force_foreground(h);
     SetTimer(h, TIMER_POLL, 1000, None);
     InvalidateRect(h, null(), 0);
+}
+
+/// Lage des Fensters bei logischer Höhe `height`: am Ende der Leiste (rechts
+/// bzw. bei einer seitlichen Leiste unten), an der angedockten Lage – beim
+/// automatischen Ausblenden kann die Leiste gerade weggeschoben sein.
+unsafe fn placement(dpi: u32, height: i32) -> (i32, i32, i32, i32) {
+    let br = crate::bar::docked_rect(crate::bar::anchor());
+    let (w, hh) = (px(dpi, W), px(dpi, height));
+    let (x, y) = crate::display::place_near(br, w, hh, px(dpi, 12), crate::display::Along::End);
+    (x, y, w, hh)
+}
+
+/// Mikrofon-Zustand und -Name neu lesen.
+unsafe fn read_mic() {
+    let mic = status::mic_muted();
+    let name = if mic.is_some() { audio::default_device(Flow::Input).map(|d| d.name) } else { None };
+    with(|st| {
+        st.mic = mic;
+        st.mic_name = name;
+    });
+}
+
+/// Seite wechseln (None = Hauptseite) bzw. Liste neu lesen; passt die Höhe an.
+unsafe fn show_page(hwnd: HWND, page: Option<Flow>) {
+    let devices = page.map(audio::list).unwrap_or_default();
+    let height = if page.is_some() { list_height(devices.len()) } else { H };
+    let Some((old, dpi)) = with(|st| {
+        st.page = page;
+        st.devices = devices;
+        (std::mem::replace(&mut st.height, height), st.dpi)
+    }) else {
+        return;
+    };
+    if old != height {
+        let (x, y, w, hh) = placement(dpi, height);
+        SetWindowPos(hwnd, null_mut(), x, y, w, hh, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    InvalidateRect(hwnd, null(), 0);
+}
+
+/// Audiogeräte haben sich geändert (Rückmeldung über die Leiste): offene
+/// Liste und Mikrofonzeile auffrischen.
+pub unsafe fn devices_changed() {
+    if !visible() {
+        return;
+    }
+    let h = hwnd();
+    read_mic();
+    let s = status::poll();
+    let page = with(|st| {
+        st.status = Some(s);
+        st.page
+    })
+    .flatten();
+    show_page(h, page);
 }
 
 /// Schließen – auf jedem Weg hierüber, damit der Abfrage-Takt mit endet.
@@ -310,8 +494,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             if with(|st| st.dragging) != Some(true) {
                 let s = status::poll();
+                let mic = status::mic_muted();
                 // Nur bei Änderung neu zeichnen.
-                if with(|st| std::mem::replace(&mut st.status, Some(s.clone())) != Some(s)).unwrap_or(false) {
+                let changed = with(|st| {
+                    let a = std::mem::replace(&mut st.status, Some(s.clone())) != Some(s);
+                    let b = std::mem::replace(&mut st.mic, mic) != mic;
+                    a || b
+                });
+                if changed == Some(true) {
                     InvalidateRect(hwnd, null(), 0);
                 }
             }
@@ -386,6 +576,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     hide(hwnd);
                     shell_open("ms-settings:batterysaver", "", SW_SHOWNORMAL);
                 }
+                Some(Act::List(flow)) => show_page(hwnd, Some(flow)),
+                Some(Act::Back) => show_page(hwnd, None),
+                Some(Act::MicMute) => {
+                    if let Some(m) = status::mic_muted() {
+                        status::set_mic_mute(!m);
+                    }
+                    read_mic();
+                }
+                Some(Act::Device(i)) => {
+                    let pick = with(|st| st.devices.get(i).filter(|d| !d.default).map(|d| d.id.clone())).flatten();
+                    if let Some(id) = pick {
+                        if let Err(e) = audio::set_default(&id) {
+                            log(&format!("Audiogerät umschalten fehlgeschlagen: {e}"));
+                        }
+                        // Haken, Regler und Mikrofon folgen dem neuen Gerät.
+                        let s = status::poll();
+                        with(|st| st.status = Some(s));
+                        read_mic();
+                        let page = with(|st| st.page).flatten();
+                        show_page(hwnd, page);
+                    }
+                }
+                Some(Act::MoreSound) => {
+                    hide(hwnd);
+                    shell_open("ms-settings:sound", "", SW_SHOWNORMAL);
+                }
                 Some(Act::Slider) | None => {}
             }
             InvalidateRect(hwnd, null(), 0);
@@ -398,7 +614,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let uri = match act {
                 Some(Act::Wifi) => "ms-settings:network-wifi",
                 Some(Act::Bluetooth) => "ms-settings:bluetooth",
-                Some(Act::Mute | Act::Slider) => "ms-settings:sound",
+                Some(Act::Mute | Act::Slider | Act::List(_) | Act::MicMute | Act::Device(_)) => "ms-settings:sound",
                 Some(Act::Battery) => "ms-settings:powersleep",
                 _ => return 0,
             };
@@ -417,7 +633,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_KEYDOWN if wp as u16 == VK_ESCAPE => {
-            hide(hwnd);
+            // Auf der Geräteseite erst zurück, dann schließen.
+            if with(|st| st.page.is_some()) == Some(true) {
+                show_page(hwnd, None);
+            } else {
+                hide(hwnd);
+            }
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -455,6 +676,11 @@ pub unsafe fn create(inst: HINSTANCE) {
             fonts: None,
             radios: None,
             status: None,
+            page: None,
+            devices: Vec::new(),
+            mic: None,
+            mic_name: None,
+            height: H,
             mouse: (-1, -1),
             tracking: false,
             dragging: false,

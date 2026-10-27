@@ -11,6 +11,7 @@ mod ai;
 mod ai_tools;
 mod anim;
 mod apps;
+mod audio;
 mod bar;
 mod calendar;
 mod clockfmt;
